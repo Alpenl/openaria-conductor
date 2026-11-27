@@ -327,6 +327,12 @@ impl IndicatorController for SysfsLedController {
     }
 }
 
+impl Drop for SysfsLedController {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +544,26 @@ mod tests {
         );
 
         led.restore().unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("trigger")).unwrap().trim(),
+            "timer"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("delay_on")).unwrap().trim(),
+            "300"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("delay_off")).unwrap().trim(),
+            "700"
+        );
+
+        // Dropping SysfsLedController after setting a state must automatically restore it.
+        led.set_state(IndicatorState::Error).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("delay_on")).unwrap().trim(),
+            "125"
+        );
+        drop(led);
         assert_eq!(
             fs::read_to_string(dir.join("trigger")).unwrap().trim(),
             "timer"

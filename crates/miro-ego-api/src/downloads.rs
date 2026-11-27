@@ -37,9 +37,12 @@ struct LogEtagCacheKey {
     logs_root: PathBuf,
     relative_name: String,
     st_dev: u64,
+    st_ino: u64,
     size: u64,
     mtime_sec: i64,
     mtime_nsec: i64,
+    st_ctime: i64,
+    st_ctime_nsec: i64,
 }
 
 struct LogEtagCacheInner {
@@ -48,7 +51,7 @@ struct LogEtagCacheInner {
     lru_order: VecDeque<LogEtagCacheKey>,
 }
 
-/// Bounded LRU strong-ETag (`sha256`) cache keyed by `(logs_root, relative_name, st_dev, size, mtime_sec, mtime_nsec)`.
+/// Bounded LRU strong-ETag (`sha256`) cache keyed by `(logs_root, relative_name, st_dev, st_ino, size, mtime_sec, mtime_nsec, st_ctime, st_ctime_nsec)`.
 ///
 /// Validates `fstat` in O(1) on repeated `Range` downloads of unchanged `/api/v1/logs/{name}` files
 /// without re-reading and re-hashing the entire file on every chunk.
@@ -196,7 +199,10 @@ pub(crate) enum DeleteReplayLookup {
 pub(crate) enum DeleteBeginResult {
     Replay(CommandOutcome),
     Coalesce(watch::Receiver<Option<ApiResult<CommandOutcome>>>),
-    Execute(DeleteExecutionGuard),
+    Execute(
+        DeleteExecutionGuard,
+        watch::Receiver<Option<ApiResult<CommandOutcome>>>,
+    ),
 }
 
 pub(crate) struct DeleteExecutionGuard {
@@ -251,7 +257,8 @@ impl Drop for DeleteExecutionGuard {
             let _ = tx.send(Some(Err(ApiError::service_unavailable(
                 "delete_interrupted",
                 "in-flight session deletion was interrupted; retry",
-            ))));
+            )
+            .with_header("Retry-After", "1"))));
         }
     }
 }
@@ -404,16 +411,19 @@ impl ArtifactDeleteGate {
             key.clone(),
             InFlightDelete {
                 canonical_body: canonical_body.clone(),
-                rx,
+                rx: rx.clone(),
             },
         );
-        Ok(DeleteBeginResult::Execute(DeleteExecutionGuard {
-            gate: Arc::clone(self),
-            idem_key: key,
-            canonical_body,
-            target_sids: target_sids.to_vec(),
-            tx: Some(tx),
-        }))
+        Ok(DeleteBeginResult::Execute(
+            DeleteExecutionGuard {
+                gate: Arc::clone(self),
+                idem_key: key,
+                canonical_body,
+                target_sids: target_sids.to_vec(),
+                tx: Some(tx),
+            },
+            rx,
+        ))
     }
 }
 
@@ -605,6 +615,7 @@ pub fn stream_download_body(
         None,
         None,
         None,
+        false,
     )
 }
 
@@ -617,6 +628,7 @@ pub fn stream_download_body_with_guard(
     chunk_bytes: usize,
     permit: OwnedSemaphorePermit,
     lease_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    range_reaches_file_eof: bool,
 ) -> axum::body::Body {
     stream_download_body_inner(
         source,
@@ -627,6 +639,7 @@ pub fn stream_download_body_with_guard(
         None,
         None,
         lease_guard,
+        range_reaches_file_eof,
     )
 }
 
@@ -649,6 +662,7 @@ pub fn stream_download_body_with_lease(
         delete_lease,
         None,
         None,
+        false,
     )
 }
 
@@ -671,11 +685,13 @@ pub fn stream_download_body_with_session_lease(
         None,
         session_lease,
         None,
+        false,
     )
 }
 
 /// Build an async streaming `axum::body::Body` holding `permit`, `session_lease`, and an
 /// optional opaque backend open-handle lease guard until streaming finishes or disconnects.
+#[allow(clippy::too_many_arguments)]
 pub fn stream_download_body_with_session_and_guard(
     source: DownloadSource,
     offset: u64,
@@ -684,6 +700,7 @@ pub fn stream_download_body_with_session_and_guard(
     permit: OwnedSemaphorePermit,
     session_lease: Option<SessionDownloadLease>,
     lease_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    range_reaches_file_eof: bool,
 ) -> axum::body::Body {
     stream_download_body_inner(
         source,
@@ -694,6 +711,7 @@ pub fn stream_download_body_with_session_and_guard(
         None,
         session_lease,
         lease_guard,
+        range_reaches_file_eof,
     )
 }
 
@@ -707,6 +725,7 @@ fn stream_download_body_inner(
     delete_lease: Option<OwnedRwLockReadGuard<()>>,
     session_lease: Option<SessionDownloadLease>,
     lease_guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    range_reaches_file_eof: bool,
 ) -> axum::body::Body {
     if length == 0 {
         drop(source);
@@ -745,6 +764,8 @@ fn stream_download_body_inner(
                 let _delete_lease = delete_lease;
                 let _session_lease = session_lease;
                 let _lease_guard = lease_guard;
+                // Bind `file` AFTER all leases/guards so reverse drop order closes `Arc<File>` first.
+                let file = file;
                 if let (Ok(off_i64), Ok(len_i64)) = (i64::try_from(offset), i64::try_from(length)) {
                     let _ = fadvise_sequential(file.as_raw_fd(), off_i64, len_i64);
                 }
@@ -799,7 +820,7 @@ fn stream_download_body_inner(
                     let n = filled as u64;
                     let new_cursor = cursor.saturating_add(n);
                     let next_remaining = remaining.saturating_sub(n);
-                    let reached_eof = next_remaining == 0;
+                    let reached_eof = next_remaining == 0 && range_reaches_file_eof;
                     if let Some((adv_off, adv_len, updated_evicted)) =
                         compute_page_aligned_dontneed(evicted_until, new_cursor, reached_eof)
                     {
@@ -903,9 +924,12 @@ pub fn open_safe_log_file_with_cache(
         logs_root: logs_root.to_path_buf(),
         relative_name: relative_name.to_owned(),
         st_dev: u64::from(stat.st_dev),
+        st_ino: u64::from(stat.st_ino),
         size,
         mtime_sec: i64::from(stat.st_mtime),
         mtime_nsec: i64::from(stat.st_mtime_nsec),
+        st_ctime: i64::from(stat.st_ctime),
+        st_ctime_nsec: i64::from(stat.st_ctime_nsec),
     };
 
     let etag_hex = if let Some(cached) = etag_cache.get(&cache_key) {
@@ -920,9 +944,12 @@ pub fn open_safe_log_file_with_cache(
         let after_size = u64::try_from(after.st_size)
             .map_err(|_| ApiError::internal("invalid_source_state", "negative log file size"))?;
         if after.st_dev != stat.st_dev
+            || after.st_ino != stat.st_ino
             || after_size != size
             || after.st_mtime != stat.st_mtime
             || after.st_mtime_nsec != stat.st_mtime_nsec
+            || after.st_ctime != stat.st_ctime
+            || after.st_ctime_nsec != stat.st_ctime_nsec
         {
             return Err(ApiError::storage_unavailable(
                 "diagnostic log file changed concurrently during read; retry",
@@ -1010,5 +1037,132 @@ mod tests {
         assert_eq!(err.status_code, 503);
         assert_eq!(err.code, "storage_unavailable");
         assert!(err.retryable);
+    }
+
+    #[test]
+    fn compute_page_aligned_dontneed_skips_tail_when_range_does_not_reach_eof() {
+        // Partial Range download [0, 5000) of a larger file: `reached_eof == false`
+        // must only evict full aligned pages [0, 4096) with len = 4096, never len = 0.
+        assert_eq!(
+            compute_page_aligned_dontneed(0, 100, false),
+            None,
+            "sub-page partial range must not emit len=0 DONTNEED"
+        );
+        assert_eq!(
+            compute_page_aligned_dontneed(0, 5000, false),
+            Some((0, 4096, 4096)),
+            "partial range must emit explicit page-aligned length, not 0"
+        );
+        // Only when `reached_eof == true` (range reaches file EOF) is `adv_len = 0` emitted.
+        assert_eq!(
+            compute_page_aligned_dontneed(4096, 5000, true),
+            Some((4096, 0, 5000))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_download_body_drops_file_before_lease_guard_and_handles_partial_range() {
+        use futures_util::StreamExt;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use tokio::sync::Semaphore;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "miro-ego-drop-order-{}-{unique}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, vec![0x42_u8; 8192]).unwrap();
+        let file = Arc::new(File::open(&path).unwrap());
+        let weak_file = Arc::downgrade(&file);
+
+        struct AssertFileDroppedBeforeGuard {
+            weak_file: std::sync::Weak<File>,
+            saw_file_already_dropped: Arc<AtomicBool>,
+        }
+        impl Drop for AssertFileDroppedBeforeGuard {
+            fn drop(&mut self) {
+                self.saw_file_already_dropped
+                    .store(self.weak_file.strong_count() == 0, AtomicOrdering::Release);
+            }
+        }
+
+        let saw_dropped = Arc::new(AtomicBool::new(false));
+        let guard = Arc::new(AssertFileDroppedBeforeGuard {
+            weak_file,
+            saw_file_already_dropped: Arc::clone(&saw_dropped),
+        });
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = sem.acquire_owned().await.unwrap();
+
+        let body = stream_download_body_with_guard(
+            DownloadSource::File(file),
+            0,
+            100,
+            4096,
+            permit,
+            Some(guard),
+            false,
+        );
+        let mut stream = body.into_data_stream();
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected.len(), 100);
+
+        // Give the blocking task a moment to finish unwinding its stack locals after closing tx.
+        for _ in 0..20 {
+            if saw_dropped.load(AtomicOrdering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            saw_dropped.load(AtomicOrdering::Acquire),
+            "Arc<File> must drop before lease_guard"
+        );
+    }
+
+    #[test]
+    fn log_etag_cache_misses_when_inode_changes_with_identical_size_and_mtime() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("miro-ego-log-ino-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("daemon.log");
+        std::fs::write(&log_path, b"first-content-1234").unwrap();
+
+        let cache = LogEtagCache::new(16);
+        let rep1 = open_safe_log_file_with_cache(&dir, "daemon.log", &cache).unwrap();
+        assert_eq!(cache.misses(), 1);
+        assert_eq!(cache.hits(), 0);
+
+        // Second read of same inode hits cache.
+        let _rep1b = open_safe_log_file_with_cache(&dir, "daemon.log", &cache).unwrap();
+        assert_eq!(cache.hits(), 1);
+
+        // Replace with a new inode of the same size and mtime.
+        let mtime = std::fs::metadata(&log_path).unwrap().modified().unwrap();
+        let tmp_path = dir.join(".replacement.tmp");
+        std::fs::write(&tmp_path, b"other-content-5678").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tmp_path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&tmp_path, &log_path).unwrap();
+
+        let rep2 = open_safe_log_file_with_cache(&dir, "daemon.log", &cache).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(cache.misses(), 2, "new inode must miss ETag cache");
+        assert_ne!(rep1.etag, rep2.etag);
     }
 }

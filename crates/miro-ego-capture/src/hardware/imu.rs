@@ -21,7 +21,7 @@ const KNOWN_IMU_SELECTOR: u8 = 1;
 const SAMPLES_PER_PACKET: usize = 2;
 const DEVICE_TIMESTAMP_MODULUS: u64 = 1 << 24;
 const DEFAULT_STALE_POLL: Duration = Duration::from_millis(1);
-const DEFAULT_HALF_SAMPLE_PERIOD_NS: u64 = 1_250_000;
+const DEFAULT_SAMPLE_PERIOD_NS: u64 = 2_500_000;
 const XU_GUID_BYTES: [u8; 16] = [
     0x2c, 0xf4, 0xc2, 0xd5, 0x08, 0x18, 0x9f, 0x4d, 0xbe, 0x56, 0x75, 0x3e, 0x27, 0x1c, 0x92, 0x44,
 ];
@@ -378,26 +378,21 @@ impl IoState {
 
         let packet_mono_ns =
             midpoint_ns(packet_read.host_read_start_ns, packet_read.host_read_end_ns);
-        let half_sample_period_ns = self
+        let sample_period_ns = self
             .last_packet_monotonic_ns
             .and_then(|prev| packet_mono_ns.checked_sub(prev))
-            .map(|packet_dt| (packet_dt / (SAMPLES_PER_PACKET as u64 * 2)).max(1))
-            .unwrap_or(DEFAULT_HALF_SAMPLE_PERIOD_NS)
-            .min(DEFAULT_HALF_SAMPLE_PERIOD_NS * 4);
-        let raw_sample0_ns = packet_mono_ns.saturating_sub(half_sample_period_ns);
-        let min_sample0_ns = match self.last_sample_monotonic_ns {
-            Some(prev) => prev.saturating_add(1),
-            None => 1.min(packet_mono_ns),
+            .map(|packet_dt| (packet_dt / (SAMPLES_PER_PACKET as u64)).max(1))
+            .unwrap_or(DEFAULT_SAMPLE_PERIOD_NS)
+            .min(DEFAULT_SAMPLE_PERIOD_NS * 4);
+        let raw_sample0_ns = packet_mono_ns.saturating_sub(sample_period_ns);
+        let sample0_mono_ns = match self.last_sample_monotonic_ns {
+            Some(prev) => raw_sample0_ns.max(prev.saturating_add(1)),
+            None => raw_sample0_ns,
         };
-        let max_sample0_ns = packet_mono_ns.saturating_sub(1);
-        let sample0_mono_ns = if min_sample0_ns <= max_sample0_ns {
-            raw_sample0_ns.clamp(min_sample0_ns, max_sample0_ns)
-        } else {
-            packet_mono_ns
-        };
-        let sample_mono = [sample0_mono_ns, packet_mono_ns];
+        let sample1_mono_ns = packet_mono_ns.max(sample0_mono_ns.saturating_add(1));
+        let sample_mono = [sample0_mono_ns, sample1_mono_ns];
         self.last_packet_monotonic_ns = Some(packet_mono_ns);
-        self.last_sample_monotonic_ns = Some(packet_mono_ns);
+        self.last_sample_monotonic_ns = Some(sample1_mono_ns);
 
         let packet_sequence = self.packet_sequence;
         let first_sequence = self.sample_sequence;
@@ -412,7 +407,7 @@ impl IoState {
                 device_ticks,
                 host_read_start_ns: packet_read.host_read_start_ns,
                 host_read_end_ns: packet_read.host_read_end_ns,
-                host_monotonic_ns: sample_mono.get(idx).copied().unwrap_or(packet_mono_ns),
+                host_monotonic_ns: sample_mono.get(idx).copied().unwrap_or(sample1_mono_ns),
                 accelerometer: raw.accelerometer,
                 gyroscope: raw.gyroscope,
                 sync_offset_ns: estimate.offset_ns,
@@ -1061,6 +1056,47 @@ mod tests {
         assert_eq!(samples[4].device_ticks, 0x1_000000);
         assert_eq!(samples[6].device_ticks, 0x1_000003);
         assert_eq!(last_observation.unwrap().samples[1].sequence, 7);
+        for pair in samples.windows(2) {
+            assert_eq!(
+                pair[1].host_monotonic_ns - pair[0].host_monotonic_ns,
+                2_500_000
+            );
+        }
+    }
+
+    #[test]
+    fn intra_packet_timestamps_have_uniform_two_point_five_ms_spacing_and_clamp_jitter() {
+        let mut state = IoState::new(None, 3, 1, Duration::from_millis(1));
+        let mut samples = Vec::new();
+        for index in 0_u32..5 {
+            let start = 10_000_000_000 + u64::from(index) * 5_000_000;
+            let obs = state
+                .observe_packet(PacketRead {
+                    payload: packet(1_000 * (index + 1), index as i16),
+                    host_read_start_ns: start,
+                    host_read_end_ns: start,
+                })
+                .unwrap();
+            samples.extend(obs.samples);
+        }
+        for pair in samples.windows(2) {
+            assert_eq!(
+                pair[1].host_monotonic_ns - pair[0].host_monotonic_ns,
+                2_500_000
+            );
+        }
+
+        // Tight/repeated packet timestamp clamps sample0 >= prev + 1 and sample1 > sample0.
+        let prev_last = samples.last().unwrap().host_monotonic_ns;
+        let tight = state
+            .observe_packet(PacketRead {
+                payload: packet(6_000, 9),
+                host_read_start_ns: prev_last + 1,
+                host_read_end_ns: prev_last + 1,
+            })
+            .unwrap();
+        assert_eq!(tight.samples[0].host_monotonic_ns, prev_last + 1);
+        assert_eq!(tight.samples[1].host_monotonic_ns, prev_last + 2);
     }
 
     #[test]

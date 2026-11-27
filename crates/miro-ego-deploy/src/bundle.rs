@@ -6,15 +6,19 @@
 use crate::{DeployError, DeployResult};
 use miro_ego_core::ids::{hex_encode, is_valid_sha256, new_uuid_v4};
 use miro_ego_core::sys::fs::{
-    fsync_directory, open_readonly_safe, parse_strict_json_value, read_bounded_bytes,
+    fsync_directory, open_directory_safe, open_readonly_safe, openat_retry,
+    parse_strict_json_value, read_bounded_bytes,
 };
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::ffi::CString;
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 pub const BUNDLE_SCHEMA: &str = "miro-ego.rdk-x5-bundle.v1";
@@ -555,11 +559,34 @@ pub fn verify_bundle_dir_with_key(
     Ok(verified)
 }
 
+/// Explicit allowlist of non-`miro-ego-*` systemd drop-in directories permitted inside a bundle.
+pub const ALLOWED_SYSTEMD_DROPIN_DIRS: &[&str] = &[
+    "miro-ego.service.d",
+    "fstrim.service.d",
+    "logrotate.timer.d",
+];
+
+pub(crate) fn is_allowed_systemd_dropin_dir(name: &str) -> bool {
+    name.ends_with(".d")
+        && !name.contains('/')
+        && (name.starts_with("miro-ego-") || ALLOWED_SYSTEMD_DROPIN_DIRS.contains(&name))
+}
+
 /// Check whether a bundle asset relative path is in an allowed namespace:
-/// `deploy/miro-ego/<asset>` or `share/voice/<cue>.wav`.
+/// `deploy/miro-ego/<asset>`, `deploy/miro-ego/<allowed-unit>.d/<name>.conf`,
+/// or `share/voice/<cue>.wav`.
 pub fn is_allowed_bundle_asset_path(path: &str) -> bool {
     if let Some(rest) = path.strip_prefix("deploy/miro-ego/") {
-        return !rest.is_empty();
+        if rest.is_empty() {
+            return false;
+        }
+        if let Some((dir, file)) = rest.split_once('/') {
+            return is_allowed_systemd_dropin_dir(dir)
+                && !file.is_empty()
+                && !file.contains('/')
+                && file.ends_with(".conf");
+        }
+        return true;
     }
     if let Some(wav_file) = path.strip_prefix("share/voice/") {
         if let Some(stem) = wav_file.strip_suffix(".wav") {
@@ -573,9 +600,80 @@ pub fn is_allowed_bundle_asset_path(path: &str) -> bool {
     false
 }
 
+fn open_or_create_dir_tree_nofollow(parent: &Path) -> DeployResult<File> {
+    let anchor = if parent.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    };
+    let mut cur_dir = open_directory_safe(anchor).map_err(|err| DeployError::Failed {
+        message: format!(
+            "failed opening root directory {} safely: {err}",
+            anchor.display()
+        ),
+    })?;
+    for comp in parent.components() {
+        match comp {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(seg) => {
+                let seg_c = CString::new(seg.as_bytes()).map_err(|_| DeployError::Failed {
+                    message: format!("path component contains NUL byte: {}", parent.display()),
+                })?;
+                let dir_flags =
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+                cur_dir = match openat_retry(cur_dir.as_raw_fd(), &seg_c, dir_flags) {
+                    Ok(d) => d,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        // SAFETY: `cur_dir` is an open directory fd and `seg_c` is NUL-terminated.
+                        let rc =
+                            unsafe { libc::mkdirat(cur_dir.as_raw_fd(), seg_c.as_ptr(), 0o755) };
+                        if rc != 0 {
+                            let mk_err = std::io::Error::last_os_error();
+                            if mk_err.kind() != std::io::ErrorKind::AlreadyExists {
+                                return Err(DeployError::Failed {
+                                    message: format!(
+                                        "failed creating destination dir {}: {mk_err}",
+                                        parent.display()
+                                    ),
+                                });
+                            }
+                        }
+                        openat_retry(cur_dir.as_raw_fd(), &seg_c, dir_flags).map_err(
+                            |open_err| DeployError::Failed {
+                                message: format!(
+                                    "destination dir {} is unsafe or a symlink: {open_err}",
+                                    parent.display()
+                                ),
+                            },
+                        )?
+                    }
+                    Err(err) => {
+                        return Err(DeployError::Failed {
+                            message: format!(
+                                "destination dir {} component is unsafe or not a directory: {err}",
+                                parent.display()
+                            ),
+                        });
+                    }
+                };
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(DeployError::Failed {
+                    message: format!(
+                        "forbidden path traversal component in destination {}",
+                        parent.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(cur_dir)
+}
+
 /// Stream-copy a regular file opened with `O_NOFOLLOW` into an exclusive temporary file under
-/// `dst`'s parent directory, verifying byte length, SHA-256, and optional AArch64 ELF64 header
-/// on the exact copied stream BEFORE atomic rename + parent directory fsync.
+/// `dst`'s parent directory (walking components with `O_DIRECTORY | O_NOFOLLOW`), verifying byte
+/// length, SHA-256, and optional AArch64 ELF64 header on the exact copied stream BEFORE atomic
+/// `renameat` + parent directory fsync.
 pub fn copy_and_verify_safe(
     bundle_root: Option<&Path>,
     src_path_or_rel: &Path,
@@ -602,36 +700,55 @@ pub fn copy_and_verify_safe(
     let parent = dst.parent().ok_or_else(|| DeployError::Failed {
         message: format!("destination path has no parent: {}", dst.display()),
     })?;
-    fs::create_dir_all(parent).map_err(|err| DeployError::Failed {
-        message: format!(
-            "failed creating destination dir {}: {err}",
-            parent.display()
-        ),
-    })?;
+    let parent_dir = open_or_create_dir_tree_nofollow(parent)?;
 
     let file_name = dst
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_else(|| "artifact".to_owned());
-    let tmp_path = parent.join(format!(
+    let dst_name_c = CString::new(file_name.as_bytes()).map_err(|_| DeployError::Failed {
+        message: format!("destination file name contains NUL byte: {}", dst.display()),
+    })?;
+    let tmp_name = format!(
         ".{file_name}.tmp-{}-{}",
         std::process::id(),
         new_uuid_v4().replace('-', "")
-    ));
+    );
+    let tmp_name_c = CString::new(tmp_name.as_bytes()).map_err(|_| DeployError::Failed {
+        message: "temp file name contains NUL byte".to_owned(),
+    })?;
+    let tmp_path = parent.join(&tmp_name);
 
     let copy_res = (|| -> DeployResult<u64> {
-        let mut out_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&tmp_path)
-            .map_err(|err| DeployError::Failed {
-                message: format!(
-                    "failed creating staging temp file {}: {err}",
-                    tmp_path.display()
-                ),
-            })?;
+        let out_fd = loop {
+            // SAFETY: `parent_dir` is an open `O_DIRECTORY` fd and `tmp_name_c` is NUL-terminated.
+            let fd = unsafe {
+                libc::openat(
+                    parent_dir.as_raw_fd(),
+                    tmp_name_c.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    mode as libc::mode_t,
+                )
+            };
+            if fd >= 0 {
+                break fd;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(DeployError::Failed {
+                    message: format!(
+                        "failed creating staging temp file {}: {err}",
+                        tmp_path.display()
+                    ),
+                });
+            }
+        };
+        // SAFETY: `out_fd` is a newly opened owned descriptor.
+        let mut out_file = unsafe { File::from_raw_fd(out_fd) };
 
         let mut hasher = Sha256::new();
         let mut buf = [0u8; 64 * 1024];
@@ -705,19 +822,34 @@ pub fn copy_and_verify_safe(
         })?;
         drop(out_file);
 
-        fs::rename(&tmp_path, dst).map_err(|err| DeployError::Failed {
-            message: format!(
-                "failed atomically promoting {} to {}: {err}",
-                tmp_path.display(),
-                dst.display()
-            ),
-        })?;
+        // SAFETY: `parent_dir` is an open directory fd and both C strings are NUL-terminated.
+        if unsafe {
+            libc::renameat(
+                parent_dir.as_raw_fd(),
+                tmp_name_c.as_ptr(),
+                parent_dir.as_raw_fd(),
+                dst_name_c.as_ptr(),
+            )
+        } != 0
+        {
+            let err = std::io::Error::last_os_error();
+            return Err(DeployError::Failed {
+                message: format!(
+                    "failed atomically promoting {} to {}: {err}",
+                    tmp_path.display(),
+                    dst.display()
+                ),
+            });
+        }
         let _ = fsync_directory(parent);
         Ok(total)
     })();
 
     if copy_res.is_err() {
-        let _ = fs::remove_file(&tmp_path);
+        // SAFETY: `parent_dir` is an open directory fd and `tmp_name_c` is NUL-terminated.
+        unsafe {
+            let _ = libc::unlinkat(parent_dir.as_raw_fd(), tmp_name_c.as_ptr(), 0);
+        }
     }
     copy_res
 }

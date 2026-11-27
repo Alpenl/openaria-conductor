@@ -8,6 +8,7 @@ use crate::artifact_io::{
     ArtifactFileIdentity, ByteRange, open_relative_regular_in_dir, parse_single_byte_range,
 };
 use crate::util::{VolumeHandleLease, now_rfc3339_utc, unix_secs_to_rfc3339_utc};
+use crate::volume::ExfatVolumeManager;
 use crate::{StorageError, StorageResult};
 use miro_ego_core::ids::hex_encode;
 use miro_ego_core::paths::DataVolumePaths;
@@ -24,7 +25,7 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 pub const LOG_LIST_SCHEMA: &str = "miro-ego.log-list.v1";
 pub const DEFAULT_LOG_LIST_LIMIT: usize = 200;
@@ -215,6 +216,7 @@ pub struct LogStore {
     paths: DataVolumePaths,
     volume_ready: VolumeReadyFn,
     handle_counter: Option<Arc<AtomicUsize>>,
+    released_flag: Option<Arc<AtomicBool>>,
 }
 
 impl LogStore {
@@ -223,12 +225,41 @@ impl LogStore {
             paths,
             volume_ready,
             handle_counter: None,
+            released_flag: None,
         }
     }
 
     pub fn with_handle_counter(mut self, counter: Arc<AtomicUsize>) -> Self {
         self.handle_counter = Some(counter);
         self
+    }
+
+    /// Bind an [`ExfatVolumeManager`] so log listing/opening gates through
+    /// `SeqCst` [`ExfatVolumeManager::try_acquire_handle_lease`].
+    pub fn with_volume(mut self, volume: &ExfatVolumeManager) -> Self {
+        self.handle_counter = Some(volume.handle_counter());
+        self.released_flag = Some(volume.released_flag());
+        self
+    }
+
+    fn try_acquire_lease(&self, unavailable_msg: &str) -> StorageResult<Option<VolumeHandleLease>> {
+        let lease = match (&self.handle_counter, &self.released_flag) {
+            (Some(counter), Some(released)) => {
+                let lease = VolumeHandleLease::try_acquire(Arc::clone(counter), released)
+                    .ok_or_else(|| StorageError::Unavailable {
+                        message: unavailable_msg.to_owned(),
+                    })?;
+                Some(lease)
+            }
+            (Some(counter), None) => Some(VolumeHandleLease::acquire(Arc::clone(counter))),
+            (None, _) => None,
+        };
+        if !(self.volume_ready)() {
+            return Err(StorageError::Unavailable {
+                message: unavailable_msg.to_owned(),
+            });
+        }
+        Ok(lease)
     }
 
     /// List visible regular diagnostic logs under `/data/logs/`, newest `modified_at` first.
@@ -253,11 +284,8 @@ impl LogStore {
             ));
         }
 
-        if !(self.volume_ready)() {
-            return Err(StorageError::Unavailable {
-                message: "recording volume is unavailable for diagnostic log listing".to_owned(),
-            });
-        }
+        let _lease =
+            self.try_acquire_lease("recording volume is unavailable for diagnostic log listing")?;
 
         let mount_dir = open_directory_safe(self.paths.mountpoint()).map_err(|err| {
             StorageError::Unavailable {
@@ -338,11 +366,8 @@ impl LogStore {
     /// Open one safe regular diagnostic log file under `/data/logs/{name}`.
     pub fn open_log(&self, name: &str) -> StorageResult<OpenedLogFile> {
         validate_log_name(name)?;
-        if !(self.volume_ready)() {
-            return Err(StorageError::Unavailable {
-                message: "recording volume is unavailable for diagnostic log download".to_owned(),
-            });
-        }
+        let lease =
+            self.try_acquire_lease("recording volume is unavailable for diagnostic log download")?;
 
         let logs_root = self.paths.logs_dir();
         let mount_dir = open_directory_safe(self.paths.mountpoint()).map_err(|err| {
@@ -383,11 +408,6 @@ impl LogStore {
             ));
         }
         let is_exfat = is_exfat_or_msdos(root_dir.as_raw_fd()).unwrap_or(false);
-
-        let lease = self
-            .handle_counter
-            .as_ref()
-            .map(|c| VolumeHandleLease::acquire(Arc::clone(c)));
 
         let file = open_relative_regular_in_dir(&root_dir, root_dev, name)?;
         let st = fstat(file.as_raw_fd())

@@ -350,6 +350,8 @@ pub async fn session_artifact(
     let content_range = resolved
         .content_range
         .map(|r| r.content_range_header(representation.size));
+    let range_reaches_file_eof =
+        resolved.offset.saturating_add(resolved.length) >= representation.size;
     let crate::downloads::OpenRepresentation {
         content_type,
         etag,
@@ -373,6 +375,7 @@ pub async fn session_artifact(
             permit,
             Some(session_lease),
             lease_guard,
+            range_reaches_file_eof,
         )
     };
 
@@ -456,7 +459,7 @@ pub async fn delete_sessions(
             return render_delete_outcome(&ctx, outcome);
         }
         Ok(DeleteReplayLookup::Coalesce(rx)) => {
-            return render_coalesced_delete(&ctx, rx).await;
+            return render_coalesced_delete(&ctx, rx, true).await;
         }
         Ok(DeleteReplayLookup::Miss) => {}
         Err(err) => return ctx.error_response(err),
@@ -478,7 +481,7 @@ pub async fn delete_sessions(
     }
 
     // 3. Acquire per-session delete gate (only open downloads on `target_sids` block deletion!).
-    let exec_guard = match state.artifact_delete_gate.try_begin_delete(
+    let (exec_guard, rx) = match state.artifact_delete_gate.try_begin_delete(
         principal.principal_id(),
         &key,
         canonical,
@@ -488,39 +491,47 @@ pub async fn delete_sessions(
             return render_delete_outcome(&ctx, outcome);
         }
         Ok(DeleteBeginResult::Coalesce(rx)) => {
-            return render_coalesced_delete(&ctx, rx).await;
+            return render_coalesced_delete(&ctx, rx, true).await;
         }
-        Ok(DeleteBeginResult::Execute(guard)) => guard,
+        Ok(DeleteBeginResult::Execute(guard, rx)) => (guard, rx),
         Err(err) => return ctx.error_response(err),
     };
 
-    let res = state.backend.delete_sessions(cmd).await;
-    exec_guard.finish(&res);
-    match res {
-        Ok(outcome) => render_delete_outcome(&ctx, outcome),
-        Err(err) => ctx.error_response(err),
-    }
+    // Execute deletion + guard inside a detached task so a disconnecting HTTP client cannot drop
+    // `deleting_sessions` protection while files are still being unlinked on disk.
+    let backend = Arc::clone(&state.backend);
+    tokio::spawn(async move {
+        let res = backend.delete_sessions(cmd).await;
+        exec_guard.finish(&res);
+    });
+    render_coalesced_delete(&ctx, rx, false).await
 }
 
 async fn render_coalesced_delete(
     ctx: &RequestCtx,
     mut rx: tokio::sync::watch::Receiver<Option<ApiResult<CommandOutcome>>>,
+    mark_replayed: bool,
 ) -> Response<Body> {
     loop {
         if let Some(res) = rx.borrow_and_update().clone() {
             return match res {
                 Ok(mut outcome) => {
-                    outcome.replayed = true;
+                    if mark_replayed {
+                        outcome.replayed = true;
+                    }
                     render_delete_outcome(ctx, outcome)
                 }
                 Err(err) => ctx.error_response(err),
             };
         }
         if rx.changed().await.is_err() {
-            return ctx.error_response(ApiError::service_unavailable(
-                "delete_interrupted",
-                "in-flight session deletion was interrupted; retry",
-            ));
+            return ctx.error_response(
+                ApiError::service_unavailable(
+                    "delete_interrupted",
+                    "in-flight session deletion was interrupted; retry",
+                )
+                .with_header("Retry-After", "1"),
+            );
         }
     }
 }

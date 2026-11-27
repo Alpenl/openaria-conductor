@@ -52,7 +52,10 @@ struct CoalescerInner {
 enum BeginStep {
     Replay(CommandOutcome),
     Follower(watch::Receiver<Option<ApiResult<CommandOutcome>>>),
-    Leader(LeaderGuard),
+    Leader(
+        LeaderGuard,
+        watch::Receiver<Option<ApiResult<CommandOutcome>>>,
+    ),
 }
 
 struct LeaderGuard {
@@ -156,7 +159,7 @@ impl IdempotencyCoalescer {
     ) -> ApiResult<CommandOutcome>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = ApiResult<CommandOutcome>>,
+        Fut: Future<Output = ApiResult<CommandOutcome>> + Send + 'static,
     {
         self.execute_inner(
             principal_id,
@@ -183,7 +186,7 @@ impl IdempotencyCoalescer {
     ) -> ApiResult<CommandOutcome>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = ApiResult<CommandOutcome>>,
+        Fut: Future<Output = ApiResult<CommandOutcome>> + Send + 'static,
     {
         self.execute_inner(
             principal_id,
@@ -210,7 +213,7 @@ impl IdempotencyCoalescer {
     ) -> ApiResult<CommandOutcome>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = ApiResult<CommandOutcome>>,
+        Fut: Future<Output = ApiResult<CommandOutcome>> + Send + 'static,
     {
         let step = self.begin(
             principal_id,
@@ -222,28 +225,16 @@ impl IdempotencyCoalescer {
         )?;
         match step {
             BeginStep::Replay(outcome) => Ok(outcome),
-            BeginStep::Follower(mut rx) => loop {
-                if let Some(res) = rx.borrow_and_update().clone() {
-                    return match res {
-                        Ok(mut outcome) => {
-                            outcome.replayed = true;
-                            Ok(outcome)
-                        }
-                        Err(err) => Err(err),
-                    };
-                }
-                if rx.changed().await.is_err() {
-                    return Err(ApiError::service_unavailable(
-                        "command_interrupted",
-                        "in-flight idempotent command was interrupted; retry",
-                    )
-                    .with_header("Retry-After", "1"));
-                }
-            },
-            BeginStep::Leader(leader) => {
-                let res = fut().await;
-                leader.finish(&res);
-                res
+            BeginStep::Follower(rx) => await_watch_result(rx, true).await,
+            BeginStep::Leader(leader, rx) => {
+                // Run the leader future + `LeaderGuard` in a detached task so a disconnecting
+                // leader HTTP client never aborts in-flight backend / `spawn_blocking` work.
+                let work = fut();
+                tokio::spawn(async move {
+                    let res = work.await;
+                    leader.finish(&res);
+                });
+                await_watch_result(rx, false).await
             }
         }
     }
@@ -290,17 +281,46 @@ impl IdempotencyCoalescer {
             InFlightRecord {
                 operation_id: operation_id.to_owned(),
                 canonical_body: canonical_body.to_vec(),
-                rx,
+                rx: rx.clone(),
             },
         );
-        Ok(BeginStep::Leader(LeaderGuard {
-            coalescer: Arc::clone(self),
-            key,
-            operation_id: operation_id.to_owned(),
-            canonical_body: canonical_body.to_vec(),
-            cache_completed,
-            tx: Some(tx),
-        }))
+        Ok(BeginStep::Leader(
+            LeaderGuard {
+                coalescer: Arc::clone(self),
+                key,
+                operation_id: operation_id.to_owned(),
+                canonical_body: canonical_body.to_vec(),
+                cache_completed,
+                tx: Some(tx),
+            },
+            rx,
+        ))
+    }
+}
+
+async fn await_watch_result(
+    mut rx: watch::Receiver<Option<ApiResult<CommandOutcome>>>,
+    mark_replayed: bool,
+) -> ApiResult<CommandOutcome> {
+    loop {
+        if let Some(res) = rx.borrow_and_update().clone() {
+            return match res {
+                Ok(mut outcome) => {
+                    if mark_replayed {
+                        outcome.replayed = true;
+                    }
+                    Ok(outcome)
+                }
+                Err(err) => Err(err),
+            };
+        }
+        if rx.changed().await.is_err() {
+            return Err(ApiError::service_unavailable(
+                "command_interrupted",
+                "in-flight idempotent command was interrupted; retry",
+            )
+            .with_header("Retry-After", "1"));
+        }
     }
 }
 
@@ -345,5 +365,96 @@ fn prune_expired_locked(guard: &mut CoalescerInner) {
         } else {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn leader_disconnect_completes_detached_work_and_serves_follower_and_replay() {
+        let coalescer = Arc::new(IdempotencyCoalescer::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let c1 = Arc::clone(&coalescer);
+        let calls1 = Arc::clone(&calls);
+        let started1 = Arc::clone(&started);
+        let release1 = Arc::clone(&release);
+        let leader_handle = tokio::spawn(async move {
+            c1.execute(
+                "op-1",
+                "startCapture",
+                "startCapture",
+                "key-disconnect-1",
+                b"{}",
+                move || async move {
+                    calls1.fetch_add(1, Ordering::SeqCst);
+                    started1.notify_one();
+                    release1.notified().await;
+                    Ok(CommandOutcome {
+                        status_code: 202,
+                        body: Some(json!({"ok": true})),
+                        replayed: false,
+                    })
+                },
+            )
+            .await
+        });
+
+        started.notified().await;
+
+        // Start a coalescing follower before dropping the leader task.
+        let c2 = Arc::clone(&coalescer);
+        let calls2 = Arc::clone(&calls);
+        let follower_handle = tokio::spawn(async move {
+            c2.execute(
+                "op-1",
+                "startCapture",
+                "startCapture",
+                "key-disconnect-1",
+                b"{}",
+                move || async move {
+                    calls2.fetch_add(1, Ordering::SeqCst);
+                    Ok(CommandOutcome {
+                        status_code: 202,
+                        body: Some(json!({"ok": false})),
+                        replayed: false,
+                    })
+                },
+            )
+            .await
+        });
+
+        // Simulate leader HTTP client disconnect by aborting the leader handler task.
+        tokio::task::yield_now().await;
+        leader_handle.abort();
+        let _ = leader_handle.await;
+
+        // Release backend work: detached task must finish and deliver outcome to follower + cache.
+        release.notify_one();
+        let follower_res = follower_handle.await.unwrap().unwrap();
+        assert!(follower_res.replayed);
+        assert_eq!(follower_res.body, Some(json!({"ok": true})));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Retrying client after completion gets cached replay without re-executing backend.
+        let replay_res = coalescer
+            .execute(
+                "op-1",
+                "startCapture",
+                "startCapture",
+                "key-disconnect-1",
+                b"{}",
+                || async { unreachable!("must replay cached outcome") },
+            )
+            .await
+            .unwrap();
+        assert!(replay_res.replayed);
+        assert_eq!(replay_res.body, Some(json!({"ok": true})));
     }
 }

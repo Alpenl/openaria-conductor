@@ -438,6 +438,13 @@ hb_s32 hb_mm_mc_dequeue_output_buffer(media_codec_context_t *context,
     if (mc == NULL || buffer == NULL || info == NULL) {
         return -EINVAL;
     }
+    pthread_mutex_lock(&g_mock_lock);
+    const int forced_err = mc->is_encoder ? g_cfg.force_encoder_output_error
+                                          : g_cfg.force_decoder_output_error;
+    pthread_mutex_unlock(&g_mock_lock);
+    if (forced_err != 0) {
+        return forced_err;
+    }
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

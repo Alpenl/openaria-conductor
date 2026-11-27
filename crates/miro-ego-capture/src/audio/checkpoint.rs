@@ -4,6 +4,7 @@ use crate::audio::{
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -133,6 +134,7 @@ pub fn commit_checkpoint(
             let opened = OpenOptions::new()
                 .append(true)
                 .create_new(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(directory.join("checkpoint.ndjson"))
                 .map_err(|e| {
                     AudioError::io("write_failed", "create audio checkpoint journal", e)
@@ -158,6 +160,7 @@ pub fn commit_checkpoint(
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&temporary)
         .map_err(|e| AudioError::io("write_failed", "create audio checkpoint header", e))?;
     let commit_result = (|| -> io::Result<()> {
@@ -165,7 +168,7 @@ pub fn commit_checkpoint(
         output.sync_all()?;
         drop(output);
         std::fs::rename(&temporary, directory.join("checkpoint.json"))?;
-        File::open(&directory)?.sync_all()?;
+        miro_ego_core::sys::fs::fsync_directory(&directory)?;
         Ok(())
     })();
     if let Err(error) = commit_result {

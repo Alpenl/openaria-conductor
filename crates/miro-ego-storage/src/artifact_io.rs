@@ -3,6 +3,7 @@
 //! page-cache management.
 
 use crate::util::{VolumeHandleLease, is_safe_path_segment, sha256_hex};
+use crate::volume::ExfatVolumeManager;
 use crate::{StorageError, StorageResult};
 use miro_ego_core::ids::is_valid_sha256;
 use miro_ego_core::sys::fs::{
@@ -516,7 +517,66 @@ pub fn open_verified_artifact_checked_with_lease(
     }
 
     let lease = handle_counter.map(|c| VolumeHandleLease::acquire(Arc::clone(c)));
+    open_verified_artifact_inner(
+        recordings_root,
+        relative_dir,
+        artifact_id,
+        expected_session_id,
+        expected_manifest_sha256,
+        verify_digest,
+        lease,
+    )
+}
 
+/// Safely open a verified artifact gated atomically via [`ExfatVolumeManager::try_acquire_handle_lease`]
+/// (`SeqCst` increment-then-check-`released` barrier) so zero descriptors open after `SafeSwap`.
+pub fn open_verified_artifact_checked_with_volume(
+    recordings_root: &Path,
+    relative_dir: &str,
+    artifact_id: &str,
+    expected_session_id: Option<&str>,
+    expected_manifest_sha256: Option<&str>,
+    verify_digest: bool,
+    volume: Option<&ExfatVolumeManager>,
+) -> StorageResult<VerifiedArtifactFile> {
+    if !is_valid_sha256(artifact_id) {
+        return Err(StorageError::invalid_input(
+            "invalid_artifact_id",
+            "artifact_id must be a 64-character lowercase SHA-256 digest",
+        ));
+    }
+
+    let lease = match volume {
+        Some(vol) => {
+            Some(
+                vol.try_acquire_handle_lease()
+                    .ok_or_else(|| StorageError::Unavailable {
+                        message: "recording volume has been released for safe swap".to_owned(),
+                    })?,
+            )
+        }
+        None => None,
+    };
+    open_verified_artifact_inner(
+        recordings_root,
+        relative_dir,
+        artifact_id,
+        expected_session_id,
+        expected_manifest_sha256,
+        verify_digest,
+        lease,
+    )
+}
+
+fn open_verified_artifact_inner(
+    recordings_root: &Path,
+    relative_dir: &str,
+    artifact_id: &str,
+    expected_session_id: Option<&str>,
+    expected_manifest_sha256: Option<&str>,
+    verify_digest: bool,
+    lease: Option<VolumeHandleLease>,
+) -> StorageResult<VerifiedArtifactFile> {
     let (session_dir, root_dev, exfat) = open_pinned_directory(recordings_root, relative_dir)?;
     let manifest = open_manifest_in_dir(&session_dir, root_dev, exfat, expected_session_id)?;
     if let Some(expected_sha) = expected_manifest_sha256 {
@@ -647,8 +707,24 @@ pub fn open_verified_artifact_checked_with_lease(
     })
 }
 
-/// Extract all downloadable artifact descriptors from a parsed `miro-ego.device-session.v1` manifest.
+/// Extract unique downloadable artifact descriptors from a parsed `miro-ego.device-session.v1` manifest.
 pub fn extract_manifest_artifacts(root: &Value) -> StorageResult<Vec<ManifestArtifactDescriptor>> {
+    extract_manifest_artifacts_impl(root, true)
+}
+
+/// Extract every declared artifact path descriptor from a parsed `miro-ego.device-session.v1`
+/// manifest without deduplicating shared SHA-256 digests, so integrity verification checks every
+/// declared path on disk.
+pub(crate) fn extract_all_manifest_artifacts(
+    root: &Value,
+) -> StorageResult<Vec<ManifestArtifactDescriptor>> {
+    extract_manifest_artifacts_impl(root, false)
+}
+
+fn extract_manifest_artifacts_impl(
+    root: &Value,
+    dedup_by_id: bool,
+) -> StorageResult<Vec<ManifestArtifactDescriptor>> {
     let obj = root.as_object().ok_or_else(|| {
         StorageError::integrity("manifest_invalid", "manifest root must be object")
     })?;
@@ -791,6 +867,9 @@ pub fn extract_manifest_artifacts(root: &Value) -> StorageResult<Vec<ManifestArt
                     "conflicting representation metadata for duplicate artifact_id",
                 ));
             }
+            if !dedup_by_id {
+                out.push(desc);
+            }
         } else {
             by_id.insert(desc.artifact_id.clone(), desc.clone());
             out.push(desc);
@@ -861,16 +940,17 @@ fn req_str<'a>(obj: &'a Map<String, Value>, key: &str) -> StorageResult<&'a str>
 /// Strictly validate a manifest artifact relative path.
 pub fn validate_artifact_relative_path(path: &str) -> StorageResult<()> {
     let components = parse_relative_components(path)?;
-    if let Some(&first) = components.first() {
-        if first == "manifest.json" || first == "recording.json" {
-            return Err(StorageError::invalid_input(
-                "invalid_path",
-                "control files cannot be accessed as artifacts",
-            ));
-        }
+    if let Some(&first) = components.first()
+        && (first.eq_ignore_ascii_case("manifest.json")
+            || first.eq_ignore_ascii_case("recording.json"))
+    {
+        return Err(StorageError::invalid_input(
+            "invalid_path",
+            "control files cannot be accessed as artifacts",
+        ));
     }
     for comp in &components {
-        if comp.contains(".tmp") {
+        if comp.to_ascii_lowercase().contains(".tmp") {
             return Err(StorageError::invalid_input(
                 "invalid_path",
                 "temporary files cannot be accessed as artifacts",

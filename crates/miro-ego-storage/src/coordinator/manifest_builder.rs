@@ -343,7 +343,7 @@ impl CaptureCoordinator {
         let final_root = self.volume.paths().recordings_dir().join(&relative_dir);
 
         let verify_published_res: StorageResult<IndexedSession> = (|| {
-            remove_control_markers_with_logs(&final_root, &declared_log_paths)?;
+            let _ = remove_control_markers_with_logs(&final_root, &declared_log_paths);
             if combined_logs.is_empty() {
                 let _ = fs::remove_dir(final_root.join("logs"));
             }

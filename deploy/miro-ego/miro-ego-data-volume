@@ -1,7 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MOUNT="${MIRO_EGO_DATA_VOLUME_MOUNT:-/data}"
+ENV_FILE="${MIRO_EGO_DATA_VOLUME_ENV_FILE:-/etc/default/miro-ego-data-volume}"
+if [ -z "${MIRO_EGO_DATA_VOLUME_PARTUUID:-}" ] || [ -z "${MIRO_EGO_DATA_VOLUME_UUID:-}" ]; then
+    if [ -r "$ENV_FILE" ]; then
+        while IFS= read -r env_line || [ -n "$env_line" ]; do
+            case "$env_line" in
+                ''|\#*) continue ;;
+                export\ *) env_line="${env_line#export }" ;;
+            esac
+            case "$env_line" in
+                MIRO_EGO_DATA_VOLUME_MODE=*|MIRO_EGO_DATA_VOLUME_PARTUUID=*|MIRO_EGO_DATA_VOLUME_UUID=*|MIRO_EGO_DATA_VOLUME_MOUNT=*|MIRO_EGO_DATA_MOUNTPOINT=*)
+                    env_key="${env_line%%=*}"
+                    env_val="${env_line#*=}"
+                    case "$env_val" in
+                        \"*\") env_val="${env_val#\"}"; env_val="${env_val%\"}" ;;
+                        \'*\') env_val="${env_val#\'}"; env_val="${env_val%\'}" ;;
+                    esac
+                    case "$env_key" in
+                        MIRO_EGO_DATA_VOLUME_MODE)
+                            [ -n "${MIRO_EGO_DATA_VOLUME_MODE:-}" ] || MIRO_EGO_DATA_VOLUME_MODE="$env_val"
+                            ;;
+                        MIRO_EGO_DATA_VOLUME_PARTUUID)
+                            [ -n "${MIRO_EGO_DATA_VOLUME_PARTUUID:-}" ] || MIRO_EGO_DATA_VOLUME_PARTUUID="$env_val"
+                            ;;
+                        MIRO_EGO_DATA_VOLUME_UUID)
+                            [ -n "${MIRO_EGO_DATA_VOLUME_UUID:-}" ] || MIRO_EGO_DATA_VOLUME_UUID="$env_val"
+                            ;;
+                        MIRO_EGO_DATA_VOLUME_MOUNT)
+                            [ -n "${MIRO_EGO_DATA_VOLUME_MOUNT:-}" ] || MIRO_EGO_DATA_VOLUME_MOUNT="$env_val"
+                            ;;
+                        MIRO_EGO_DATA_MOUNTPOINT)
+                            [ -n "${MIRO_EGO_DATA_MOUNTPOINT:-}" ] || MIRO_EGO_DATA_MOUNTPOINT="$env_val"
+                            ;;
+                    esac
+                    ;;
+            esac
+        done < "$ENV_FILE"
+    fi
+fi
+
+MOUNT="${MIRO_EGO_DATA_VOLUME_MOUNT:-${MIRO_EGO_DATA_MOUNTPOINT:-/data}}"
 MODE="${MIRO_EGO_DATA_VOLUME_MODE:-exfat}"
 MIRO_EGO_BIN="${MIRO_EGO_BIN:-/opt/miro-ego/current/bin/miro-ego}"
 
@@ -137,6 +176,12 @@ if [[ ",$options," != *,rw,* ]]; then
         exit 1
     }
 fi
+for required_opt in "uid=$capture_uid" "gid=$capture_gid" "nosuid" "nodev" "noexec"; do
+    if [[ ",$options," != *",$required_opt,"* ]]; then
+        log "$MOUNT mount options missing required $required_opt: $options"
+        exit 1
+    fi
+done
 
 runuser -u miro-ego -- mkdir -p \
     "$MOUNT/recordings" \

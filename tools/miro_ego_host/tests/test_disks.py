@@ -321,6 +321,89 @@ class HostDisksTests(unittest.TestCase):
             self.assertIn(0x0007C0F4, ioctls)  # IOCTL_DISK_SET_DISK_ATTRIBUTES (offline)
         self.assertIn(0x00070140, ioctls)  # IOCTL_DISK_UPDATE_PROPERTIES on restore
 
+    def test_check_path_not_on_disk_walks_up_to_existing_ancestor_on_linux_and_macos(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            existing_parent = Path(folder)
+            missing_output = existing_parent / "missing-dir" / "nested" / "out.img"
+
+            seen_linux: list[tuple[str, ...]] = []
+
+            def fake_linux_run(*args: str) -> bytes:
+                seen_linux.append(args)
+                return b"/dev/sdb1\n"
+
+            with (
+                patch.object(disks.platform, "system", return_value="Linux"),
+                patch.object(disks, "run", side_effect=fake_linux_run),
+                self.assertRaisesRegex(RuntimeError, "target disk"),
+            ):
+                disks.check_path_not_on_disk(
+                    "/dev/sdb",
+                    missing_output,
+                    message="Output image cannot be stored on target disk",
+                )
+            self.assertEqual(
+                seen_linux,
+                [("findmnt", "-n", "-o", "SOURCE", "--target", str(existing_parent))],
+            )
+
+            seen_darwin: list[tuple[str, ...]] = []
+
+            def fake_darwin_run(*args: str) -> bytes:
+                seen_darwin.append(args)
+                if args[0] == "df":
+                    return (
+                        b"Filesystem 512-blocks Used Available Capacity Mounted on\n"
+                        b"/dev/disk4s1 1 1 1 1% /Volumes/Card\n"
+                    )
+                return plistlib.dumps({"ParentWholeDisk": "disk4"})
+
+            with (
+                patch.object(disks.platform, "system", return_value="Darwin"),
+                patch.object(disks, "run", side_effect=fake_darwin_run),
+                self.assertRaisesRegex(RuntimeError, "target disk"),
+            ):
+                disks.check_path_not_on_disk(
+                    "/dev/disk4",
+                    missing_output,
+                    message="Output image cannot be stored on target disk",
+                )
+            self.assertEqual(seen_darwin[0], ("df", "-P", str(existing_parent)))
+
+    def test_write_card_flushes_linux_block_cache_before_verify(self) -> None:
+        import errno
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as folder:
+            card = Path(folder) / "card"
+            image = Path(folder) / "system.img"
+            card.write_bytes(b"old-data" * 512)
+            image.write_bytes(b"new-img!" * 64)
+            d = disks.Disk(str(card), card.stat().st_size, "test", "file")
+
+            ioctl_codes: list[int] = []
+            fadvise_calls: list[tuple[int, int, int]] = []
+
+            def fake_ioctl(_fd: int, code: int) -> None:
+                ioctl_codes.append(code)
+                raise OSError(errno.ENOTTY, "not a block device")
+
+            def fake_fadvise(_fd: int, offset: int, length: int, advice: int) -> None:
+                fadvise_calls.append((offset, length, advice))
+
+            with (
+                patch.object(disks.platform, "system", return_value="Linux"),
+                patch.object(fcntl, "ioctl", side_effect=fake_ioctl),
+                patch.object(os, "posix_fadvise", side_effect=fake_fadvise, create=True),
+                patch.object(os, "POSIX_FADV_DONTNEED", 4, create=True),
+            ):
+                disks.write_card(str(card), os.O_RDWR, d, image, disks.sha256_file(image))
+
+            self.assertEqual(ioctl_codes, [disks._LINUX_BLKFLSBUF, disks._LINUX_BLKFLSBUF])
+            self.assertEqual(fadvise_calls, [(0, 0, 4), (0, 0, 4)])
+
 
 if __name__ == "__main__":
     unittest.main()

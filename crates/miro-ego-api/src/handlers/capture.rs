@@ -791,8 +791,8 @@ pub async fn get_preview_h264(
         Err(err) => return ctx.error_response(err),
     };
 
-    let (gop_fragments, rx) = hub.subscribe_with_gop();
-    let Some(init) = hub.init_segment().await else {
+    let (init_opt, gop_fragments, rx) = hub.subscribe_with_gop();
+    let Some(init) = init_opt else {
         return ctx.error_response(ApiError::preview_unavailable(
             "H.264 preview initialization segment is not available yet",
         ));

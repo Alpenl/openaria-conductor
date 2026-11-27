@@ -2,7 +2,6 @@
 //! boot-bound calibration (`clock_settime(CLOCK_REALTIME)`, `<run_dir>/clock-state.json`).
 
 use crate::{NetworkError, NetworkResult};
-use miro_ego_core::ids::new_uuid_v4;
 use miro_ego_core::sys::fs::{read_bounded_json, write_bytes_atomic};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -14,6 +13,10 @@ pub const CLOCK_STATE_SCHEMA: &str = "miro-ego.clock-state.v1";
 pub const CLOCK_STATE_FILENAME: &str = "clock-state.json";
 pub const DEFAULT_BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 pub const MAX_CLOCK_STATE_BYTES: usize = 8 * 1024;
+/// Minimum accepted wall-clock timestamp (`2024-01-01T00:00:00Z` in ms).
+pub const CLOCK_MIN_MS: u64 = 1_704_067_200_000;
+/// Exclusive maximum accepted wall-clock timestamp (`2100-01-01T00:00:00Z` in ms).
+pub const CLOCK_MAX_MS: u64 = 4_102_444_800_000;
 
 /// Privileged clock status snapshot returned by `clock.status` and `clock.sync`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +63,6 @@ pub trait SystemClockBackend: Send + Sync {
 #[derive(Debug)]
 pub struct LinuxSystemClockBackend {
     boot_id_path: PathBuf,
-    fallback_boot_id: String,
 }
 
 impl Default for LinuxSystemClockBackend {
@@ -73,27 +75,34 @@ impl LinuxSystemClockBackend {
     pub fn new() -> Self {
         Self {
             boot_id_path: PathBuf::from(DEFAULT_BOOT_ID_PATH),
-            fallback_boot_id: new_uuid_v4(),
         }
     }
 
     pub fn with_boot_id_path(path: impl Into<PathBuf>) -> Self {
         Self {
             boot_id_path: path.into(),
-            fallback_boot_id: new_uuid_v4(),
         }
     }
 }
 
 impl SystemClockBackend for LinuxSystemClockBackend {
     fn boot_id(&self) -> NetworkResult<String> {
-        if let Ok(raw) = fs::read_to_string(&self.boot_id_path) {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() && trimmed.len() <= 64 {
-                return Ok(trimmed.to_ascii_lowercase());
-            }
+        let raw = fs::read_to_string(&self.boot_id_path).map_err(|err| NetworkError::Backend {
+            message: format!(
+                "failed to read boot_id from {}: {err}",
+                self.boot_id_path.display()
+            ),
+        })?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.len() > 64 {
+            return Err(NetworkError::Backend {
+                message: format!(
+                    "invalid boot_id contents in {}",
+                    self.boot_id_path.display()
+                ),
+            });
         }
-        Ok(self.fallback_boot_id.clone())
+        Ok(trimmed.to_ascii_lowercase())
     }
 
     fn is_ntp_synchronized(&self) -> NetworkResult<bool> {
@@ -293,10 +302,17 @@ pub fn execute_clock_sync(
     unix_time_ms: u64,
     replace: bool,
 ) -> NetworkResult<ClockStatusSnapshot> {
+    if !(CLOCK_MIN_MS..CLOCK_MAX_MS).contains(&unix_time_ms) {
+        return Err(NetworkError::Invalid {
+            message: format!(
+                "unix_time_ms {unix_time_ms} is outside valid range [{CLOCK_MIN_MS}, {CLOCK_MAX_MS})"
+            ),
+        });
+    }
     let boot_id = backend.boot_id()?;
     let ntp_synced = backend.is_ntp_synchronized()?;
 
-    if ntp_synced && !replace {
+    if ntp_synced {
         let now_ms = backend.realtime_unix_ms()?;
         let mono_now = backend.monotonic_ns()?;
         let persisted = load_boot_clock_state(run_dir, &boot_id);
@@ -380,6 +396,7 @@ fn persist_boot_clock_state(run_dir: &Path, state: &PersistedClockState) -> Netw
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miro_ego_core::ids::new_uuid_v4;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_run_dir(tag: &str) -> PathBuf {
@@ -410,12 +427,25 @@ mod tests {
         assert_eq!(init.synchronized_at_ms, None);
         assert_eq!(init.age_seconds, None);
 
-        // When NTP is synchronized and replace=false, clock_sync does NOT call clock_settime.
+        // When NTP is synchronized, even replace=true does NOT call clock_settime and returns source="ntp", applied=false.
         mock.set_ntp_synchronized(true);
         let ntp_skip = execute_clock_sync(&mock, &run_dir, 1_760_000_000_000, false).unwrap();
         assert_eq!(ntp_skip.source, "ntp");
         assert!(!ntp_skip.applied);
+        let ntp_replace = execute_clock_sync(&mock, &run_dir, 1_760_000_000_000, true).unwrap();
+        assert_eq!(ntp_replace.source, "ntp");
+        assert!(!ntp_replace.applied);
         assert_eq!(mock.settime_calls(), 0);
+
+        // Out-of-range timestamps must be rejected.
+        assert!(matches!(
+            execute_clock_sync(&mock, &run_dir, CLOCK_MIN_MS - 1, false),
+            Err(NetworkError::Invalid { .. })
+        ));
+        assert!(matches!(
+            execute_clock_sync(&mock, &run_dir, CLOCK_MAX_MS, false),
+            Err(NetworkError::Invalid { .. })
+        ));
 
         // Turn off NTP -> client sync applies and persists clock-state.json!
         mock.set_ntp_synchronized(false);
@@ -460,6 +490,14 @@ mod tests {
         assert!(!linux_backend.boot_id().unwrap().is_empty());
         let _ = linux_backend.is_ntp_synchronized().unwrap();
         assert!(linux_backend.monotonic_ns().unwrap() > 0);
+
+        // Unreadable boot_id path returns NetworkError::Backend instead of fabricating a UUID.
+        let bad_boot_backend =
+            LinuxSystemClockBackend::with_boot_id_path(run_dir.join("missing-boot-id"));
+        assert!(matches!(
+            bad_boot_backend.boot_id(),
+            Err(NetworkError::Backend { .. })
+        ));
 
         fs::remove_dir_all(run_dir).unwrap();
     }

@@ -7,7 +7,7 @@
 use crate::error::{CoreError, CoreResult};
 use crate::sys::clock::monotonic_ns;
 use crate::sys::fs::{
-    fsync_directory, open_create_exclusive, renameat2_noreplace, sync_and_evict_page_cache,
+    create_unique_temp_file, fsync_directory, renameat2_noreplace, sync_and_evict_page_cache,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,9 +17,6 @@ use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static TELEMETRY_FLUSH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Hard upper bound for in-memory telemetry fallback (4 MiB).
 pub const MAX_RING_BYTES: usize = 4 * 1024 * 1024;
@@ -276,23 +273,15 @@ impl BoundedRingLog {
             }
         }
 
-        let flush_seq = TELEMETRY_FLUSH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp_path = parent.join(format!(
-            ".{}.{}.{}.tmp",
-            file_name.to_string_lossy(),
-            std::process::id(),
-            flush_seq
-        ));
-        let temp_c = CString::new(temp_path.as_os_str().as_bytes()).map_err(|_| {
-            CoreError::invalid_input(
-                "telemetry_flush_failed",
-                "temporary telemetry path contains NUL byte",
-            )
-        })?;
+        let (temp_path, mut file) = create_unique_temp_file(parent, file_name, 0o640)
+            .map_err(|err| CoreError::io("telemetry_flush_failed", "create telemetry dump", err))?;
 
         let write_result = (|| -> CoreResult<()> {
-            let mut file = open_create_exclusive(&temp_path, 0o640).map_err(|err| {
-                CoreError::io("telemetry_flush_failed", "create telemetry dump", err)
+            let temp_c = CString::new(temp_path.as_os_str().as_bytes()).map_err(|_| {
+                CoreError::invalid_input(
+                    "telemetry_flush_failed",
+                    "temporary telemetry path contains NUL byte",
+                )
             })?;
             for (_, line) in &lines {
                 file.write_all(line.as_bytes())

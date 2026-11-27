@@ -37,10 +37,9 @@ extern int32_t hb_mem_flush_buf_with_vaddr(uint64_t virt_addr, uint64_t size)
 
 #define DECODER_INPUT_TIMEOUT_MS 200
 #define DECODER_OUTPUT_TIMEOUT_MS 200
-#define DECODER_DRAIN_POLLS 25 /* 5s without output after input stops */
 #define ENCODER_INPUT_TIMEOUT_MS 200
 #define ENCODER_OUTPUT_TIMEOUT_MS 200
-#define ENCODER_DRAIN_POLLS 25 /* 5s ceiling on a stuck VPU drain */
+#define DRAIN_TIMEOUT_NS 5000000000ULL /* 5s ceiling on a stuck JPU/VPU drain */
 #define DEFAULT_INPUT_STALL_TIMEOUT_MS 5000 /* 5s continuous input backpressure ceiling */
 #define INPUT_RETRY_MIN_BACKOFF_NS 2000000ULL /* 2ms sleep floor when SDK returns immediately */
 #define ERROR_LEN 256
@@ -296,16 +295,8 @@ static int configure_encoder(media_codec_context_t *context,
 } while (0)
 #define SET_VBR(member) do { \
     params->rc_params.member.frame_rate = (uint32_t)config->fps; \
-    params->rc_params.member.bit_rate = (uint32_t)config->bitrate_kbps; \
-    params->rc_params.member.max_bit_rate = (uint32_t)config->bitrate_kbps; \
     params->rc_params.member.intra_period = period; \
     params->rc_params.member.intra_qp = (uint32_t)config->intra_qp; \
-    params->rc_params.member.initial_rc_qp = config->initial_qp; \
-    params->rc_params.member.vbv_buf_size = config->vbv_ms; \
-    params->rc_params.member.min_qp_I = params->rc_params.member.min_qp_P = \
-        params->rc_params.member.min_qp_B = (uint32_t)config->min_qp; \
-    params->rc_params.member.max_qp_I = params->rc_params.member.max_qp_P = \
-        params->rc_params.member.max_qp_B = (uint32_t)config->max_qp; \
     params->rc_params.member.qp_map_enable = 0; \
 } while (0)
 #define SET_FIXQP(member) do { \
@@ -672,6 +663,11 @@ static void segment_seal(miro_ego_pipeline_t *pipeline, segment_t *segment)
     do {
         sync_ret = fsync(dir_fd);
     } while (sync_ret < 0 && errno == EINTR);
+    if (sync_ret != 0 && (errno == EINVAL || errno == ENOSYS || errno == EOPNOTSUPP)) {
+        do {
+            sync_ret = syncfs(dir_fd);
+        } while (sync_ret < 0 && errno == EINTR);
+    }
     if (sync_ret != 0 && errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP) {
         fail(pipeline, "segment_seal_failed: sync video directory: %s", strerror(errno));
         close(dir_fd);
@@ -792,6 +788,27 @@ static void sleep_ns(unsigned long long ns)
     }
 }
 
+static void backoff_if_fast_retry(unsigned long long call_started_ns)
+{
+    const unsigned long long now_ns = monotonic_time_ns();
+    if (now_ns >= call_started_ns && (now_ns - call_started_ns) < INPUT_RETRY_MIN_BACKOFF_NS) {
+        sleep_ns(INPUT_RETRY_MIN_BACKOFF_NS - (now_ns - call_started_ns));
+    }
+}
+
+static int drain_deadline_expired(int *draining,
+                                  unsigned long long *drain_started_ns,
+                                  unsigned long long timeout_ns)
+{
+    const unsigned long long now_ns = monotonic_time_ns();
+    if (!*draining) {
+        *draining = 1;
+        *drain_started_ns = now_ns;
+        return 0;
+    }
+    return now_ns >= *drain_started_ns && (now_ns - *drain_started_ns) >= timeout_ns;
+}
+
 static int dequeue_input_with_retry(miro_ego_pipeline_t *pipeline,
                                     media_codec_context_t *codec,
                                     media_codec_buffer_t *buffer,
@@ -828,9 +845,7 @@ static int dequeue_input_with_retry(miro_ego_pipeline_t *pipeline,
         if (now_ns >= started_ns && (now_ns - started_ns) >= stall_ceiling_ns) {
             return ret;
         }
-        if (now_ns >= call_started_ns && (now_ns - call_started_ns) < INPUT_RETRY_MIN_BACKOFF_NS) {
-            sleep_ns(INPUT_RETRY_MIN_BACKOFF_NS - (now_ns - call_started_ns));
-        }
+        backoff_if_fast_retry(call_started_ns);
     }
 }
 
@@ -868,52 +883,49 @@ static void ion_flush_range(const uint8_t *ptr, uint64_t size)
 #endif
 }
 
-static void ion_invalidate_nv12_frame(const media_codec_buffer_t *frame)
+static void ion_cache_nv12_frame(const media_codec_buffer_t *frame, int invalidate)
 {
     if (frame == NULL || frame->vframe_buf.size == 0u ||
         frame->vframe_buf.vir_ptr[0] == NULL) {
         return;
     }
+    void (*op)(const uint8_t *, uint64_t) =
+        invalidate ? ion_invalidate_range : ion_flush_range;
     const int stride = frame->vframe_buf.stride > 0
                            ? frame->vframe_buf.stride
                            : frame->vframe_buf.width;
     const int height = frame->vframe_buf.height;
     if (stride <= 0 || height <= 0) {
-        ion_invalidate_range(frame->vframe_buf.vir_ptr[0], frame->vframe_buf.size);
+        op(frame->vframe_buf.vir_ptr[0], frame->vframe_buf.size);
         return;
     }
     const uint64_t y_bytes = (uint64_t)stride * (uint64_t)height;
     const uint64_t uv_bytes = (uint64_t)stride * (uint64_t)(height / 2);
-    if (frame->vframe_buf.vir_ptr[1] == frame->vframe_buf.vir_ptr[0] + y_bytes) {
-        ion_invalidate_range(frame->vframe_buf.vir_ptr[0], y_bytes + uv_bytes);
+    const uintptr_t y_addr = (uintptr_t)frame->vframe_buf.vir_ptr[0];
+    const uintptr_t uv_addr = (uintptr_t)frame->vframe_buf.vir_ptr[1];
+    if (frame->vframe_buf.vir_ptr[1] != NULL &&
+        uv_addr >= y_addr &&
+        (uint64_t)(uv_addr - y_addr) <= (uint64_t)frame->vframe_buf.size) {
+        const uint64_t uv_offset = (uint64_t)(uv_addr - y_addr);
+        const uint64_t total_bytes = uv_offset + uv_bytes;
+        op(frame->vframe_buf.vir_ptr[0],
+           total_bytes <= (uint64_t)frame->vframe_buf.size
+               ? total_bytes
+               : (uint64_t)frame->vframe_buf.size);
     } else {
-        ion_invalidate_range(frame->vframe_buf.vir_ptr[0], y_bytes);
-        ion_invalidate_range(frame->vframe_buf.vir_ptr[1], uv_bytes);
+        op(frame->vframe_buf.vir_ptr[0], y_bytes);
+        op(frame->vframe_buf.vir_ptr[1], uv_bytes);
     }
+}
+
+static void ion_invalidate_nv12_frame(const media_codec_buffer_t *frame)
+{
+    ion_cache_nv12_frame(frame, 1);
 }
 
 static void ion_flush_nv12_frame(const media_codec_buffer_t *frame)
 {
-    if (frame == NULL || frame->vframe_buf.size == 0u ||
-        frame->vframe_buf.vir_ptr[0] == NULL) {
-        return;
-    }
-    const int stride = frame->vframe_buf.stride > 0
-                           ? frame->vframe_buf.stride
-                           : frame->vframe_buf.width;
-    const int height = frame->vframe_buf.height;
-    if (stride <= 0 || height <= 0) {
-        ion_flush_range(frame->vframe_buf.vir_ptr[0], frame->vframe_buf.size);
-        return;
-    }
-    const uint64_t y_bytes = (uint64_t)stride * (uint64_t)height;
-    const uint64_t uv_bytes = (uint64_t)stride * (uint64_t)(height / 2);
-    if (frame->vframe_buf.vir_ptr[1] == frame->vframe_buf.vir_ptr[0] + y_bytes) {
-        ion_flush_range(frame->vframe_buf.vir_ptr[0], y_bytes + uv_bytes);
-    } else {
-        ion_flush_range(frame->vframe_buf.vir_ptr[0], y_bytes);
-        ion_flush_range(frame->vframe_buf.vir_ptr[1], uv_bytes);
-    }
+    ion_cache_nv12_frame(frame, 0);
 }
 
 static void *mux_writer_thread(void *argument)
@@ -976,8 +988,10 @@ static void *encoder_output_thread(void *argument)
 {
     eye_t *eye = (eye_t *)argument;
     miro_ego_pipeline_t *pipeline = eye->pipeline;
-    int idle_polls = 0;
+    int draining = 0;
+    unsigned long long drain_started_ns = 0ULL;
     for (;;) {
+        const unsigned long long call_started_ns = monotonic_time_ns();
         media_codec_buffer_t buffer;
         media_codec_output_buffer_info_t info;
         memset(&buffer, 0, sizeof(buffer));
@@ -985,6 +999,13 @@ static void *encoder_output_thread(void *argument)
         int ret = hb_mm_mc_dequeue_output_buffer(&eye->codec, &buffer, &info,
                                                  ENCODER_OUTPUT_TIMEOUT_MS);
         if (ret != 0) {
+            if (!is_transient_dequeue_timeout(ret)) {
+                if (atomic_load(&pipeline->failed) == 0) {
+                    fail(pipeline, "encoder_output_dequeue_failed: eye=%s ret=%d",
+                         EYE_NAMES[eye->eye], ret);
+                }
+                break;
+            }
             /* Only the split thread knows how many frames this eye owes, so the
              * encoder cannot stop draining before the split thread is done. */
             if (atomic_load(&pipeline->split_done) != 0) {
@@ -992,16 +1013,19 @@ static void *encoder_output_thread(void *argument)
                     atomic_load(&pipeline->encoded[eye->eye]) >= atomic_load(&pipeline->fed[eye->eye])) {
                     break;
                 }
-                if (++idle_polls >= ENCODER_DRAIN_POLLS) {
+                if (drain_deadline_expired(&draining, &drain_started_ns, DRAIN_TIMEOUT_NS)) {
                     fail(pipeline, "encoder_drain_timeout: eye=%s ret=%d fed=%llu encoded=%llu",
                          EYE_NAMES[eye->eye], ret, atomic_load(&pipeline->fed[eye->eye]),
                          atomic_load(&pipeline->encoded[eye->eye]));
                     break;
                 }
+            } else {
+                draining = 0;
             }
+            backoff_if_fast_retry(call_started_ns);
             continue;
         }
-        idle_polls = 0;
+        draining = 0;
         if (buffer.vstream_buf.size == 0 || buffer.vstream_buf.vir_ptr == NULL) {
             fail(pipeline, "encoder_output_invalid: eye=%s bytes=%u",
                  EYE_NAMES[eye->eye], buffer.vstream_buf.size);
@@ -1013,6 +1037,7 @@ static void *encoder_output_thread(void *argument)
             }
             break;
         }
+        ion_invalidate_range(buffer.vstream_buf.vir_ptr, (uint64_t)buffer.vstream_buf.size);
         int key_frame = (pipeline->config.hevc ? miro_ego_h265_has_idr : miro_ego_h264_has_idr)(
             buffer.vstream_buf.vir_ptr, (size_t)buffer.vstream_buf.size);
         int queued = miro_ego_packet_queue_push(&eye->packets, buffer.vstream_buf.vir_ptr,
@@ -1067,7 +1092,26 @@ static void split_eye_buffer(const miro_ego_pipeline_t *pipeline,
     };
     if (pipeline->split_ops->split_eye(pipeline->split_ctx, &src_frame, &dst_frame,
                                        eye_width, height, x_offset) == 0) {
-        target->vframe_buf.size = dst_frame.size;
+        uint64_t dst_bytes = dst_frame.size;
+        const int dst_stride = dst_frame.stride > 0 ? dst_frame.stride : eye_width;
+        if (dst_frame.y != NULL && dst_frame.uv != NULL && dst_stride > 0 && height > 0) {
+            const uintptr_t y_addr = (uintptr_t)dst_frame.y;
+            const uintptr_t uv_addr = (uintptr_t)dst_frame.uv;
+            const uint64_t uv_bytes = (uint64_t)dst_stride * (uint64_t)(height / 2);
+            if (uv_addr >= y_addr && (uint64_t)(uv_addr - y_addr) <= (uint64_t)target_capacity) {
+                const uint64_t span = (uint64_t)(uv_addr - y_addr) + uv_bytes;
+                if (span <= (uint64_t)target_capacity && span > dst_bytes) {
+                    dst_bytes = span;
+                }
+            } else {
+                const uint64_t packed =
+                    (uint64_t)dst_stride * ((uint64_t)height + (uint64_t)(height / 2));
+                if (dst_bytes == 0u && packed <= (uint64_t)target_capacity) {
+                    dst_bytes = packed;
+                }
+            }
+        }
+        target->vframe_buf.size = dst_bytes <= UINT32_MAX ? (uint32_t)dst_bytes : target_capacity;
     }
 }
 
@@ -1076,12 +1120,14 @@ static void *split_thread_main(void *argument)
     miro_ego_pipeline_t *pipeline = (miro_ego_pipeline_t *)argument;
     const int eye_width = pipeline->eye_width;
     const int height = pipeline->config.height;
-    int idle_polls = 0;
+    int draining = 0;
+    unsigned long long drain_started_ns = 0ULL;
 
     for (;;) {
         if (atomic_load(&pipeline->failed) != 0) {
             break;
         }
+        const unsigned long long call_started_ns = monotonic_time_ns();
         media_codec_buffer_t frame;
         media_codec_output_buffer_info_t info;
         memset(&frame, 0, sizeof(frame));
@@ -1092,20 +1138,27 @@ static void *split_thread_main(void *argument)
             if (atomic_load(&pipeline->failed) != 0) {
                 break;
             }
+            if (!is_transient_dequeue_timeout(ret)) {
+                fail(pipeline, "decoder_output_dequeue_failed: ret=%d", ret);
+                break;
+            }
             if (atomic_load(&pipeline->stopping) != 0) {
                 if (atomic_load(&pipeline->decoded) >= atomic_load(&pipeline->submitted)) {
                     break;
                 }
-                if (++idle_polls >= DECODER_DRAIN_POLLS) {
+                if (drain_deadline_expired(&draining, &drain_started_ns, DRAIN_TIMEOUT_NS)) {
                     fail(pipeline, "decoder_drain_timeout: ret=%d submitted=%llu decoded=%llu",
                          ret, atomic_load(&pipeline->submitted),
                          atomic_load(&pipeline->decoded));
                     break;
                 }
+            } else {
+                draining = 0;
             }
+            backoff_if_fast_retry(call_started_ns);
             continue;
         }
-        idle_polls = 0;
+        draining = 0;
         if (frame.type != MC_VIDEO_FRAME_BUFFER || frame.vframe_buf.size == 0 ||
             info.video_frame_info.decode_result == 0) {
             atomic_fetch_add(&pipeline->drop_decoder_output, 1ULL);

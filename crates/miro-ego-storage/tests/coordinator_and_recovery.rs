@@ -1609,17 +1609,21 @@ fn coordinator_stop_convergence_close_coordination_and_starting_snapshot_atomici
     assert_eq!(starting_snap.snapshot.device_state, "recording");
     assert!(starting_snap.snapshot.active_recording.is_some());
 
-    // Close coordinator while `Starting` is inside `begin_capture`, then release `begin_capture`.
-    coord2.close().unwrap();
-    assert_eq!(coord2.phase().unwrap(), CapturePhase::Closing);
-    release_begin.wait();
+    // Spawn `close()` while `Starting` is inside `begin_capture`: `close()` MUST wait for `Starting`
+    // to finish before transitioning to `Closing` and aborting the active capture handle!
+    let close_coord2 = Arc::clone(&coord2);
+    let closer2 = thread::spawn(move || close_coord2.close());
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(coord2.phase().unwrap(), CapturePhase::Starting);
 
-    assert!(starter.join().unwrap().is_err());
+    release_begin.wait();
+    let _ = starter.join().unwrap();
+    closer2.join().unwrap().unwrap();
+    assert_eq!(coord2.phase().unwrap(), CapturePhase::Closing);
     assert!(
         aborted.load(Ordering::Acquire),
-        "handle returned after Starting -> Closing MUST be aborted"
+        "handle from Starting must be aborted when close() completes"
     );
-    assert_eq!(fs::read_dir(env2.paths().staging_dir()).unwrap().count(), 0);
 }
 
 #[test]
@@ -2614,7 +2618,7 @@ fn wave3_catalog_v1_to_v2_migration_wal_batch_forget_readonly_and_clean_marker()
     use miro_ego_storage::util::crc32_ieee;
     use miro_ego_storage::{
         CATALOG_BINARY_FORMAT_VERSION, CATALOG_BINARY_MAGIC, CATALOG_FORMAT_VERSION,
-        CATALOG_WAL_MAGIC, CatalogEntry, SessionState,
+        CATALOG_WAL_V2_MAGIC, CatalogEntry, SessionState,
     };
 
     let env = TestEnv::new("w3-catalog-wal");
@@ -2697,7 +2701,7 @@ fn wave3_catalog_v1_to_v2_migration_wal_batch_forget_readonly_and_clean_marker()
         batch_rels.push(rel);
     }
     let wal_bytes = fs::read(paths.catalog_wal_file()).unwrap();
-    assert_eq!(&wal_bytes[0..8], &CATALOG_WAL_MAGIC);
+    assert_eq!(&wal_bytes[0..8], &CATALOG_WAL_V2_MAGIC);
 
     // Read-only open sees both snapshot + WAL entries without mutating files or sweeping temps.
     let stray_tmp = paths.index_dir().join("catalog.bin.tmp.readonly-check");

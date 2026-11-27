@@ -34,7 +34,8 @@ use miro_ego_core::sys::fs::{read_bounded_bytes, set_exfat_hidden, write_bytes_a
 use miro_ego_deploy::{
     DEFAULT_ALLOWED_UPDATES_ROOT, DEFAULT_DEPLOY_SOCKET_PATH, DeployRpcClient, DeployRpcServer,
     DeployRpcServerConfig, FIRMWARE_STATUS_SCHEMA, HealthChecker, LocalHttpHealthChecker,
-    RealSystemctlRunner, ReleaseManager, ReleaseManagerPaths, SystemctlRunner,
+    RealSystemctlRunner, ReleaseManager, ReleaseManagerPaths, SYSTEM_DEPLOY_STATE_DIR,
+    SystemctlRunner,
 };
 use miro_ego_hw::thermal::{
     DEFAULT_THERMAL_ROOT, is_rdk_x5_model, read_board_model, read_soc_temperature_c,
@@ -1037,6 +1038,12 @@ fn load_or_build_serve_config(args: &ServeArgs) -> Result<DeviceConfig, String> 
         })?;
         let default_settings = Path::new(SYSTEM_CONFIG_DIR).join("settings.json");
         let _ = load_and_apply_settings_for_device(&mut cfg, &default_settings)?;
+        if let Some(ref data_dir) = args.data_dir {
+            cfg.storage.mountpoint = data_dir.clone();
+        }
+        if let Some(ref state_dir) = args.state_dir {
+            cfg.state_root = state_dir.clone();
+        }
         return Ok(cfg);
     }
 
@@ -1544,10 +1551,18 @@ fn run_button(args: ButtonArgs) -> Result<(), String> {
 }
 
 fn run_deploy(args: DeployArgs) -> Result<(), String> {
+    let deploy_state_root = if args.system_root != Path::new("/") {
+        args.system_root.join("var/lib/miro-ego-deploy")
+    } else if args.state_root != Path::new(SYSTEM_STATE_DIR) {
+        args.state_root.join("deploy")
+    } else {
+        PathBuf::from(SYSTEM_DEPLOY_STATE_DIR)
+    };
     let paths = ReleaseManagerPaths {
         install_root: args.install_root,
         config_root: args.config_root,
         state_root: args.state_root,
+        deploy_state_root,
         run_dir: args.run_dir,
         system_root: args.system_root.clone(),
     };
@@ -1647,9 +1662,11 @@ fn run_deploy(args: DeployArgs) -> Result<(), String> {
                 if let Some(idle_limit) = idle_opt {
                     let mut interval = tokio::time::interval(Duration::from_millis(100));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let term_sig = wait_for_termination_signal();
+                    tokio::pin!(term_sig);
                     loop {
                         tokio::select! {
-                            () = wait_for_termination_signal() => break,
+                            () = &mut term_sig => break,
                             _ = interval.tick() => {
                                 if server.has_exited_idle()
                                     || (server.is_idle() && server.idle_elapsed() >= idle_limit)
@@ -1752,6 +1769,9 @@ fn run_status(
 
     let mut release_paths = ReleaseManagerPaths::canonical();
     release_paths.install_root = install_root;
+    if state_root != Path::new(SYSTEM_STATE_DIR) {
+        release_paths.deploy_state_root = state_root.join("deploy");
+    }
     release_paths.state_root = state_root;
     let rpc_deploy = DeployRpcClient::new(&deploy_socket)
         .with_timeout(Duration::from_secs(2))

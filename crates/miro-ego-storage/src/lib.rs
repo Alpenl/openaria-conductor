@@ -24,8 +24,10 @@ pub const CATALOG_BINARY_MAGIC: [u8; 8] = *b"MEGOCAT1";
 pub const CATALOG_FORMAT_VERSION: u32 = 1;
 /// Compact binary v2 framing version written by [`BinarySessionCatalog`].
 pub const CATALOG_BINARY_FORMAT_VERSION: u32 = 2;
-/// Append-only incremental catalog WAL magic stored in `/data/.miro-ego/index/catalog.wal`.
+/// Append-only incremental catalog WAL magic stored in `/data/.miro-ego/index/catalog.wal` (v1 legacy).
 pub const CATALOG_WAL_MAGIC: [u8; 8] = *b"MEGOWAL1";
+/// Snapshot-bound incremental catalog WAL magic (`MEGOWAL2` + `base_revision_seq: u64` LE).
+pub const CATALOG_WAL_V2_MAGIC: [u8; 8] = *b"MEGOWAL2";
 pub const VOLUME_METADATA_SCHEMA: &str = "miro-ego.volume.v1";
 
 #[derive(Debug, Error)]
@@ -286,7 +288,8 @@ pub trait RecoveryManager: Send + Sync {
 pub use artifact_io::{
     ByteRange, ManifestArtifactDescriptor, OpenedManifest, VerifiedArtifactFile, open_manifest,
     open_verified_artifact, open_verified_artifact_checked_with_lease,
-    open_verified_artifact_with_lease, parse_single_byte_range,
+    open_verified_artifact_checked_with_volume, open_verified_artifact_with_lease,
+    parse_single_byte_range,
 };
 pub use audit::{ApiAuditEvent, AuditConfig, AuditLogger, AuditWriteTarget, BoundedRingBuffer};
 pub use catalog::{

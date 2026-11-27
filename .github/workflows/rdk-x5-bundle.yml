@@ -77,7 +77,7 @@ jobs:
       - name: Install zig and cargo-zigbuild for AArch64 cross-compilation
         run: |
           uv venv --no-project /tmp/miro-ego-cross
-          uv pip install --python /tmp/miro-ego-cross/bin/python 'ziglang==0.16.0' 'cargo-zigbuild'
+          uv pip install --python /tmp/miro-ego-cross/bin/python 'ziglang==0.16.0' 'cargo-zigbuild==0.20.1'
           zig_dir="$(
             /tmp/miro-ego-cross/bin/python - <<'PY'
           from pathlib import Path
@@ -118,6 +118,64 @@ jobs:
           export MIRO_EGO_GIT_COMMIT="${MIRO_EGO_COMMIT}"
           cargo zigbuild --locked --release --target aarch64-unknown-linux-gnu.2.28 -p miro-ego-cli
 
+      - name: Prepare Hobot SDK sysroot (if configured)
+        env:
+          HOBOT_SDK_SYSROOT_URL: ${{ secrets.HOBOT_SDK_SYSROOT_URL || '' }}
+          HOBOT_SDK_SYSROOT_SHA256: ${{ secrets.HOBOT_SDK_SYSROOT_SHA256 || '' }}
+          CONFIGURED_HB_SDK_ROOT: ${{ vars.HB_SDK_ROOT || '' }}
+        run: |
+          archive="/tmp/hobot-sdk-sysroot.archive"
+          sysroot="/tmp/hobot-sdk-sysroot"
+          if [[ -n "${HOBOT_SDK_SYSROOT_URL}" || -n "${HOBOT_SDK_SYSROOT_SHA256}" ]]; then
+            if [[ -z "${HOBOT_SDK_SYSROOT_URL}" || -z "${HOBOT_SDK_SYSROOT_SHA256}" ]]; then
+              echo "::error::Both HOBOT_SDK_SYSROOT_URL and HOBOT_SDK_SYSROOT_SHA256 must be configured together." >&2
+              exit 1
+            fi
+            if [[ ! "${HOBOT_SDK_SYSROOT_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "::error::HOBOT_SDK_SYSROOT_SHA256 must be a 64-character hex SHA-256 digest." >&2
+              exit 1
+            fi
+            rm -rf "$sysroot" "$archive"
+            mkdir -p "$sysroot"
+            curl -fsSL --retry 3 -o "$archive" "$HOBOT_SDK_SYSROOT_URL"
+            echo "${HOBOT_SDK_SYSROOT_SHA256,,}  ${archive}" | sha256sum --check --strict -
+            case "${HOBOT_SDK_SYSROOT_URL%%\?*}" in
+              *.zip) unzip -q "$archive" -d "$sysroot" ;;
+              *) tar -xf "$archive" -C "$sysroot" ;;
+            esac
+            resolved_root=""
+            for candidate in "$sysroot" "$sysroot"/*; do
+              [[ -d "$candidate" ]] || continue
+              if [[ -d "${candidate}/include" && -f "${candidate}/lib/libmultimedia.so" ]]; then
+                resolved_root="$candidate"
+                break
+              fi
+              if [[ -d "${candidate}/usr/include" && -f "${candidate}/usr/hobot/lib/libmultimedia.so" ]]; then
+                resolved_root="$candidate"
+                echo "HOBOT_SDK_INCLUDE=${candidate}/usr/include" >> "$GITHUB_ENV"
+                echo "HOBOT_SDK_LIB=${candidate}/usr/hobot/lib" >> "$GITHUB_ENV"
+                break
+              fi
+              if [[ -d "${candidate}/usr/hobot/include" && -f "${candidate}/usr/hobot/lib/libmultimedia.so" ]]; then
+                resolved_root="$candidate"
+                echo "HOBOT_SDK_INCLUDE=${candidate}/usr/hobot/include" >> "$GITHUB_ENV"
+                echo "HOBOT_SDK_LIB=${candidate}/usr/hobot/lib" >> "$GITHUB_ENV"
+                break
+              fi
+            done
+            if [[ -z "$resolved_root" ]]; then
+              echo "::error::Extracted Hobot SDK sysroot is missing headers and libmultimedia.so." >&2
+              exit 1
+            fi
+            echo "HB_SDK_ROOT=${resolved_root}" >> "$GITHUB_ENV"
+            echo "Prepared Hobot SDK sysroot at ${resolved_root}"
+          elif [[ -n "${CONFIGURED_HB_SDK_ROOT}" ]]; then
+            echo "HB_SDK_ROOT=${CONFIGURED_HB_SDK_ROOT}" >> "$GITHUB_ENV"
+            echo "Using configured HB_SDK_ROOT=${CONFIGURED_HB_SDK_ROOT}"
+          else
+            echo "No Hobot SDK sysroot configured; non-tag CI will use mock_hobot_sdk.c."
+          fi
+
       - name: Cross-compile C miro-ego-encoder for aarch64-unknown-linux-gnu
         run: |
           mkdir -p dist-aarch64
@@ -130,16 +188,31 @@ jobs:
             csrc/miro-ego-encoder/miro_ego_mp4_meta.c
           )
           if [[ -n "${HB_SDK_ROOT:-}" && -z "${HOBOT_SDK_INCLUDE:-}" && -z "${HOBOT_SDK_LIB:-}" ]]; then
-            HOBOT_SDK_INCLUDE="${HB_SDK_ROOT}/include"
-            HOBOT_SDK_LIB="${HB_SDK_ROOT}/lib"
+            if [[ -d "${HB_SDK_ROOT}/include" && -f "${HB_SDK_ROOT}/lib/libmultimedia.so" ]]; then
+              HOBOT_SDK_INCLUDE="${HB_SDK_ROOT}/include"
+              HOBOT_SDK_LIB="${HB_SDK_ROOT}/lib"
+            elif [[ -d "${HB_SDK_ROOT}/usr/include" && -f "${HB_SDK_ROOT}/usr/hobot/lib/libmultimedia.so" ]]; then
+              HOBOT_SDK_INCLUDE="${HB_SDK_ROOT}/usr/include"
+              HOBOT_SDK_LIB="${HB_SDK_ROOT}/usr/hobot/lib"
+            elif [[ -d "${HB_SDK_ROOT}/usr/hobot/include" && -f "${HB_SDK_ROOT}/usr/hobot/lib/libmultimedia.so" ]]; then
+              HOBOT_SDK_INCLUDE="${HB_SDK_ROOT}/usr/hobot/include"
+              HOBOT_SDK_LIB="${HB_SDK_ROOT}/usr/hobot/lib"
+            else
+              HOBOT_SDK_INCLUDE="${HB_SDK_ROOT}/include"
+              HOBOT_SDK_LIB="${HB_SDK_ROOT}/lib"
+            fi
           fi
           if [[ -n "${HOBOT_SDK_INCLUDE:-}" && -n "${HOBOT_SDK_LIB:-}" && -f "${HOBOT_SDK_LIB}/libmultimedia.so" ]]; then
             echo "Linking miro-ego-encoder against RDK X5 Hobot SDK"
+            sdk_libs=(-lmultimedia -lpthread)
+            if [[ -f "${HOBOT_SDK_LIB}/libhbmem.so" ]]; then
+              sdk_libs+=(-lhbmem)
+            fi
             zig cc -target aarch64-linux-gnu.2.28 -O2 -Wall -Wextra -Werror -std=gnu11 \
               -I"$HOBOT_SDK_INCLUDE" -Icsrc/miro-ego-encoder \
               "${SRCS[@]}" \
               -L"$HOBOT_SDK_LIB" -Wl,-rpath,/usr/hobot/lib -Wl,-rpath-link,"$HOBOT_SDK_LIB" \
-              -lmultimedia -lpthread \
+              "${sdk_libs[@]}" \
               -o dist-aarch64/miro-ego-encoder
             {
               echo "MIRO_EGO_MOCK_SDK=0"

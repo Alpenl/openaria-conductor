@@ -156,7 +156,6 @@ impl Drop for ActiveRpcConnDropGuard {
 struct ScanRpcGate {
     active_scans: AtomicUsize,
     max_scan_slots: usize,
-    scan_mutex: Mutex<()>,
 }
 
 impl ScanRpcGate {
@@ -170,7 +169,6 @@ impl ScanRpcGate {
         Arc::new(Self {
             active_scans: AtomicUsize::new(0),
             max_scan_slots,
-            scan_mutex: Mutex::new(()),
         })
     }
 
@@ -179,9 +177,6 @@ impl ScanRpcGate {
         controller: &AuthoritativeNetworkController,
     ) -> NetworkResult<ScanResponse> {
         let prev = self.active_scans.fetch_add(1, Ordering::AcqRel);
-        let _slot_guard = ActiveRpcConnDropGuard {
-            counter: Arc::new(AtomicUsize::new(0)),
-        };
         if prev >= self.max_scan_slots {
             self.active_scans.fetch_sub(1, Ordering::AcqRel);
             return Err(NetworkError::Busy {
@@ -195,13 +190,7 @@ impl ScanRpcGate {
             }
         }
         let _active_guard = ScanSlotGuard(&self.active_scans);
-        // Note: `NmcliBackend::scan_wifi` coalesces concurrent scan callers via `ScanFlight`,
-        // while `scan_mutex` isolates non-coalesced scan setup/teardown onto a dedicated lock
-        // completely separate from `mutation_lock` and fast-path RPCs (`status`, `health`, `clock`).
-        let _scan_guard = self
-            .scan_mutex
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        // `NmcliBackend::scan_wifi` coalesces concurrent scan callers via `ScanFlight`.
         controller.scan()
     }
 }
@@ -215,8 +204,8 @@ pub struct NetworkRpcServer {
 }
 
 impl NetworkRpcServer {
-    /// Bind a new Unix domain socket at `socket_path` (mode `0600`) under a restrictive `umask`
-    /// (`0o077`) with `AT_SYMLINK_NOFOLLOW` protection and start serving requests.
+    /// Bind a new Unix domain socket at `socket_path` (mode `0660`, group `miro-ego` when root)
+    /// under a restrictive `umask` (`0o077`) with `AT_SYMLINK_NOFOLLOW` protection and start serving requests.
     pub fn bind(
         socket_path: impl Into<PathBuf>,
         controller: Arc<AuthoritativeNetworkController>,
@@ -275,8 +264,8 @@ impl NetworkRpcServer {
                     message: format!("bound path {} is not a Unix socket", path.display()),
                 });
             }
-            best_effort_chown_miro_ego_nofollow(&path);
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+            best_effort_chgrp_miro_ego_nofollow(&path);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).map_err(|err| {
                 NetworkError::Backend {
                     message: format!("failed to chmod Unix socket {}: {err}", path.display()),
                 }
@@ -414,29 +403,125 @@ impl Drop for NetworkRpcServer {
     }
 }
 
-fn best_effort_chown_miro_ego_nofollow(path: &Path) {
+fn lookup_miro_ego_uid_r() -> Option<u32> {
+    let name_c = CString::new("miro-ego").ok()?;
+    let init_len = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
+        n if n > 0 => (n as usize).clamp(1024, 65_536),
+        _ => 4096,
+    };
+    let mut buf = vec![0u8; init_len];
+    loop {
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwnam_r(
+                name_c.as_ptr(),
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                &raw mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1024 * 1024 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc == 0 && !result.is_null() {
+            let pwd = unsafe { pwd.assume_init() };
+            return Some(pwd.pw_uid);
+        }
+        return None;
+    }
+}
+
+fn lookup_miro_ego_gid_r() -> Option<u32> {
+    let name_c = CString::new("miro-ego").ok()?;
+    let init_len = match unsafe { libc::sysconf(libc::_SC_GETGR_R_SIZE_MAX) } {
+        n if n > 0 => (n as usize).clamp(1024, 65_536),
+        _ => 4096,
+    };
+    let mut buf = vec![0u8; init_len];
+    loop {
+        let mut grp = std::mem::MaybeUninit::<libc::group>::uninit();
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getgrnam_r(
+                name_c.as_ptr(),
+                grp.as_mut_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                &raw mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1024 * 1024 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc == 0 && !result.is_null() {
+            let grp = unsafe { grp.assume_init() };
+            return Some(grp.gr_gid);
+        }
+        return None;
+    }
+}
+
+fn best_effort_chgrp_miro_ego_nofollow(path: &Path) {
     if unsafe { libc::geteuid() } != 0 {
         return;
     }
-    let Ok(name_c) = CString::new("miro-ego") else {
+    let Some(gid) = lookup_miro_ego_gid_r() else {
         return;
     };
     let Ok(path_c) = CString::new(path.as_os_str().as_bytes()) else {
         return;
     };
     unsafe {
-        let pwd = libc::getpwnam(name_c.as_ptr());
-        let grp = libc::getgrnam(name_c.as_ptr());
-        if !pwd.is_null() && !grp.is_null() {
-            let _ = libc::fchownat(
-                libc::AT_FDCWD,
-                path_c.as_ptr(),
-                (*pwd).pw_uid,
-                (*grp).gr_gid,
-                libc::AT_SYMLINK_NOFOLLOW,
-            );
-        }
+        let _ = libc::fchownat(
+            libc::AT_FDCWD,
+            path_c.as_ptr(),
+            u32::MAX,
+            gid,
+            libc::AT_SYMLINK_NOFOLLOW,
+        );
     }
+}
+
+fn peer_uid_authorized(stream: &UnixStream) -> Result<(), String> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 || (len as usize) < std::mem::size_of::<libc::ucred>() {
+        return Err(format!(
+            "failed to inspect peer credentials: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        if cred.uid == euid {
+            return Ok(());
+        }
+        return Err(format!(
+            "peer uid {} unauthorized (expected {euid})",
+            cred.uid
+        ));
+    }
+    if cred.uid == 0 || lookup_miro_ego_uid_r().is_some_and(|uid| cred.uid == uid) {
+        return Ok(());
+    }
+    Err(format!("peer uid {} is not authorized", cred.uid))
 }
 
 fn poll_listener_readable(fd: libc::c_int, timeout: Duration) {
@@ -460,6 +545,12 @@ fn handle_connection(
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(config.read_timeout));
     let _ = stream.set_write_timeout(Some(config.write_timeout));
+
+    if let Err(msg) = peer_uid_authorized(&stream) {
+        let denied = seal_rpc_response(RpcResponse::error("permission_denied", msg, None, false));
+        let _ = write_framed_response(stream, &denied, config.max_line_bytes, config.write_timeout);
+        return;
+    }
 
     let response = match read_ndjson_line(&mut stream, config.max_line_bytes, config.read_timeout) {
         Ok(None) => return, // clean empty EOF
@@ -1429,7 +1520,7 @@ mod tests {
             NetworkRpcServer::bind(&sock, Arc::clone(&ctrl), RpcServerConfig::default()).unwrap();
         assert_eq!(
             fs::symlink_metadata(&sock).unwrap().permissions().mode() & 0o777,
-            0o600
+            0o660
         );
         let client = NetworkRpcClient::new(&sock);
         assert_eq!(DEFAULT_CLIENT_TIMEOUT, Duration::from_secs(45));

@@ -581,12 +581,17 @@ impl ExfatVolumeManager {
 
     /// Whether the volume has been logically released for `SafeSwap` handoff.
     pub fn is_volume_released(&self) -> bool {
-        self.released.load(Ordering::Acquire)
+        self.released.load(Ordering::SeqCst)
     }
 
     /// Mark or clear the `SafeSwap` volume-released state across all handles to this manager.
     pub fn set_volume_released(&self, released: bool) {
-        self.released.store(released, Ordering::Release);
+        self.released.store(released, Ordering::SeqCst);
+    }
+
+    /// Shared atomic flag tracking whether the volume is logically released for `SafeSwap`.
+    pub fn released_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.released)
     }
 
     /// Shared atomic counter tracking open artifact/log/audit handles on `/data`.
@@ -596,12 +601,19 @@ impl ExfatVolumeManager {
 
     /// Number of currently tracked open handles on `/data`.
     pub fn open_handle_count(&self) -> usize {
-        self.open_handles.load(Ordering::Acquire)
+        self.open_handles.load(Ordering::SeqCst)
     }
 
     /// Acquire an RAII lease incrementing [`Self::open_handle_count`] until dropped.
     pub fn acquire_handle_lease(&self) -> VolumeHandleLease {
         VolumeHandleLease::acquire(Arc::clone(&self.open_handles))
+    }
+
+    /// Atomically acquire a [`VolumeHandleLease`] only if the volume is not released for `SafeSwap`,
+    /// using a `SeqCst` increment-then-check barrier paired with [`Self::set_volume_released`] +
+    /// [`Self::open_handle_count`].
+    pub fn try_acquire_handle_lease(&self) -> Option<VolumeHandleLease> {
+        VolumeHandleLease::try_acquire(Arc::clone(&self.open_handles), &self.released)
     }
 
     /// Fast mount & write-availability check used by audit/receipt/log paths so:
@@ -1184,25 +1196,31 @@ fn validate_volume_metadata_base(meta: &VolumeMetadata, expected_label: &str) ->
 
 fn validate_volume_metadata(meta: &VolumeMetadata, policy: &VolumePolicy) -> StorageResult<()> {
     validate_volume_metadata_base(meta, &policy.expected_label)?;
-    if let Some(expected_uuid) = &policy.expected_uuid {
-        if meta.uuid.as_deref() != Some(expected_uuid.as_str()) {
-            return Err(StorageError::VolumeInvalid {
-                message: format!(
-                    "volume metadata uuid {:?} does not match expected '{expected_uuid}'",
-                    meta.uuid
-                ),
-            });
-        }
+    if let Some(expected_uuid) = &policy.expected_uuid
+        && !meta
+            .uuid
+            .as_deref()
+            .is_some_and(|u| u.eq_ignore_ascii_case(expected_uuid))
+    {
+        return Err(StorageError::VolumeInvalid {
+            message: format!(
+                "volume metadata uuid {:?} does not match expected '{expected_uuid}'",
+                meta.uuid
+            ),
+        });
     }
-    if let Some(expected_partuuid) = &policy.expected_partuuid {
-        if meta.partuuid.as_deref() != Some(expected_partuuid.as_str()) {
-            return Err(StorageError::VolumeInvalid {
-                message: format!(
-                    "volume metadata partuuid {:?} does not match expected '{expected_partuuid}'",
-                    meta.partuuid
-                ),
-            });
-        }
+    if let Some(expected_partuuid) = &policy.expected_partuuid
+        && !meta
+            .partuuid
+            .as_deref()
+            .is_some_and(|p| p.eq_ignore_ascii_case(expected_partuuid))
+    {
+        return Err(StorageError::VolumeInvalid {
+            message: format!(
+                "volume metadata partuuid {:?} does not match expected '{expected_partuuid}'",
+                meta.partuuid
+            ),
+        });
     }
     Ok(())
 }

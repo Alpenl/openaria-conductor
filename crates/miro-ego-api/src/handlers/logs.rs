@@ -186,6 +186,8 @@ pub async fn get_log_file(
     let content_range = resolved
         .content_range
         .map(|r| r.content_range_header(representation.size));
+    let range_reaches_file_eof =
+        resolved.offset.saturating_add(resolved.length) >= representation.size;
     let body = stream_download_body_with_guard(
         representation.source,
         resolved.offset,
@@ -193,6 +195,7 @@ pub async fn get_log_file(
         state.config.download_chunk_bytes,
         permit,
         representation.lease_guard,
+        range_reaches_file_eof,
     );
 
     build_download_response(

@@ -1459,6 +1459,7 @@ async fn deploy_serve_rpc_fd0_activation_and_firmware_check_update_rollback_e2e(
         install_root: install_root.clone(),
         config_root: config_root.clone(),
         state_root: state_dir.clone(),
+        deploy_state_root: sysroot.join("var/lib/miro-ego-deploy"),
         run_dir: deploy_run.clone(),
         system_root: sysroot.clone(),
     };
@@ -1568,11 +1569,12 @@ async fn deploy_serve_rpc_fd0_activation_and_firmware_check_update_rollback_e2e(
     options.listen_override = Some("127.0.0.1:0".parse().unwrap());
     options.network_socket = None;
     options.deploy_socket = Some(deploy_sock.clone());
-    options.release_paths = release_paths;
+    options.release_paths = release_paths.clone();
 
     let bound = bind_daemon(options)
         .await
         .expect("bind daemon with deploy_socket");
+    let bound_backend_for_replay = Arc::clone(&bound.backend);
     let addr = bound.server.local_addr();
     let origin = format!("http://{addr}");
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -1622,6 +1624,8 @@ async fn deploy_serve_rpc_fd0_activation_and_firmware_check_update_rollback_e2e(
     assert_eq!(bad_err["error"]["code"], "invalid_firmware_bundle");
 
     // 3. `POST /api/v1/firmware/update` with `commit_v2` installs v2 via `deploy serve-rpc`!
+    let update_idem_key = new_uuid_v4();
+    let update_payload = serde_json::to_vec(&json!({ "commit": commit_v2 })).unwrap();
     let (up_code, _, up_body) = http_request(
         addr,
         Method::POST,
@@ -1629,9 +1633,9 @@ async fn deploy_serve_rpc_fd0_activation_and_firmware_check_update_rollback_e2e(
         &[
             ("Content-Type", "application/json"),
             ("Origin", &origin),
-            ("Idempotency-Key", &new_uuid_v4()),
+            ("Idempotency-Key", &update_idem_key),
         ],
-        Some(serde_json::to_vec(&json!({ "commit": commit_v2 })).unwrap()),
+        Some(update_payload.clone()),
     )
     .await;
     assert_eq!(
@@ -1662,7 +1666,29 @@ async fn deploy_serve_rpc_fd0_activation_and_firmware_check_update_rollback_e2e(
     assert_eq!(after_update["previous"]["commit"], commit_v1);
     assert_eq!(after_update["has_update"], false);
 
+    // Replaying firmware/update directly via ProductionGatewayBackend must reflect live `succeeded`
+    // status from DeployRpcServer rather than a stale in-memory cached `"accepted"` snapshot!
+    let direct_up_replay = bound_backend_for_replay
+        .firmware_update(miro_ego_api::IdempotentCommand {
+            principal_id: "isolated-lab-device".to_owned(),
+            idempotency_key: update_idem_key.clone(),
+            body: serde_json::from_slice(&update_payload).unwrap(),
+            canonical_body: update_payload.clone(),
+        })
+        .await
+        .expect("direct firmware_update replay via DeployRpcServer");
+    assert!(direct_up_replay.replayed);
+    assert_eq!(
+        direct_up_replay
+            .body
+            .as_ref()
+            .and_then(|b| b["status"].as_str()),
+        Some("succeeded")
+    );
+
     // 4. `POST /api/v1/firmware/rollback` rolls back to `commit_v1` (`0.3.0`) via `deploy serve-rpc`!
+    let rb_idem_key = new_uuid_v4();
+    let rb_payload = serde_json::to_vec(&json!({ "commit": commit_v1 })).unwrap();
     let (rb_code, _, rb_body) = http_request(
         addr,
         Method::POST,
@@ -1670,9 +1696,9 @@ async fn deploy_serve_rpc_fd0_activation_and_firmware_check_update_rollback_e2e(
         &[
             ("Content-Type", "application/json"),
             ("Origin", &origin),
-            ("Idempotency-Key", &new_uuid_v4()),
+            ("Idempotency-Key", &rb_idem_key),
         ],
-        Some(serde_json::to_vec(&json!({ "commit": commit_v1 })).unwrap()),
+        Some(rb_payload.clone()),
     )
     .await;
     assert_eq!(
@@ -1703,6 +1729,56 @@ async fn deploy_serve_rpc_fd0_activation_and_firmware_check_update_rollback_e2e(
     let _ = shutdown_tx.send(());
     daemon_task.await.unwrap().unwrap();
 
+    // Restart gateway daemon and replay the same rollback Idempotency-Key:
+    // must replay `202` + `X-Idempotency-Replayed: true` from DeployRpcServer even though
+    // `previous` is now `commit_v2` (not `commit_v1`)!
+    let cfg_restarted = make_lab_device_config(&data_dir, &state_dir);
+    let mut options2 = DaemonServeOptions::from_device_config(cfg_restarted, true);
+    options2.listen_override = Some("127.0.0.1:0".parse().unwrap());
+    options2.network_socket = None;
+    options2.deploy_socket = Some(deploy_sock.clone());
+    options2.release_paths = release_paths.clone();
+    let bound2 = bind_daemon(options2)
+        .await
+        .expect("rebind daemon with deploy_socket");
+    let addr2 = bound2.server.local_addr();
+    let origin2 = format!("http://{addr2}");
+    let (shutdown_tx2, shutdown_rx2) = oneshot::channel::<()>();
+    let daemon_task2 = tokio::spawn(async move {
+        run_bound_daemon_with_shutdown(bound2, async {
+            let _ = shutdown_rx2.await;
+        })
+        .await
+    });
+    let (rb_replay_code, rb_replay_hdrs, rb_replay_body) = http_request(
+        addr2,
+        Method::POST,
+        "/api/v1/firmware/rollback",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin2),
+            ("Idempotency-Key", &rb_idem_key),
+        ],
+        Some(rb_payload),
+    )
+    .await;
+    assert_eq!(
+        rb_replay_code,
+        202,
+        "rollback replay after daemon restart failed: {}",
+        String::from_utf8_lossy(&rb_replay_body)
+    );
+    assert_eq!(
+        rb_replay_hdrs
+            .get("Idempotency-Replayed")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    let rb_replay_doc: Value = serde_json::from_slice(&rb_replay_body).unwrap();
+    assert_eq!(rb_replay_doc["status"], "succeeded");
+    let _ = shutdown_tx2.send(());
+    daemon_task2.await.unwrap().unwrap();
+
     // Send SIGTERM to `miro-ego deploy serve-rpc` and verify `STOPPING=1` + clean exit!
     unsafe {
         let _ = libc::kill(rpc_child.id() as libc::pid_t, libc::SIGTERM);
@@ -1721,6 +1797,7 @@ async fn deploy_serve_rpc_fd0_activation_and_firmware_check_update_rollback_e2e(
             install_root,
             config_root,
             state_root: state_dir,
+            deploy_state_root: sysroot.join("var/lib/miro-ego-deploy"),
             run_dir: deploy_run,
             system_root: sysroot,
         },

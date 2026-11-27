@@ -2,61 +2,224 @@
 //! enforcement, idle `AuditLogger` descriptor eviction, and bounded exponential recovery
 //! backoff (preventing 1 Hz `Failed <-> Recovering` thrash on persistent volume faults).
 
-use super::fsm::CaptureCoordinator;
+use super::fsm::{CaptureCoordinator, CoordinatorState};
 use super::types::{
     CAPTURE_DIAGNOSTIC_EVENT_SCHEMA, CAPTURE_STATE_EVENT_SCHEMA, CaptureEventType, CapturePhase,
-    CaptureStopRequest, DeleteSessionsResult, ReserveEnforcementOutcome,
+    CaptureStopRequest, DeleteSessionsResult, FailedDeleteSession, ReserveEnforcementOutcome,
     SESSION_DELETE_RESULT_SCHEMA,
 };
 use crate::recovery::StagingRecoveryManager;
-use crate::util::now_rfc3339_utc;
+use crate::util::{is_canonical_session_relative_dir, now_rfc3339_utc};
 use crate::volume::VolumeAdmission;
 use crate::{RecoveryManager, RecoveryReport, StorageError, StorageResult, VolumeManager};
 use miro_ego_core::CoreError;
+use miro_ego_core::ids::is_valid_uuid_v7;
 use miro_ego_core::sys::clock::monotonic_ns;
-use miro_ego_core::sys::fs::{fsync_directory, read_bounded_json};
+use miro_ego_core::sys::fs::{fstat, fsync_directory, open_directory_safe, read_bounded_json};
 use serde_json::{Value, json};
 use std::fs;
-use std::sync::Arc;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const RECOVERY_BACKOFF_BASE_SECS: u64 = 2;
 const RECOVERY_BACKOFF_MAX_SECS: u64 = 30;
 
+struct VolumeAdmissionBusyGuard<'a> {
+    state: &'a Mutex<CoordinatorState>,
+    cv: &'a Condvar,
+    active: bool,
+}
+
+impl<'a> VolumeAdmissionBusyGuard<'a> {
+    fn new(state: &'a Mutex<CoordinatorState>, cv: &'a Condvar) -> Self {
+        Self {
+            state,
+            cv,
+            active: true,
+        }
+    }
+
+    fn release_now(&mut self) {
+        if self.active {
+            self.active = false;
+            if let Ok(mut guard) = self.state.lock() {
+                guard.volume_admission_in_progress = false;
+                self.cv.notify_all();
+            } else if let Err(poisoned) = self.state.lock() {
+                let mut guard = poisoned.into_inner();
+                guard.volume_admission_in_progress = false;
+                self.cv.notify_all();
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for VolumeAdmissionBusyGuard<'_> {
+    fn drop(&mut self) {
+        self.release_now();
+    }
+}
+
 impl CaptureCoordinator {
     /// Complete any interrupted `PendingDeleteIntent` left behind by power loss mid-batch-delete.
     fn finish_pending_delete_intent(&self) {
         let writable = self.volume.is_mounted_and_writable();
-        let Some(intent) = self.receipts.take_pending_delete_intent(writable) else {
+        if !writable {
+            return;
+        }
+        let Some(intent) = self.receipts.peek_pending_delete_intent(writable) else {
             return;
         };
         let recordings_root = self.volume.paths().recordings_dir();
         let deleting_root = self.volume.paths().deleting_dir();
-        let mut deleted_ids = Vec::with_capacity(intent.targets.len());
-        let mut deleted_rels = Vec::with_capacity(intent.targets.len());
-        for (sid, rel) in intent.targets {
-            let rec_dir = recordings_root.join(&rel);
-            if rec_dir.is_dir() {
-                let _ = fs::remove_dir_all(&rec_dir);
-                if let Some(parent) = rec_dir.parent()
-                    && parent != recordings_root
-                {
-                    let _ = fs::remove_dir(parent);
+        let root_dev = match open_directory_safe(&recordings_root) {
+            Ok(dir) => match fstat(dir.as_raw_fd()) {
+                Ok(st) => st.st_dev,
+                Err(_) => return,
+            },
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let Ok(del_dir) = open_directory_safe(&deleting_root) else {
+                    return;
+                };
+                match fstat(del_dir.as_raw_fd()) {
+                    Ok(st) => st.st_dev,
+                    Err(_) => return,
                 }
             }
-            let trash_dir = deleting_root.join(&sid);
-            if trash_dir.exists() {
-                let _ = fs::remove_dir_all(&trash_dir);
+            Err(_) => return,
+        };
+
+        let mut deleted_ids = Vec::with_capacity(intent.targets.len());
+        let mut forgotten_rels = Vec::with_capacity(intent.targets.len());
+        let mut failed_sessions = Vec::new();
+        for (sid, rel) in intent.targets {
+            if !is_valid_uuid_v7(&sid) || !is_canonical_session_relative_dir(&rel) {
+                failed_sessions.push(FailedDeleteSession {
+                    session_id: sid,
+                    error: "refusing to delete invalid pending delete target".to_owned(),
+                });
+                continue;
             }
-            deleted_rels.push(rel);
+            let rec_dir = recordings_root.join(&rel);
+            if let Some(parent) = rec_dir.parent()
+                && let Ok(pmeta) = fs::symlink_metadata(parent)
+                && (pmeta.file_type().is_symlink() || !pmeta.is_dir() || pmeta.dev() != root_dev)
+            {
+                failed_sessions.push(FailedDeleteSession {
+                    session_id: sid,
+                    error: "parent date directory failed symlink or st_dev check".to_owned(),
+                });
+                continue;
+            }
+            let rec_removed: bool;
+            match fs::symlink_metadata(&rec_dir) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() || !meta.is_dir() || meta.dev() != root_dev {
+                        failed_sessions.push(FailedDeleteSession {
+                            session_id: sid,
+                            error: "session directory failed symlink or st_dev check".to_owned(),
+                        });
+                        continue;
+                    }
+                    match fs::remove_dir_all(&rec_dir) {
+                        Ok(()) => {
+                            rec_removed = true;
+                            if let Some(parent) = rec_dir.parent()
+                                && parent != recordings_root
+                            {
+                                let _ = fs::remove_dir(parent);
+                            }
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                            rec_removed = true;
+                        }
+                        Err(err) => {
+                            failed_sessions.push(FailedDeleteSession {
+                                session_id: sid,
+                                error: format!("failed to remove session directory: {err}"),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    rec_removed = true;
+                }
+                Err(err) => {
+                    failed_sessions.push(FailedDeleteSession {
+                        session_id: sid,
+                        error: format!("failed to stat session directory: {err}"),
+                    });
+                    continue;
+                }
+            }
+
+            let trash_dir = deleting_root.join(&sid);
+            match fs::symlink_metadata(&trash_dir) {
+                Ok(tmeta) => {
+                    if tmeta.file_type().is_symlink() || !tmeta.is_dir() || tmeta.dev() != root_dev
+                    {
+                        if rec_removed {
+                            forgotten_rels.push(rel);
+                        }
+                        failed_sessions.push(FailedDeleteSession {
+                            session_id: sid,
+                            error: "staged trash directory failed symlink or st_dev check"
+                                .to_owned(),
+                        });
+                        continue;
+                    }
+                    match fs::remove_dir_all(&trash_dir) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            if rec_removed {
+                                forgotten_rels.push(rel);
+                            }
+                            failed_sessions.push(FailedDeleteSession {
+                                session_id: sid,
+                                error: format!("failed to remove staged trash directory: {err}"),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    if rec_removed {
+                        forgotten_rels.push(rel);
+                    }
+                    failed_sessions.push(FailedDeleteSession {
+                        session_id: sid,
+                        error: format!("failed to stat staged trash directory: {err}"),
+                    });
+                    continue;
+                }
+            }
+
+            forgotten_rels.push(rel);
             deleted_ids.push(sid);
         }
-        let _ = fsync_directory(&recordings_root);
-        let _ = self.catalog.forget_paths(&deleted_rels);
+        if recordings_root.is_dir() {
+            let _ = fsync_directory(&recordings_root);
+        }
+        if deleting_root.is_dir() {
+            let _ = fsync_directory(&deleting_root);
+        }
+        if !forgotten_rels.is_empty() && self.catalog.forget_paths(&forgotten_rels).is_err() {
+            let _ = self.catalog.forget_paths_in_memory(&forgotten_rels);
+        }
         let res = DeleteSessionsResult {
             schema: SESSION_DELETE_RESULT_SCHEMA.to_owned(),
             deleted_session_ids: deleted_ids,
-            failed_sessions: Vec::new(),
+            failed_sessions,
         };
         if let Ok(json_val) = serde_json::to_value(&res) {
             self.receipts.commit_delete_sessions_bundle(
@@ -77,8 +240,17 @@ impl CaptureCoordinator {
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            if guard.phase != CapturePhase::Idle && guard.phase != CapturePhase::Failed {
+            if (guard.phase != CapturePhase::Idle && guard.phase != CapturePhase::Failed)
+                || guard.safe_swap_in_progress
+                || guard.volume_admission_in_progress
+            {
                 return Err(guard.busy_error("run crash recovery"));
+            }
+            if guard.volume_released || self.volume.is_volume_released() {
+                return Err(StorageError::conflict(
+                    "volume_released",
+                    "cannot run crash recovery while recording volume is released for safe swap",
+                ));
             }
             guard.transition(CapturePhase::Recovering)?;
             self.phase_cv.notify_all();
@@ -160,14 +332,21 @@ impl CaptureCoordinator {
             if guard.phase != CapturePhase::Failed {
                 return Ok(guard.phase);
             }
+            if guard.safe_swap_in_progress || guard.volume_admission_in_progress {
+                return Err(guard.busy_error("recover from failure"));
+            }
+            guard.volume_admission_in_progress = true;
             guard.recovery_failure_streak = 0;
             guard.next_recovery_retry_at = None;
+            guard.saw_unmount_since_release = false;
+            self.phase_cv.notify_all();
             (
                 guard.admission.clone(),
                 guard.active_volume_id.clone(),
                 guard.volume_released,
             )
         };
+        let mut busy_guard = VolumeAdmissionBusyGuard::new(&self.state, &self.phase_cv);
 
         self.volume.set_volume_released(false);
         let prev_binding = if was_released {
@@ -210,6 +389,8 @@ impl CaptureCoordinator {
             guard.volume_released = false;
             guard.released_mount_signature = None;
             guard.saw_unmount_since_release = false;
+            guard.volume_admission_in_progress = false;
+            busy_guard.disarm();
             if volume_changed {
                 guard.retained_unsuccessful = None;
             }
@@ -236,6 +417,9 @@ impl CaptureCoordinator {
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            if guard.is_busy_for_ops() || guard.phase == CapturePhase::Closing {
+                return Err(guard.busy_error("refresh volume admission"));
+            }
             guard.recovery_failure_streak = 0;
             guard.next_recovery_retry_at = None;
         }
@@ -247,13 +431,16 @@ impl CaptureCoordinator {
         run_recovery_always: bool,
     ) -> StorageResult<VolumeAdmission> {
         let (prev, prev_vid, was_released, was_failed) = {
-            let guard = self
+            let mut guard = self
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            if guard.phase.is_busy() || guard.phase == CapturePhase::Closing {
+            if guard.is_busy_for_ops() || guard.phase == CapturePhase::Closing {
                 return Err(guard.busy_error("refresh volume admission"));
             }
+            guard.volume_admission_in_progress = true;
+            guard.saw_unmount_since_release = false;
+            self.phase_cv.notify_all();
             (
                 guard.admission.clone(),
                 guard.active_volume_id.clone(),
@@ -261,6 +448,7 @@ impl CaptureCoordinator {
                 guard.phase == CapturePhase::Failed,
             )
         };
+        let mut busy_guard = VolumeAdmissionBusyGuard::new(&self.state, &self.phase_cv);
 
         self.volume.set_volume_released(false);
         let prev_binding = if was_released || was_failed {
@@ -337,6 +525,8 @@ impl CaptureCoordinator {
             guard.released_mount_signature = None;
             guard.saw_unmount_since_release = false;
             guard.last_failure_reason = None;
+            guard.volume_admission_in_progress = false;
+            busy_guard.disarm();
             if guard.phase == CapturePhase::Failed {
                 guard.transition(CapturePhase::Idle)?;
                 self.phase_cv.notify_all();
@@ -344,6 +534,7 @@ impl CaptureCoordinator {
                 let snap = self.build_status_snapshot_locked(&guard, rt);
                 Some((guard.authority_epoch.clone(), guard.source_revision, snap))
             } else {
+                self.phase_cv.notify_all();
                 guard.bump_revision();
                 None
             }
@@ -467,6 +658,7 @@ impl CaptureCoordinator {
         let (
             phase,
             volume_released,
+            busy_for_ops,
             released_sig,
             saw_unmount,
             has_admission,
@@ -480,6 +672,7 @@ impl CaptureCoordinator {
             (
                 guard.phase,
                 guard.volume_released || self.volume.is_volume_released(),
+                guard.is_busy_for_ops(),
                 guard.released_mount_signature.clone(),
                 guard.saw_unmount_since_release,
                 guard.admission.is_some(),
@@ -489,7 +682,7 @@ impl CaptureCoordinator {
         };
 
         if phase != CapturePhase::Recording {
-            if !phase.is_busy() && phase != CapturePhase::Closing {
+            if !busy_for_ops && phase != CapturePhase::Closing {
                 if phase == CapturePhase::Failed || volume_released {
                     match self.volume.probe_raw_volume() {
                         Some(cap) if cap.mounted && cap.writable && !cap.read_only => {
@@ -501,7 +694,7 @@ impl CaptureCoordinator {
                             .ok()
                             .map(|m| m.volume_id);
                             let mount_changed = match &released_sig {
-                                None => true,
+                                None => false,
                                 Some((old_vid, old_dev, old_mnt)) => {
                                     cap.device_id != *old_dev
                                         || cap.mount_identity != *old_mnt

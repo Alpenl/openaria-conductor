@@ -203,6 +203,38 @@ static void test_nv12_split_and_preview(void)
         assert(p_f.uv[i] == 40);
         assert(p_f.uv[i + 1] == 200);
     }
+
+    /* Contiguous vstride > height padding must be preserved in dst.size */
+    uint8_t padded_l[8 * 16 * 3 / 2];
+    memset(padded_l, 0, sizeof(padded_l));
+    miro_ego_nv12_frame_t l_padded = {
+        .y = padded_l,
+        .uv = padded_l + 8 * 12, /* vstride=12 > height=8 */
+        .width = 8,
+        .height = 8,
+        .stride = 8,
+        .size = sizeof(padded_l),
+    };
+    assert(miro_ego_split_eye_nv12(&s_f, &l_padded, 8, 8, 0) == 0);
+    assert(l_padded.size == (uint32_t)(8 * 12 + 8 * 4));
+    assert(l_padded.uv[0] == 40 && l_padded.uv[1] == 200);
+
+    /* Disjoint Y and UV buffers fall back to packed dst_stride * (height + height/2) */
+    uint8_t *disjoint_uv = malloc(8 * 4);
+    uint8_t *disjoint_y = malloc(8 * 8);
+    assert(disjoint_uv != NULL && disjoint_y != NULL);
+    miro_ego_nv12_frame_t l_disjoint = {
+        .y = disjoint_y,
+        .uv = disjoint_uv,
+        .width = 8,
+        .height = 8,
+        .stride = 8,
+        .size = 8 * 12,
+    };
+    assert(miro_ego_split_eye_nv12(&s_f, &l_disjoint, 8, 8, 0) == 0);
+    assert(l_disjoint.size == 8 * 12);
+    free(disjoint_y);
+    free(disjoint_uv);
 }
 
 /* ----------------------------------------------------- MP4 metadata fix --- */

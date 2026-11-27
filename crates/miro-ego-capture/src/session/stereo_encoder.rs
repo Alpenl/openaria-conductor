@@ -1,6 +1,7 @@
 use crate::session::session_io;
 use crate::session::shm_ring::{
-    ShmRingConfig, ShmRingError, ShmRingProducer, create_eventfd, wake_eventfd_best_effort,
+    ShmRingConfig, ShmRingError, ShmRingProducer, create_eventfd, min_slot_capacity_for_dimensions,
+    wake_eventfd_best_effort,
 };
 use miro_ego_core::ids::is_valid_sha256;
 use miro_ego_core::sys::clock::monotonic_ns;
@@ -34,8 +35,6 @@ const DEFAULT_MIN_QP: u8 = 20;
 const DEFAULT_MAX_QP: u8 = 51;
 const DEFAULT_INTRA_QP: u8 = 22;
 const DEFAULT_INITIAL_QP: u8 = 24;
-const MIN_MJPEG_SLOT_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_DEFAULT_MJPEG_SLOT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncoderEventError {
@@ -304,16 +303,9 @@ pub fn min_shm_slot_capacity(width: u64, height: u64) -> Result<usize, EncoderPr
             "encoder frame dimensions must be positive",
         ));
     }
-    let pixels = width.checked_mul(height).ok_or_else(|| {
+    let sized = min_slot_capacity_for_dimensions(width, height).ok_or_else(|| {
         EncoderProcessError::new("invalid_argument", "encoder frame dimensions overflow")
     })?;
-    let page_aligned = pixels
-        .checked_add(0xfff)
-        .map(|v| v & !0xfff)
-        .ok_or_else(|| {
-            EncoderProcessError::new("invalid_argument", "encoder frame buffer size overflow")
-        })?;
-    let sized = page_aligned.clamp(MIN_MJPEG_SLOT_BYTES, MAX_DEFAULT_MJPEG_SLOT_BYTES);
     usize::try_from(sized).map_err(|_| {
         EncoderProcessError::new(
             "invalid_argument",
@@ -356,7 +348,12 @@ pub struct EncoderConfig<'a> {
 
 impl EncoderProcess {
     pub fn new(config: EncoderConfig<'_>) -> Result<Self, EncoderProcessError> {
-        Self::with_transport(config, EncoderTransport::default())
+        let width = u32::try_from(config.width).unwrap_or(u32::MAX);
+        let height = u32::try_from(config.height).unwrap_or(u32::MAX);
+        Self::with_transport(
+            config,
+            EncoderTransport::ShmRing(ShmRingConfig::for_dimensions(width, height)),
+        )
     }
 
     pub fn with_transport(
@@ -381,6 +378,13 @@ impl EncoderProcess {
                 "invalid encoder parameters",
             ));
         }
+        let transport_mode = if transport_mode == EncoderTransport::default() {
+            let width = u32::try_from(config.width).unwrap_or(u32::MAX);
+            let height = u32::try_from(config.height).unwrap_or(u32::MAX);
+            EncoderTransport::ShmRing(ShmRingConfig::for_dimensions(width, height))
+        } else {
+            transport_mode
+        };
         if let EncoderTransport::ShmRing(shm_cfg) = transport_mode {
             shm_cfg.validate()?;
             let min_capacity = min_shm_slot_capacity(config.width, config.height)?;
@@ -2053,6 +2057,23 @@ mod tests {
         };
         assert_eq!(err.code, "invalid_shm_config");
         assert!(EncoderProcess::new(cfg()).is_ok());
+
+        let uhd_cfg = || EncoderConfig {
+            width: 3840,
+            height: 2160,
+            ..cfg()
+        };
+        let uhd_new = EncoderProcess::new(uhd_cfg()).unwrap();
+        assert_eq!(
+            uhd_new.transport_mode(),
+            EncoderTransport::ShmRing(ShmRingConfig::for_dimensions(3840, 2160))
+        );
+        let uhd_default =
+            EncoderProcess::with_transport(uhd_cfg(), EncoderTransport::default()).unwrap();
+        assert_eq!(
+            uhd_default.transport_mode(),
+            EncoderTransport::ShmRing(ShmRingConfig::for_dimensions(3840, 2160))
+        );
     }
 
     #[test]
@@ -2291,11 +2312,20 @@ mod tests {
         ));
         encoder.lock().unwrap().abort();
 
-        // Wait briefly for grandchild in process group to be reaped by init after SIGKILL -pgid.
+        // Wait briefly for grandchild in process group to die (or become a zombie when PID 1 in a
+        // minimal PID namespace does not immediately reap reparented children).
         let reap_deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let alive = unsafe { libc::kill(grandchild_pid, 0) };
-            if alive == -1 {
+            let is_zombie = alive == 0
+                && std::fs::read_to_string(format!("/proc/{grandchild_pid}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit_once(") ")
+                            .and_then(|(_, rest)| rest.chars().next())
+                    })
+                    .is_some_and(|state| matches!(state, 'Z' | 'X'));
+            if alive == -1 || is_zombie {
                 break;
             }
             assert!(

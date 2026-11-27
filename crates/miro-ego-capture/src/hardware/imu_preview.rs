@@ -81,10 +81,10 @@ impl Preview {
                                         // off to 2 Hz when idle so USB EP0 control traffic stays minimal.
                                         let wait_for = poll_interval_for_state(&state, now);
                                         let _ = shared.1.wait_timeout_while(state, wait_for, |s| {
-                                            !s.stop
-                                                && !(wait_for == IDLE_POLL_INTERVAL
+                                            !(s.stop
+                                                || (wait_for == IDLE_POLL_INTERVAL
                                                     && poll_interval_for_state(s, Instant::now())
-                                                        == ACTIVE_POLL_INTERVAL)
+                                                        == ACTIVE_POLL_INTERVAL))
                                         });
                                     }
                                 }

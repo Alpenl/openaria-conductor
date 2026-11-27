@@ -26,6 +26,7 @@ pub const DEFAULT_RESCUE_HOTSPOT_PSK: &str = "12345678";
 pub const DEFAULT_ACTIVATION_WAIT_SECS: u64 = 10;
 pub const DEFAULT_NMCLI_TIMEOUT: Duration = Duration::from_secs(12);
 pub const MAX_SCAN_ENTRIES: usize = 256;
+pub const MAX_COMMAND_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Output captured from a subprocess invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,33 +45,67 @@ pub trait CommandRunner: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemCommandRunner;
 
+fn read_pipe_bounded<R: Read>(mut pipe: R, max_bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if out.len() < max_bytes {
+                    let take = n.min(max_bytes - out.len());
+                    out.extend_from_slice(&chunk[..take]);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+fn kill_child_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        if pid > 0 {
+            // SAFETY: `child` was placed in its own process group (`process_group(0)`),
+            // so `-pid` terminates only the subprocess and its descendants.
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, program: &str, args: &[&str], timeout: Duration) -> NetworkResult<CommandOutput> {
-        let mut child = Command::new(program)
-            .args(args)
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| NetworkError::Backend {
-                message: format!("failed to spawn {program}: {err}"),
-            })?;
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn().map_err(|err| NetworkError::Backend {
+            message: format!("failed to spawn {program}: {err}"),
+        })?;
 
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
         let stdout_handle = std::thread::spawn(move || -> Vec<u8> {
-            let mut buf = Vec::new();
-            if let Some(ref mut pipe) = stdout_pipe {
-                let _ = pipe.read_to_end(&mut buf);
+            match stdout_pipe {
+                Some(pipe) => read_pipe_bounded(pipe, MAX_COMMAND_OUTPUT_BYTES),
+                None => Vec::new(),
             }
-            buf
         });
         let stderr_handle = std::thread::spawn(move || -> Vec<u8> {
-            let mut buf = Vec::new();
-            if let Some(ref mut pipe) = stderr_pipe {
-                let _ = pipe.read_to_end(&mut buf);
+            match stderr_pipe {
+                Some(pipe) => read_pipe_bounded(pipe, MAX_COMMAND_OUTPUT_BYTES),
+                None => Vec::new(),
             }
-            buf
         });
 
         let deadline = Instant::now() + timeout;
@@ -79,8 +114,7 @@ impl CommandRunner for SystemCommandRunner {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_child_process_group(&mut child);
                         let _ = stdout_handle.join();
                         let _ = stderr_handle.join();
                         return Err(NetworkError::Backend {
@@ -93,8 +127,7 @@ impl CommandRunner for SystemCommandRunner {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(err) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_child_process_group(&mut child);
                     let _ = stdout_handle.join();
                     let _ = stderr_handle.join();
                     return Err(NetworkError::Backend {
@@ -1317,6 +1350,7 @@ impl NmcliBackend {
     /// stored keyfile passphrase on disk.
     pub fn promote_wifi_client_autoconnect(&self, profile_name: &str) -> NetworkResult<()> {
         let path = self.profile_path(profile_name);
+        let mut rollback_prev: Option<String> = None;
         if path.is_file() {
             let previous = fs::read_to_string(&path).map_err(|err| NetworkError::Backend {
                 message: format!("cannot read Wi-Fi profile {}: {err}", path.display()),
@@ -1324,9 +1358,10 @@ impl NmcliBackend {
             let updated = rewrite_autoconnect(&previous, true);
             if updated != previous {
                 self.atomic_update_with_rollback(&path, &previous, &updated)?;
+                rollback_prev = Some(previous);
             }
         }
-        let out = self.runner.run(
+        let modify_res = self.runner.run(
             "nmcli",
             &[
                 "connection",
@@ -1336,16 +1371,29 @@ impl NmcliBackend {
                 "yes",
             ],
             Duration::from_secs(10),
-        )?;
-        if out.exit_code != 0 {
-            return Err(NetworkError::Backend {
-                message: format!(
-                    "autoconnect_promote_failed: {profile_name}: {}",
-                    out.stderr.trim()
-                ),
-            });
+        );
+        match modify_res {
+            Ok(out) if out.exit_code == 0 => Ok(()),
+            Ok(out) => {
+                if let Some(prev) = rollback_prev {
+                    let _ = write_bytes_atomic(&path, prev.as_bytes(), 0o600, true);
+                    let _ = self.reload_connections();
+                }
+                Err(NetworkError::Backend {
+                    message: format!(
+                        "autoconnect_promote_failed: {profile_name}: {}",
+                        out.stderr.trim()
+                    ),
+                })
+            }
+            Err(err) => {
+                if let Some(prev) = rollback_prev {
+                    let _ = write_bytes_atomic(&path, prev.as_bytes(), 0o600, true);
+                    let _ = self.reload_connections();
+                }
+                Err(err)
+            }
         }
-        Ok(())
     }
 
     fn write_profile_inner(
@@ -1706,6 +1754,14 @@ impl NmcliBackend {
     }
 
     fn read_profile_ssid(&self, profile_name: &str) -> Option<String> {
+        if profile_name.is_empty()
+            || profile_name.contains('/')
+            || profile_name.contains('\\')
+            || profile_name.contains('\0')
+            || profile_name.contains("..")
+        {
+            return None;
+        }
         let text = fs::read_to_string(self.profile_path(profile_name)).ok()?;
         let mut in_wifi = false;
         for raw in text.lines() {
@@ -2339,6 +2395,85 @@ mod tests {
         assert_eq!(devs[1].interface, "eth0:0");
         assert_eq!(devs[1].device_type, "ethernet");
         assert_eq!(devs[1].state, "disconnected");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_profile_ssid_rejects_traversal_and_promote_rolls_back_on_nmcli_failure() {
+        struct FailModifyRunner;
+        impl CommandRunner for FailModifyRunner {
+            fn run(
+                &self,
+                _program: &str,
+                args: &[&str],
+                _timeout: Duration,
+            ) -> NetworkResult<CommandOutput> {
+                if args.starts_with(&["connection", "modify"]) {
+                    return Ok(CommandOutput {
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: "simulated modify error".to_owned(),
+                    });
+                }
+                Ok(CommandOutput {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let dir = temp_dir("nmcli-safety");
+        let backend = NmcliBackend::new(Arc::new(FailModifyRunner), &dir, "wlan0", "eth0");
+        backend
+            .write_profile_inner(
+                "miro-ego-wifi-client-test",
+                &ProfileSpec::WifiClient {
+                    ssid: "TestNet".to_owned(),
+                    security: WifiSecurity::Open,
+                    psk: None,
+                },
+                Some(false),
+            )
+            .unwrap();
+        // Traversal / invalid profile names must return None without reading outside `profile_dir`.
+        assert_eq!(backend.read_profile_ssid(""), None);
+        assert_eq!(backend.read_profile_ssid("../escape"), None);
+        assert_eq!(backend.read_profile_ssid("sub/dir"), None);
+        assert_eq!(
+            backend.read_profile_ssid("miro-ego-wifi-client-test"),
+            Some("TestNet".to_owned())
+        );
+
+        // If `nmcli connection modify` fails, promote must roll back `autoconnect=false` on disk!
+        assert!(
+            backend
+                .promote_wifi_client_autoconnect("miro-ego-wifi-client-test")
+                .is_err()
+        );
+        let keyfile =
+            fs::read_to_string(backend.profile_path("miro-ego-wifi-client-test")).unwrap();
+        assert!(keyfile.contains("autoconnect=false"));
+
+        // SystemCommandRunner bounds output and kills process groups cleanly on timeout.
+        let mut child_out = read_pipe_bounded(std::io::Cursor::new(vec![b'x'; 32]), 10);
+        assert_eq!(child_out.len(), 10);
+        child_out.clear();
+
+        let script = dir.join("hang.sh");
+        fs::write(&script, b"#!/bin/sh\nsleep 10\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let started = Instant::now();
+        let err = SystemCommandRunner
+            .run(script.to_str().unwrap(), &[], Duration::from_millis(120))
+            .unwrap_err();
+        assert!(err.to_string().contains("network_timeout"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
         fs::remove_dir_all(dir).unwrap();
     }
 }

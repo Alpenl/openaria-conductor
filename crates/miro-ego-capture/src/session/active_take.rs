@@ -199,6 +199,20 @@ impl ActiveTakeWriter {
         Ok(())
     }
 
+    /// Roll back a reserved frame that was aborted before entering the encoder or sink.
+    pub fn cancel_pending_frame(&mut self, frame: ReservedFrame) -> Result<(), ActiveTakeError> {
+        self.ensure_pending(&frame)?;
+        if self.frame_domain != frame.record_sequence.saturating_add(1) {
+            return Err(ActiveTakeError::new(
+                "invalid_state",
+                "active take frame domain advanced past pending frame",
+            ));
+        }
+        self.pending_frame = None;
+        self.frame_domain = frame.record_sequence;
+        Ok(())
+    }
+
     pub fn finish(&mut self) -> Result<ActiveTakeSummary, ActiveTakeError> {
         self.ensure_open()?;
         if self.pending_frame.is_some() {
@@ -317,6 +331,23 @@ mod tests {
         assert_eq!(summary.frames_written, 2);
         assert_eq!(summary.bytes_written, 96);
         assert_eq!(summary.pending_frames, 0);
+    }
+
+    #[test]
+    fn cancel_pending_frame_rolls_back_unsubmitted_reservation_cleanly() {
+        let mut writer = ActiveTakeWriter::new("session").unwrap();
+        let f0 = writer.reserve_frame(source_frame(1)).unwrap();
+        writer.finish_frame(f0, 100).unwrap();
+
+        let f1 = writer.reserve_frame(source_frame(2)).unwrap();
+        assert_eq!(writer.snapshot().pending_frames, 1);
+        assert_eq!(writer.snapshot().frame_domain, 2);
+        writer.cancel_pending_frame(f1).unwrap();
+
+        let summary = writer.finish().unwrap();
+        assert_eq!(summary.pending_frames, 0);
+        assert_eq!(summary.frames_written, 1);
+        assert_eq!(summary.frame_domain, 1);
     }
 
     #[test]

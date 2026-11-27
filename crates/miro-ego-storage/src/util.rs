@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// RAII lease tracking an active open file descriptor on the recording volume (`/data`).
@@ -22,8 +22,19 @@ pub struct VolumeHandleLease {
 
 impl VolumeHandleLease {
     pub fn acquire(counter: Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
+        counter.fetch_add(1, Ordering::SeqCst);
         Self { counter }
+    }
+
+    /// Atomically acquire a handle lease using a `SeqCst` increment-then-check barrier
+    /// against `released`, rolling back the increment and returning `None` if released.
+    pub fn try_acquire(counter: Arc<AtomicUsize>, released: &AtomicBool) -> Option<Self> {
+        let lease = Self::acquire(counter);
+        if released.load(Ordering::SeqCst) {
+            drop(lease);
+            return None;
+        }
+        Some(lease)
     }
 }
 
@@ -35,7 +46,7 @@ impl Clone for VolumeHandleLease {
 
 impl Drop for VolumeHandleLease {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        self.counter.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

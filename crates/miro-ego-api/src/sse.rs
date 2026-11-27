@@ -23,6 +23,7 @@ pub const NETWORK_EVENT_SCHEMA: &str = "miro-ego.network-event.v1";
 const RESYNC_ANCHOR_LIMIT: usize = 256;
 const RETIRED_AUTHORITY_EPOCH_LIMIT: usize = 64;
 const HEARTBEAT_BYTES: &[u8] = b": heartbeat\n\n";
+const CONNECTED_COMMENT_BYTES: &[u8] = b": connected\n\n";
 
 /// Parsed decimal `Last-Event-ID` cursor.
 ///
@@ -1038,21 +1039,33 @@ pub fn capture_sse_body(
         let _permit = permit;
         let mut cursor = initial_cursor;
 
-        for event in initial_events {
-            match event.encode() {
-                Ok(chunk) => {
-                    cursor = event.delivery_id;
-                    tokio::select! {
-                        biased;
-                        _ = wait_for_shutdown(&mut shutdown_rx) => return,
-                        res = tx.send(Ok(chunk)) => {
-                            if res.is_err() {
-                                return;
+        if initial_events.is_empty() {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                res = tx.send(Ok(Bytes::from_static(CONNECTED_COMMENT_BYTES))) => {
+                    if res.is_err() {
+                        return;
+                    }
+                }
+            }
+        } else {
+            for event in initial_events {
+                match event.encode() {
+                    Ok(chunk) => {
+                        cursor = event.delivery_id;
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                            res = tx.send(Ok(chunk)) => {
+                                if res.is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
+                    Err(_) => return,
                 }
-                Err(_) => return,
             }
         }
 
@@ -1149,21 +1162,33 @@ pub fn network_sse_body(
         let _permit = permit;
         let mut cursor = initial_cursor;
 
-        for event in initial_events {
-            match event.encode() {
-                Ok(chunk) => {
-                    cursor = event.delivery_id;
-                    tokio::select! {
-                        biased;
-                        _ = wait_for_shutdown(&mut shutdown_rx) => return,
-                        res = tx.send(Ok(chunk)) => {
-                            if res.is_err() {
-                                return;
+        if initial_events.is_empty() {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                res = tx.send(Ok(Bytes::from_static(CONNECTED_COMMENT_BYTES))) => {
+                    if res.is_err() {
+                        return;
+                    }
+                }
+            }
+        } else {
+            for event in initial_events {
+                match event.encode() {
+                    Ok(chunk) => {
+                        cursor = event.delivery_id;
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                            res = tx.send(Ok(chunk)) => {
+                                if res.is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
+                    Err(_) => return,
                 }
-                Err(_) => return,
             }
         }
 

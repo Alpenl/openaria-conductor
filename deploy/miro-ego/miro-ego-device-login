@@ -5,9 +5,12 @@ LOGIN_USER=MiroEgo
 # shellcheck disable=SC2016
 LOGIN_PASSWORD_HASH='$6$MiroEgo$lrJfBEJiHnAu0q9DFRn8VK9DQv0TLDKpPyHvonTuRqpIuYj40/ee1wYh0GNYnnFNQRVWxnEPurLVU8ZZJwybs1'
 
-if ! getent passwd "$LOGIN_USER" >/dev/null; then
+if ! passwd_entry=$(getent passwd "$LOGIN_USER"); then
     useradd --badname --create-home --shell /bin/bash --user-group --groups sudo --password "$LOGIN_PASSWORD_HASH" "$LOGIN_USER"
     chage --maxdays -1 --expiredate -1 "$LOGIN_USER"
 else
-    usermod --shell /bin/bash "$LOGIN_USER"
+    current_shell=${passwd_entry##*:}
+    if [ "$current_shell" != "/bin/bash" ]; then
+        usermod --shell /bin/bash "$LOGIN_USER"
+    fi
 fi

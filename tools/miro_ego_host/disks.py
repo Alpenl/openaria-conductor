@@ -519,20 +519,20 @@ def _parse_windows_disk_numbers(raw: bytes) -> list[int]:
 
 def check_path_not_on_disk(disk_path: str, target_path: Path, *, message: str) -> None:
     """Reject *target_path* if its backing filesystem resides on *disk_path*."""
+    probe = target_path
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
     system = platform.system()
     if system == "Linux":
-        source = run("findmnt", "-n", "-o", "SOURCE", "--target", str(target_path)).decode().strip()
+        source = run("findmnt", "-n", "-o", "SOURCE", "--target", str(probe)).decode().strip()
         if linux_source_on_disk(source, disk_path):
             raise RuntimeError(message)
     elif system == "Darwin":
-        source = run("df", "-P", str(target_path)).decode().splitlines()[-1].split()[0]
+        source = run("df", "-P", str(probe)).decode().splitlines()[-1].split()[0]
         info = plistlib.loads(run("diskutil", "info", "-plist", source))
         if info.get("ParentWholeDisk") == disk_path.removeprefix("/dev/"):
             raise RuntimeError(message)
     elif system == "Windows":
-        probe = target_path
-        while not probe.exists() and probe.parent != probe:
-            probe = probe.parent
         drive = probe.drive.removeprefix("\\\\?\\")
         if not re.fullmatch(r"[A-Za-z]:", drive):
             raise RuntimeError("Choose a local fixed drive")
@@ -621,6 +621,25 @@ def verify(
         raise RuntimeError("Image readback digest mismatch")
 
 
+_LINUX_BLKFLSBUF = 0x1261
+
+
+def _flush_block_cache(stream: BinaryIO) -> None:
+    """Drop Linux block-device and page-cache buffers before readback verification."""
+    if platform.system() != "Linux":
+        return
+    import fcntl
+
+    fd = stream.fileno()
+    with suppress(OSError):
+        fcntl.ioctl(fd, _LINUX_BLKFLSBUF)
+    posix_fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if posix_fadvise is not None and dontneed is not None:
+        with suppress(OSError):
+            posix_fadvise(fd, 0, 0, dontneed)
+
+
 def write_card(
     path: str,
     flags: int,
@@ -646,6 +665,7 @@ def write_card(
         if not quick:
             print("Erasing every addressable sector...")
             transfer(card, None, disk.size, progress)
+            _flush_block_cache(card)
             card.seek(0)
             print("Verifying entire card is zero...")
             verify(card, disk.size, None, progress)
@@ -656,6 +676,7 @@ def write_card(
             print("Writing system image...")
             with image.open("rb") as src:
                 transfer(card, src, image.stat().st_size, progress)
+            _flush_block_cache(card)
             card.seek(0)
             print("Verifying system image...")
             verify(card, image.stat().st_size, expected.lower(), progress)

@@ -1277,7 +1277,20 @@ fn remaining_until_deadline(deadline: Instant) -> HwResult<Duration> {
     }
 }
 
-/// Bounded HTTP/1.1 & HTTPS loopback client calling `GET /api/v1/capture/status` and
+fn validate_http_header_token(token: &str, label: &str) -> HwResult<()> {
+    if token.is_empty()
+        || token
+            .bytes()
+            .any(|b| b == b'\r' || b == b'\n' || b < 0x20 || b == 0x7f)
+    {
+        return Err(HwError::Io {
+            message: format!("{label} contains invalid control or newline characters"),
+        });
+    }
+    Ok(())
+}
+
+/// Bounded HTTP/1.0 & HTTPS loopback client calling `GET /api/v1/capture/status` and
 /// `POST /api/v1/capture/{start,stop}` on the local `miro-ego serve` daemon.
 #[derive(Debug, Clone)]
 pub struct LocalHttpCaptureClient {
@@ -1363,6 +1376,7 @@ impl LocalHttpCaptureClient {
                         ),
                     });
                 }
+                validate_http_header_token(&token, "bearer_token")?;
                 Self::new(addr, Some(token), timeout_ms)
                     .with_pinned_tls_cert_file(&tls_certificate_file)
             }
@@ -1370,6 +1384,12 @@ impl LocalHttpCaptureClient {
     }
 
     fn http_json(&self, method: &str, path: &str, body: Option<&Value>) -> HwResult<(u16, Value)> {
+        if let Some(tok) = &self.bearer_token {
+            validate_http_header_token(tok, "bearer_token")?;
+        }
+        if let Some(csrf) = &self.csrf_token {
+            validate_http_header_token(csrf, "csrf_token")?;
+        }
         let deadline = Instant::now() + self.timeout;
         let connect_rem = remaining_until_deadline(deadline)?;
         let tcp = TcpStream::connect_timeout(&self.addr, connect_rem).map_err(|err| {
@@ -1399,7 +1419,7 @@ impl LocalHttpCaptureClient {
         };
 
         let mut req = format!(
-            "{method} /api/v1{path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nOrigin: {origin}\r\nConnection: close\r\n"
+            "{method} /api/v1{path} HTTP/1.0\r\nHost: {authority}\r\nAccept: application/json\r\nOrigin: {origin}\r\nConnection: close\r\n"
         );
         if let Some(tok) = &self.bearer_token {
             req.push_str(&format!("Authorization: Bearer {tok}\r\n"));
@@ -1481,6 +1501,18 @@ impl LocalHttpCaptureClient {
             .ok_or_else(|| HwError::Io {
                 message: format!("invalid HTTP status line: {status_line}"),
             })?;
+        for line in header_str.lines().skip(1) {
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("transfer-encoding")
+                    && v.to_ascii_lowercase().contains("chunked")
+                {
+                    return Err(HwError::Io {
+                        message: "unsupported Transfer-Encoding: chunked from capture API"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
 
         let body_bytes = &raw[header_end + 4..];
         if status_code == 204 || body_bytes.is_empty() {
@@ -1535,6 +1567,12 @@ where
                         message: "capture API response exceeded 1 MiB limit".to_owned(),
                     });
                 }
+                if has_chunked_transfer_encoding(&raw) {
+                    return Err(HwError::Io {
+                        message: "unsupported Transfer-Encoding: chunked from capture API"
+                            .to_owned(),
+                    });
+                }
                 if let Some(expected_total) = complete_content_length_total(&raw) {
                     if raw.len() >= expected_total {
                         raw.truncate(expected_total);
@@ -1558,6 +1596,21 @@ where
         }
     }
     Ok(raw)
+}
+
+fn has_chunked_transfer_encoding(raw: &[u8]) -> bool {
+    let Some(header_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(header_str) = std::str::from_utf8(&raw[..header_end]) else {
+        return false;
+    };
+    header_str.lines().skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("transfer-encoding")
+                && v.to_ascii_lowercase().contains("chunked")
+        })
+    })
 }
 
 fn complete_content_length_total(raw: &[u8]) -> Option<usize> {
@@ -1664,11 +1717,40 @@ impl<B: ButtonInput, C: CaptureToggleClient> ButtonMonitor<B, C> {
         Ok(Some((event, action)))
     }
 
-    /// Run continuously until `stop` becomes `true`, logging transient capture API errors
-    /// without terminating the button monitor loop.
+    /// Run continuously until `stop` becomes `true`, recovering from transient GPIO `HwError::Io`
+    /// errors with bounded backoff + disarming (exiting on persistent I/O failures) and logging
+    /// transient capture API errors without terminating the button monitor loop.
     pub fn run_until(&self, stop: &AtomicBool, poll_slice_ms: u64) -> HwResult<()> {
+        const MAX_CONSECUTIVE_POLL_IO_ERRORS: u32 = 5;
+        let mut consecutive_io_errs: u32 = 0;
         while !stop.load(Ordering::Acquire) {
-            let Some(event) = self.input.poll_event(poll_slice_ms)? else {
+            let event = match self.input.poll_event(poll_slice_ms) {
+                Ok(ev) => {
+                    consecutive_io_errs = 0;
+                    ev
+                }
+                Err(HwError::Io { message }) => {
+                    consecutive_io_errs = consecutive_io_errs.saturating_add(1);
+                    self.input.disarm();
+                    eprintln!(
+                        "miro-ego-button: transient GPIO poll error (attempt {consecutive_io_errs}/{MAX_CONSECUTIVE_POLL_IO_ERRORS}, continuing): {message}"
+                    );
+                    if consecutive_io_errs >= MAX_CONSECUTIVE_POLL_IO_ERRORS {
+                        return Err(HwError::Io { message });
+                    }
+                    let backoff_ms = 25_u64
+                        .saturating_mul(1_u64 << (consecutive_io_errs - 1).min(4))
+                        .min(250);
+                    let backoff_deadline = Instant::now() + Duration::from_millis(backoff_ms);
+                    while !stop.load(Ordering::Acquire) && Instant::now() < backoff_deadline {
+                        let rem = backoff_deadline.saturating_duration_since(Instant::now());
+                        std::thread::sleep(rem.min(Duration::from_millis(20)));
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let Some(event) = event else {
                 continue;
             };
             if event == ButtonEvent::ShortPress {
@@ -2144,5 +2226,83 @@ mod tests {
         assert_eq!(srv_calls.load(Ordering::SeqCst), 3);
 
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn button_monitor_recovers_from_transient_io_and_client_rejects_crlf_and_chunked() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 1. Rejects CRLF / control chars in bearer and CSRF tokens before sending anything.
+        let bad_bearer =
+            LocalHttpCaptureClient::new(addr, Some("tok\r\nInjected: 1".to_owned()), 1000);
+        assert!(bad_bearer.toggle_capture().is_err());
+
+        let bad_csrf = LocalHttpCaptureClient::new(addr, Some("good-tok".to_owned()), 1000)
+            .with_csrf_token("bad\ncSRF");
+        assert!(bad_csrf.toggle_capture().is_err());
+
+        // 2. Rejects Transfer-Encoding: chunked responses explicitly.
+        let chunked_srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+            );
+            let _ = sock.flush();
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+            let _ = sock.read(&mut buf);
+        });
+        let chunked_client = LocalHttpCaptureClient::new(addr, None, 1000);
+        let chunked_err = chunked_client.toggle_capture().unwrap_err();
+        assert!(
+            chunked_err.to_string().contains("chunked"),
+            "unexpected chunked error: {chunked_err}"
+        );
+        chunked_srv.join().unwrap();
+
+        // 3. ButtonMonitor::run_until recovers from transient HwError::Io in poll_event(), disarms,
+        //    and dispatches subsequent ShortPress.
+        struct TransientIoInput {
+            polls: AtomicUsize,
+            disarms: AtomicUsize,
+            stop_flag: Arc<AtomicBool>,
+        }
+        impl ButtonInput for TransientIoInput {
+            fn poll_event(&self, _timeout_ms: u64) -> HwResult<Option<ButtonEvent>> {
+                match self.polls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err(HwError::Io {
+                        message: "transient sysfs read EIO".to_owned(),
+                    }),
+                    1 => Ok(Some(ButtonEvent::ShortPress)),
+                    _ => {
+                        self.stop_flag.store(true, Ordering::Release);
+                        Ok(None)
+                    }
+                }
+            }
+            fn disarm(&self) {
+                self.disarms.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct CountingToggleClient(AtomicUsize);
+        impl CaptureToggleClient for CountingToggleClient {
+            fn toggle_capture(&self) -> HwResult<CaptureToggleAction> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(CaptureToggleAction::Started)
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let input = TransientIoInput {
+            polls: AtomicUsize::new(0),
+            disarms: AtomicUsize::new(0),
+            stop_flag: Arc::clone(&stop),
+        };
+        let monitor = ButtonMonitor::new(input, CountingToggleClient(AtomicUsize::new(0)));
+        monitor.run_until(&stop, 10).unwrap();
+        assert_eq!(monitor.input.disarms.load(Ordering::SeqCst), 2);
+        assert_eq!(monitor.client.0.load(Ordering::SeqCst), 1);
     }
 }

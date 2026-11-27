@@ -102,6 +102,8 @@ pub(super) struct CoordinatorState {
     pub admission: Option<VolumeAdmission>,
     pub active_volume_id: Option<String>,
     pub volume_released: bool,
+    pub safe_swap_in_progress: bool,
+    pub volume_admission_in_progress: bool,
     pub released_mount_signature: Option<(String, u64, String)>,
     pub saw_unmount_since_release: bool,
     pub active: Option<ActiveSessionContext>,
@@ -135,7 +137,25 @@ impl CoordinatorState {
         self.source_revision
     }
 
+    pub(super) fn is_busy_for_ops(&self) -> bool {
+        self.phase.is_busy() || self.safe_swap_in_progress || self.volume_admission_in_progress
+    }
+
     pub(super) fn busy_error(&self, action: &str) -> StorageError {
+        if self.phase == CapturePhase::Idle {
+            if self.safe_swap_in_progress {
+                return StorageError::conflict(
+                    "capture_busy",
+                    format!("cannot {action} while safe swap is in progress"),
+                );
+            }
+            if self.volume_admission_in_progress {
+                return StorageError::conflict(
+                    "capture_busy",
+                    format!("cannot {action} while volume admission is in progress"),
+                );
+            }
+        }
         let msg = format!(
             "cannot {action} while coordinator is in phase {}",
             self.phase.as_str()
@@ -240,6 +260,8 @@ impl CaptureCoordinator {
                 admission,
                 active_volume_id,
                 volume_released: false,
+                safe_swap_in_progress: false,
+                volume_admission_in_progress: false,
                 released_mount_signature: None,
                 saw_unmount_since_release: false,
                 active: None,
@@ -337,12 +359,20 @@ impl CaptureCoordinator {
         self.volume.acquire_handle_lease()
     }
 
+    /// Atomically acquire an RAII [`VolumeHandleLease`] only when the volume is not released.
+    pub fn try_acquire_open_handle_lease(&self) -> Option<VolumeHandleLease> {
+        self.volume.try_acquire_handle_lease()
+    }
+
     pub(super) fn close_all_volume_handles_for_safe_swap(&self) {
-        if let Ok(guard) = self.audit_logger.lock()
-            && let Some(audit) = guard.as_ref()
-        {
-            audit.close_active_file();
-        }
+        let close_audit = || {
+            if let Ok(guard) = self.audit_logger.lock()
+                && let Some(audit) = guard.as_ref()
+            {
+                audit.close_active_file();
+            }
+        };
+        close_audit();
         let hooks = self
             .release_hooks
             .lock()
@@ -352,6 +382,7 @@ impl CaptureCoordinator {
         for hook in hooks {
             hook();
         }
+        close_audit();
     }
 
     pub fn volume(&self) -> &Arc<ExfatVolumeManager> {
@@ -404,7 +435,7 @@ impl CaptureCoordinator {
             .state
             .lock()
             .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-        while guard.phase.is_busy() {
+        while guard.is_busy_for_ops() {
             let now = Instant::now();
             if now >= deadline {
                 return Ok(guard.phase);
@@ -461,12 +492,12 @@ impl CaptureCoordinator {
 
     /// Evaluate read-only capture admission readiness (`miro-ego.capture-readiness.v1`).
     pub fn capture_readiness(&self) -> StorageResult<CaptureReadiness> {
-        let (phase, volume_released) = {
+        let (phase, volume_released, busy_ops) = {
             let guard = self
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            (guard.phase, guard.volume_released)
+            (guard.phase, guard.volume_released, guard.is_busy_for_ops())
         };
 
         let reserve = self.volume.check_reserve()?;
@@ -482,7 +513,7 @@ impl CaptureCoordinator {
                 "capture_busy".to_owned(),
                 "capture coordinator is closing".to_owned(),
             )
-        } else if phase.is_busy() {
+        } else if busy_ops {
             (
                 "capture_busy".to_owned(),
                 "capture or finalization is active".to_owned(),
@@ -761,32 +792,21 @@ impl CaptureCoordinator {
             .map_err(|_| StorageError::Core(CoreError::poisoned("timer_write_lock")))?;
 
         {
-            let guard = self
-                .state
-                .lock()
-                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            if guard.phase.is_busy() {
-                return Err(guard.busy_error("change capture timer settings"));
-            }
-        }
-
-        if let Some(path) = &self.config.timer_settings_path {
-            let mut bytes = serde_json::to_vec_pretty(&new_settings).map_err(|err| {
-                StorageError::invalid_input("timer_encode_failed", err.to_string())
-            })?;
-            bytes.push(b'\n');
-            write_bytes_atomic(path, &bytes, 0o640, true).map_err(|err| {
-                StorageError::io("timer_save_failed", "persist capture timer settings", err)
-            })?;
-        }
-
-        {
             let mut guard = self
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            if guard.phase.is_busy() {
+            if guard.is_busy_for_ops() || guard.phase == CapturePhase::Closing {
                 return Err(guard.busy_error("change capture timer settings"));
+            }
+            if let Some(path) = &self.config.timer_settings_path {
+                let mut bytes = serde_json::to_vec_pretty(&new_settings).map_err(|err| {
+                    StorageError::invalid_input("timer_encode_failed", err.to_string())
+                })?;
+                bytes.push(b'\n');
+                write_bytes_atomic(path, &bytes, 0o640, true).map_err(|err| {
+                    StorageError::io("timer_save_failed", "persist capture timer settings", err)
+                })?;
             }
             guard.timer_settings = new_settings;
         }
@@ -903,14 +923,14 @@ impl CaptureCoordinator {
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            if guard.phase != CapturePhase::Idle || guard.is_busy_for_ops() {
+                return Err(guard.busy_error("start capture"));
+            }
             if guard.volume_released || self.volume.is_volume_released() {
                 return Err(StorageError::conflict(
                     "volume_released",
                     "recording volume was released for safe swap",
                 ));
-            }
-            if guard.phase != CapturePhase::Idle {
-                return Err(guard.busy_error("start capture"));
             }
             guard.admission.clone()
         };
@@ -1019,14 +1039,14 @@ impl CaptureCoordinator {
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            if guard.phase != CapturePhase::Idle || guard.is_busy_for_ops() {
+                return Err(guard.busy_error("start capture"));
+            }
             if guard.volume_released || self.volume.is_volume_released() {
                 return Err(StorageError::conflict(
                     "volume_released",
                     "recording volume was released for safe swap",
                 ));
-            }
-            if guard.phase != CapturePhase::Idle {
-                return Err(guard.busy_error("start capture"));
             }
 
             let (take_id, take_sequence, continuation_of) = match &req.take {
@@ -1303,6 +1323,37 @@ impl CaptureCoordinator {
             return Err(storage_err);
         }
 
+        let pre_start_check: StorageResult<()> = {
+            let mut guard = self
+                .state
+                .lock()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            if guard.phase == CapturePhase::Closing {
+                if guard
+                    .active
+                    .as_ref()
+                    .is_some_and(|c| c.session_id == session_id)
+                {
+                    let _ = guard.active.take();
+                }
+                Err(guard.busy_error("start capture"))
+            } else if guard.phase != CapturePhase::Starting
+                || guard
+                    .active
+                    .as_ref()
+                    .is_none_or(|c| c.session_id != session_id)
+            {
+                Err(guard.busy_error("start capture"))
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(err) = pre_start_check {
+            cleanup_empty_staging_attempt(&staging_dir);
+            drop(local_starting_lock);
+            return Err(err);
+        }
+
         let backend_req = BackendStartRequest {
             session_id: session_id.clone(),
             take_id: take_id.clone(),
@@ -1325,10 +1376,18 @@ impl CaptureCoordinator {
                             Ok(g) => g,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        let r = guard.active.take();
-                        let _ = guard.transition(CapturePhase::Idle);
-                        self.phase_cv.notify_all();
-                        r
+                        if guard
+                            .active
+                            .as_ref()
+                            .is_some_and(|c| c.session_id == session_id)
+                        {
+                            let r = guard.active.take();
+                            let _ = guard.transition(CapturePhase::Idle);
+                            self.phase_cv.notify_all();
+                            r
+                        } else {
+                            None
+                        }
                     };
                     drop(released);
                 } else {
@@ -1346,14 +1405,115 @@ impl CaptureCoordinator {
             }
         };
 
+        // Persist `recording.json` while STILL in `CapturePhase::Starting` before transitioning
+        // `Starting -> Recording` so concurrent `stopCapture` never races marker persistence.
+        let started_progress = handle.progress();
+        let next_rev = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            guard.source_revision.saturating_add(1)
+        };
+        let started_elapsed = if started_progress.elapsed_seconds > 0.0 {
+            started_progress.elapsed_seconds
+        } else {
+            monotonic_ns()
+                .unwrap_or(started_monotonic_ns)
+                .saturating_sub(started_monotonic_ns) as f64
+                / 1_000_000_000.0
+        };
+        let started_rec_state = RecordingState {
+            schema: RECORDING_STATE_SCHEMA.to_owned(),
+            state: "recording".to_owned(),
+            authority_epoch: authority_epoch.clone(),
+            state_revision: next_rev,
+            updated_at: now_rfc3339_utc(),
+            session_id: session_id.clone(),
+            take_id: take_id.clone(),
+            display_name: display_name.clone(),
+            device: self.config.device_identity(),
+            storage: RecordingStateStorage {
+                volume_id: admission.volume_id.clone(),
+                status: "mounted".to_owned(),
+                writable: admission.writable,
+                remaining_bytes: Some(admission.available_bytes),
+            },
+            progress: RecordingStateProgress {
+                elapsed_seconds: started_elapsed.max(0.0),
+                captured_frames: started_progress.captured_frames,
+                bytes_written: started_progress.bytes_written,
+                verification: None,
+            },
+            diagnostics: Vec::new(),
+        };
+        let post_begin_marker_res: StorageResult<()> = (|| {
+            let mut bytes = serde_json::to_vec_pretty(&started_rec_state).map_err(|err| {
+                StorageError::Catalog {
+                    message: format!("serialize recording.json failed: {err}"),
+                }
+            })?;
+            bytes.push(b'\n');
+            write_bytes_atomic(&staging_dir.join("recording.json"), &bytes, 0o640, true).map_err(
+                |err| {
+                    StorageError::io(
+                        "recording_marker_write_failed",
+                        "persist recording.json after start",
+                        err,
+                    )
+                },
+            )
+        })();
+        if let Err(storage_err) = post_begin_marker_res {
+            handle.abort();
+            cleanup_empty_staging_attempt(&staging_dir);
+            self.fail_start_attempt(
+                &session_id,
+                &take_id,
+                &display_name,
+                &admission,
+                storage_err.code(),
+                &storage_err.to_string(),
+            );
+            drop(local_starting_lock);
+            return Err(storage_err);
+        }
+
         let runtime_json = self.backend.runtime_observation().to_openapi_runtime_json();
         let (status_snapshot, rev) = {
             let mut guard = self
                 .state
                 .lock()
                 .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            let session_matches = guard
+                .active
+                .as_ref()
+                .is_some_and(|c| c.session_id == session_id);
+            if !session_matches || guard.phase == CapturePhase::Closing {
+                let err = guard.busy_error("start capture");
+                let released = if session_matches {
+                    guard.active.take()
+                } else {
+                    None
+                };
+                self.phase_cv.notify_all();
+                drop(guard);
+                handle.abort();
+                drop(released);
+                cleanup_empty_staging_attempt(&staging_dir);
+                drop(local_starting_lock);
+                return Err(err);
+            }
             if let Err(err) = guard.transition(CapturePhase::Recording) {
-                let released = guard.active.take();
+                let released = if guard
+                    .active
+                    .as_ref()
+                    .is_some_and(|c| c.session_id == session_id)
+                {
+                    guard.active.take()
+                } else {
+                    None
+                };
                 self.phase_cv.notify_all();
                 drop(guard);
                 handle.abort();
@@ -1372,44 +1532,6 @@ impl CaptureCoordinator {
             (snap, guard.source_revision)
         };
         drop(local_starting_lock);
-
-        if let Some(active_rec) = &status_snapshot.snapshot.active_recording
-            && let Ok(mut bytes) = serde_json::to_vec_pretty(&active_rec.recording_state)
-        {
-            bytes.push(b'\n');
-            if let Err(err) =
-                write_bytes_atomic(&staging_dir.join("recording.json"), &bytes, 0o640, true)
-            {
-                let extracted = {
-                    let mut guard = match self.state.lock() {
-                        Ok(g) => g,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    let h = guard.active.as_mut().and_then(|c| c.handle.take());
-                    let _ = guard.transition(CapturePhase::Stopping);
-                    self.phase_cv.notify_all();
-                    h
-                };
-                if let Some(h) = extracted {
-                    h.abort();
-                }
-                cleanup_empty_staging_attempt(&staging_dir);
-                let storage_err = StorageError::io(
-                    "recording_marker_write_failed",
-                    "persist recording.json after start",
-                    err,
-                );
-                self.fail_start_attempt(
-                    &session_id,
-                    &take_id,
-                    &display_name,
-                    &admission,
-                    storage_err.code(),
-                    &storage_err.to_string(),
-                );
-                return Err(storage_err);
-            }
-        }
 
         self.events.emit(
             &authority_epoch,
@@ -1484,13 +1606,28 @@ impl CaptureCoordinator {
 
     /// Recover the current successful safe-swap handoff receipt (`GET /api/v1/capture/safe-swap`).
     pub fn safe_swap_receipt(&self) -> StorageResult<Option<SafeSwapReceiptResource>> {
+        let (volume_released, admission) = {
+            let guard = self
+                .state
+                .lock()
+                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+            (guard.volume_released, guard.admission.clone())
+        };
+        if !volume_released {
+            return Ok(None);
+        }
+        let Some(adm) = admission else {
+            return Ok(None);
+        };
         let receipt = self
             .receipts
             .get_safe_swap(self.volume.is_mounted_and_writable())?;
-        Ok(receipt.map(|r| SafeSwapReceiptResource {
-            schema: SAFE_SWAP_RECEIPT_RESOURCE_SCHEMA.to_owned(),
-            receipt: r,
-        }))
+        Ok(receipt
+            .filter(|r| r.volume_id == adm.volume_id && r.generation_id == adm.generation_id)
+            .map(|r| SafeSwapReceiptResource {
+                schema: SAFE_SWAP_RECEIPT_RESOURCE_SCHEMA.to_owned(),
+                receipt: r,
+            }))
     }
 
     /// Read one per-session retained unsuccessful terminal outcome
@@ -1520,26 +1657,16 @@ impl CaptureCoordinator {
             if guard.phase == CapturePhase::Closing {
                 return Ok(());
             }
-            let starting_deadline = Instant::now() + Duration::from_millis(150);
-            while guard.phase == CapturePhase::Starting {
-                let now = Instant::now();
-                if now >= starting_deadline {
-                    break;
-                }
-                let (next_guard, wait_res) = self
-                    .phase_cv
-                    .wait_timeout(guard, starting_deadline.saturating_duration_since(now))
-                    .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-                guard = next_guard;
-                if wait_res.timed_out() {
-                    break;
-                }
-            }
             let finish_deadline = Instant::now() + Duration::from_secs(30);
             while matches!(
                 guard.phase,
-                CapturePhase::Stopping | CapturePhase::Recovering | CapturePhase::Deleting
-            ) {
+                CapturePhase::Starting
+                    | CapturePhase::Stopping
+                    | CapturePhase::Recovering
+                    | CapturePhase::Deleting
+            ) || guard.safe_swap_in_progress
+                || guard.volume_admission_in_progress
+            {
                 let now = Instant::now();
                 if now >= finish_deadline {
                     return Err(guard.busy_error("close coordinator"));
@@ -1587,9 +1714,18 @@ impl CaptureCoordinator {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let released = guard.active.take();
-            let _ = guard.transition(CapturePhase::Idle);
-            self.phase_cv.notify_all();
+            let released = if guard
+                .active
+                .as_ref()
+                .is_some_and(|c| c.session_id == session_id)
+            {
+                let r = guard.active.take();
+                let _ = guard.transition(CapturePhase::Idle);
+                self.phase_cv.notify_all();
+                r
+            } else {
+                None
+            };
             let rev = guard.source_revision;
             let epoch = guard.authority_epoch.clone();
             let rec = CaptureSnapshotRecording {

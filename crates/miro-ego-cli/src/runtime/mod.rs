@@ -488,7 +488,7 @@ pub async fn bind_daemon(options: DaemonServeOptions) -> Result<BoundDaemon, Str
             volume_paths,
             Arc::new(move || vol_for_logs.is_mounted_and_writable()),
         )
-        .with_handle_counter(coordinator.open_handle_counter()),
+        .with_volume(&volume),
     );
 
     // Step 1: Run crash staging recovery BEFORE opening HTTP intake.
@@ -526,6 +526,7 @@ pub async fn bind_daemon(options: DaemonServeOptions) -> Result<BoundDaemon, Str
     let backend_for_swap = Arc::clone(&backend);
     coordinator.set_safe_swap_release_hook(Arc::new(move || {
         backend_for_swap.flush_coalesced_audit();
+        backend_for_swap.audit().close_active_file();
     }));
 
     let (security, tls) = build_security_and_tls(&options.device_config)?;

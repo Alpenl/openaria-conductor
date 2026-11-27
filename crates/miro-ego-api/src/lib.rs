@@ -42,8 +42,8 @@ pub use idempotency::{
 };
 pub use middleware::{CORS_EXPOSE_HEADERS, GatewayRuntimeConfig, GatewayState, MAX_BODY_BYTES};
 pub use preview::{
-    H264PreviewHub, MJPEG_BOUNDARY, MJPEG_CONTENT_TYPE, MjpegPreviewHub, PreviewFrame,
-    h264_stream_body_with_gop,
+    H264Fragment, H264PreviewHub, MJPEG_BOUNDARY, MJPEG_CONTENT_TYPE, MjpegPreviewHub,
+    PreviewFrame, h264_stream_body_with_gop,
 };
 pub use range::{
     ByteRange, UnsatisfiableRange, infer_log_media_type, is_valid_log_name, is_valid_log_prefix,

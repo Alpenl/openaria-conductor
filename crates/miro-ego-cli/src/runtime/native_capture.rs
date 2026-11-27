@@ -15,8 +15,9 @@ use miro_ego_capture::session::capture_runtime::{FailureSink, RecordingTarget, R
 use miro_ego_capture::session::recording::{RecordingSegmentPlanner, RecordingSink};
 use miro_ego_capture::session::shm_ring::ShmRingConfig;
 use miro_ego_capture::session::stereo_encoder::{
-    EncoderAbortHandle, EncoderConfig, EncoderProcess, EncoderTransport,
+    EncoderAbortHandle, EncoderConfig, EncoderProcess, EncoderTransport, min_shm_slot_capacity,
 };
+use miro_ego_core::CoreError;
 use miro_ego_core::config::DeviceConfig;
 use miro_ego_core::locks::{FlockGuard, LockMode, acquire_network_operation_lock};
 use miro_ego_core::sys::clock::monotonic_ns;
@@ -25,7 +26,7 @@ use miro_ego_network::{ControllerStatus, NetworkRpcClient, ObservedDefaultRoute}
 use miro_ego_storage::coordinator::{CAMERA_FOCUS_SCHEMA, DropEventRecord};
 use miro_ego_storage::{
     ActiveCaptureHandle, BackendStartRequest, CameraFocusSetRequest, CameraFocusStatus,
-    CaptureBackend, CaptureProgressSnapshot, CapturedArtifact, CapturedAudioOutcome,
+    CaptureBackend, CaptureMode, CaptureProgressSnapshot, CapturedArtifact, CapturedAudioOutcome,
     CapturedAudioSegment, CapturedSessionArtifacts, CapturedVideoSegment, RuntimeObservation,
     StopReason, StorageError, StorageResult,
 };
@@ -35,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(super) struct CaptureFailureLog {
     last_error: Mutex<Option<(String, String)>>,
@@ -243,13 +244,29 @@ impl CaptureBackend for NetworkLockCaptureBackend {
         &self,
         req: &BackendStartRequest,
     ) -> StorageResult<Box<dyn ActiveCaptureHandle>> {
-        let lock_guard = acquire_network_operation_lock(&self.run_dir, LockMode::Shared, false)
-            .map_err(|err| {
-                StorageError::service_unavailable(
-                    "network_operation_lock_failed",
-                    format!("failed to acquire shared network-operation.lock: {err}"),
-                )
-            })?;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let lock_guard = loop {
+            match acquire_network_operation_lock(&self.run_dir, LockMode::Shared, true) {
+                Ok(guard) => break guard,
+                Err(CoreError::LockBusy { message }) => {
+                    if Instant::now() >= deadline {
+                        return Err(StorageError::service_unavailable(
+                            "network_busy",
+                            format!(
+                                "network operation lock is busy; cannot start capture: {message}"
+                            ),
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => {
+                    return Err(StorageError::service_unavailable(
+                        "network_operation_lock_failed",
+                        format!("failed to acquire shared network-operation.lock: {err}"),
+                    ));
+                }
+            }
+        };
         let handle = self.inner.begin_capture(req)?;
         Ok(Box::new(NetworkLockedActiveHandle {
             inner: Some(handle),
@@ -275,6 +292,7 @@ pub struct NativeCaptureBackend {
     imu_xu_unavailable: Arc<AtomicBool>,
     active_imu: ActiveImuSlot,
     network_client: Option<NetworkRpcClient>,
+    connect_lock: Mutex<()>,
     stream: Mutex<Option<Arc<NativeCameraStream>>>,
     runtime: Mutex<Option<Arc<Runtime>>>,
     preview_buf: Arc<LatestBuffer>,
@@ -313,6 +331,7 @@ impl NativeCaptureBackend {
             imu_xu_unavailable: Arc::new(AtomicBool::new(false)),
             active_imu: Arc::new(Mutex::new(None)),
             network_client,
+            connect_lock: Mutex::new(()),
             stream: Mutex::new(None),
             runtime: Mutex::new(None),
             preview_buf,
@@ -328,11 +347,19 @@ impl NativeCaptureBackend {
     /// Attempt to open (or recover an exited preview worker on) the V4L2 camera stream.
     /// Invoked at daemon startup, from the 1 Hz background supervisor while `Idle`, and on `begin_capture`.
     pub fn try_connect_camera(&self) -> StorageResult<()> {
-        let mut stream_guard = self.stream.lock().map_err(|_| {
-            StorageError::service_unavailable("camera_poisoned", "camera mutex poisoned")
+        let _connect_guard = self.connect_lock.lock().map_err(|_| {
+            StorageError::service_unavailable("camera_poisoned", "camera connect mutex poisoned")
         })?;
-        if stream_guard.is_some() {
-            let existing_rt = self.runtime.lock().ok().and_then(|g| g.clone());
+
+        let (has_stream, existing_rt) = {
+            let stream_guard = self.stream.lock().map_err(|_| {
+                StorageError::service_unavailable("camera_poisoned", "camera mutex poisoned")
+            })?;
+            let rt = self.runtime.lock().ok().and_then(|g| g.clone());
+            (stream_guard.is_some(), rt)
+        };
+
+        if has_stream {
             if let Some(rt) = existing_rt {
                 if rt.snapshot().is_ok_and(|snap| snap.running) {
                     return Ok(());
@@ -353,8 +380,9 @@ impl NativeCaptureBackend {
             if let Ok(mut rt_guard) = self.runtime.lock() {
                 *rt_guard = None;
             }
-            if let Some(old_stream) = stream_guard.take() {
-                let _ = old_stream.close();
+            let old_stream = self.stream.lock().ok().and_then(|mut g| g.take());
+            if let Some(old) = old_stream {
+                let _ = old.close();
             }
             self.imu_preview.stop();
         }
@@ -392,7 +420,12 @@ impl NativeCaptureBackend {
             .map_err(|err| StorageError::camera_not_connected(err.message))?;
 
         self.start_preview_forwarder();
-        *stream_guard = Some(stream);
+        {
+            let mut stream_guard = self.stream.lock().map_err(|_| {
+                StorageError::service_unavailable("camera_poisoned", "camera mutex poisoned")
+            })?;
+            *stream_guard = Some(stream);
+        }
         if let Ok(mut rt_guard) = self.runtime.lock() {
             *rt_guard = Some(runtime);
         }
@@ -560,13 +593,18 @@ impl ActiveCaptureHandle for NativeActiveHandle {
     }
 
     fn finish(mut self: Box<Self>, _reason: StopReason) -> StorageResult<CapturedSessionArtifacts> {
+        if let Some(ref audio) = self.audio {
+            audio.request_stop();
+        }
         let _ = self.runtime.stop_recording(Duration::from_secs(5));
+        let stopped_monotonic_ns = monotonic_ns().unwrap_or(self.started_monotonic_ns);
+        let audio_stop_result = self
+            .audio
+            .take()
+            .map(|recorder| recorder.stop(Duration::from_secs(5)));
 
         if let Some((code, msg)) = self.failure_log.take() {
             self.encoder_abort.abort();
-            if let Some(ref audio) = self.audio {
-                let _ = audio.stop(Duration::from_secs(2));
-            }
             if let Ok(mut enc) = self.encoder.lock() {
                 enc.abort();
             }
@@ -605,9 +643,10 @@ impl ActiveCaptureHandle for NativeActiveHandle {
             })?
         };
 
-        let now_ns = monotonic_ns().unwrap_or(self.started_monotonic_ns);
-        let duration_seconds =
-            (now_ns.saturating_sub(self.started_monotonic_ns) as f64 / 1_000_000_000.0).max(0.001);
+        let duration_seconds = (stopped_monotonic_ns.saturating_sub(self.started_monotonic_ns)
+            as f64
+            / 1_000_000_000.0)
+            .max(0.001);
 
         let take_summary = {
             let mut take = self.active_take.lock().map_err(|_| {
@@ -673,46 +712,42 @@ impl ActiveCaptureHandle for NativeActiveHandle {
 
         let (frames_artifact, imu_artifact) = extract_sink_artifacts(&sink_snap)?;
 
-        let audio = match self.audio.take() {
-            Some(recorder) => match recorder.stop(Duration::from_secs(5)) {
-                Ok(res) => {
-                    let clock_json = serde_json::to_value(&res.capture_clock).ok();
-                    CapturedAudioOutcome::Recorded {
-                        requested_mode: self.audio_requested_mode.clone(),
-                        sample_rate: res.sample_rate_hz,
-                        channels: res.channels,
-                        sample_count: res.sample_count,
-                        start_time_seconds: 0.0,
-                        end_time_seconds: duration_seconds,
-                        segments: res
-                            .segments
-                            .into_iter()
-                            .map(|seg| CapturedAudioSegment {
-                                index: seg.index,
-                                start_sample: seg.start_sample,
-                                end_sample: seg.end_sample,
-                                start_time_seconds: seg.start_time_seconds,
-                                end_time_seconds: seg.end_time_seconds,
-                                pcm_payload_bytes: seg
-                                    .bytes
-                                    .saturating_sub(audio::WAV_HEADER_BYTES),
-                                wav_header_bytes: audio::WAV_HEADER_BYTES,
-                                artifact: CapturedArtifact {
-                                    role: "audio.wav".to_owned(),
-                                    path: seg.relative_path,
-                                    media_type: "audio/wav".to_owned(),
-                                    bytes: seg.bytes,
-                                    sha256: seg.sha256,
-                                },
-                            })
-                            .collect(),
-                    }
-                    .with_capture_clock(clock_json)
-                }
-                Err(_err) => CapturedAudioOutcome::NotRecorded {
+        let audio = match audio_stop_result {
+            Some(Ok(res)) => {
+                let clock_json = serde_json::to_value(&res.capture_clock).ok();
+                CapturedAudioOutcome::Recorded {
                     requested_mode: self.audio_requested_mode.clone(),
-                    reason: "recording_interrupted".to_owned(),
-                },
+                    sample_rate: res.sample_rate_hz,
+                    channels: res.channels,
+                    sample_count: res.sample_count,
+                    start_time_seconds: 0.0,
+                    end_time_seconds: duration_seconds,
+                    segments: res
+                        .segments
+                        .into_iter()
+                        .map(|seg| CapturedAudioSegment {
+                            index: seg.index,
+                            start_sample: seg.start_sample,
+                            end_sample: seg.end_sample,
+                            start_time_seconds: seg.start_time_seconds,
+                            end_time_seconds: seg.end_time_seconds,
+                            pcm_payload_bytes: seg.bytes.saturating_sub(audio::WAV_HEADER_BYTES),
+                            wav_header_bytes: audio::WAV_HEADER_BYTES,
+                            artifact: CapturedArtifact {
+                                role: "audio.wav".to_owned(),
+                                path: seg.relative_path,
+                                media_type: "audio/wav".to_owned(),
+                                bytes: seg.bytes,
+                                sha256: seg.sha256,
+                            },
+                        })
+                        .collect(),
+                }
+                .with_capture_clock(clock_json)
+            }
+            Some(Err(_err)) => CapturedAudioOutcome::NotRecorded {
+                requested_mode: self.audio_requested_mode.clone(),
+                reason: "recording_interrupted".to_owned(),
             },
             None => CapturedAudioOutcome::NotRecorded {
                 requested_mode: self.audio_requested_mode.clone(),
@@ -747,11 +782,7 @@ impl ActiveCaptureHandle for NativeActiveHandle {
             dropped_frames,
             drop_events,
             duration_seconds,
-            effective_fps: if duration_seconds > 0.0 {
-                sink_snap.frames_written as f64 / duration_seconds
-            } else {
-                self.effective_fps
-            },
+            effective_fps: self.effective_fps,
         })
     }
 
@@ -838,6 +869,35 @@ impl CaptureBackend for NativeCaptureBackend {
         // steals packets or contends on the UVC Extension Unit control channel.
         self.imu_preview.stop();
 
+        struct ImuPreviewRestoreGuard<'a> {
+            imu_preview: &'a ImuPreview,
+            imu_device: Option<&'a Path>,
+            imu_xu_unavailable: &'a AtomicBool,
+            active_imu: &'a ActiveImuSlot,
+            armed: bool,
+        }
+        impl Drop for ImuPreviewRestoreGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    if let Ok(mut guard) = self.active_imu.lock() {
+                        *guard = None;
+                    }
+                    start_idle_imu_preview_worker(
+                        self.imu_preview,
+                        self.imu_device,
+                        self.imu_xu_unavailable,
+                    );
+                }
+            }
+        }
+        let mut imu_restore_guard = ImuPreviewRestoreGuard {
+            imu_preview: &self.imu_preview,
+            imu_device: self.imu_device.as_deref(),
+            imu_xu_unavailable: &self.imu_xu_unavailable,
+            active_imu: &self.active_imu,
+            armed: true,
+        };
+
         let imu = match self.imu_device.as_deref() {
             Some(dev_path) => {
                 let Some(dev_str) = dev_path.to_str() else {
@@ -859,11 +919,6 @@ impl CaptureBackend for NativeCaptureBackend {
                         None
                     }
                     Err(err) => {
-                        start_idle_imu_preview_worker(
-                            &self.imu_preview,
-                            self.imu_device.as_deref(),
-                            &self.imu_xu_unavailable,
-                        );
                         return Err(StorageError::service_unavailable(
                             "imu_open_failed",
                             format!("{}: {}", err.code, err.message),
@@ -886,6 +941,23 @@ impl CaptureBackend for NativeCaptureBackend {
             StorageError::io("staging_create_failed", "create staging video dir", err)
         })?;
 
+        let min_slot_cap = min_shm_slot_capacity(
+            u64::from(self.config.camera.width),
+            u64::from(self.config.camera.height),
+        )
+        .map_err(|err| StorageError::invalid_input("encoder_config_invalid", err.message))?;
+        let slot_capacity = u32::try_from(min_slot_cap)
+            .map_err(|_| {
+                StorageError::invalid_input(
+                    "encoder_config_invalid",
+                    "SHM slot capacity exceeds u32::MAX",
+                )
+            })?
+            .max(4 * 1024 * 1024);
+        let shm_cfg = ShmRingConfig {
+            slot_capacity,
+            ..ShmRingConfig::default()
+        };
         let mut encoder = EncoderProcess::with_transport(
             EncoderConfig {
                 out_dir: &video_dir,
@@ -897,26 +969,29 @@ impl CaptureBackend for NativeCaptureBackend {
                 segment_frames,
                 path_prefix: "video/",
             },
-            EncoderTransport::ShmRing(ShmRingConfig::default()),
+            EncoderTransport::ShmRing(shm_cfg),
         )
         .map_err(|err| StorageError::service_unavailable("encoder_init_failed", err.message))?;
 
-        encoder
-            .configure(&req.encoding.encoder_arguments())
-            .map_err(|err| StorageError::invalid_input("encoder_config_invalid", err.message))?;
-        encoder.start().map_err(|err| {
-            StorageError::service_unavailable("encoder_start_failed", err.message)
-        })?;
+        if let Err(err) = encoder.configure(&req.encoding.encoder_arguments()) {
+            encoder.abort();
+            return Err(StorageError::invalid_input(
+                "encoder_config_invalid",
+                err.message,
+            ));
+        }
+        if let Err(err) = encoder.start() {
+            encoder.abort();
+            return Err(StorageError::service_unavailable(
+                "encoder_start_failed",
+                err.message,
+            ));
+        }
 
         let mut sink = match RecordingSink::create(&req.staging_dir, &req.session_id) {
             Ok(s) => s,
             Err(err) => {
                 encoder.abort();
-                start_idle_imu_preview_worker(
-                    &self.imu_preview,
-                    self.imu_device.as_deref(),
-                    &self.imu_xu_unavailable,
-                );
                 return Err(StorageError::service_unavailable(
                     "sink_create_failed",
                     err.message,
@@ -928,11 +1003,6 @@ impl CaptureBackend for NativeCaptureBackend {
             Err(err) => {
                 encoder.abort();
                 sink.close();
-                start_idle_imu_preview_worker(
-                    &self.imu_preview,
-                    self.imu_device.as_deref(),
-                    &self.imu_xu_unavailable,
-                );
                 return Err(StorageError::service_unavailable(
                     "take_create_failed",
                     err.message,
@@ -944,21 +1014,17 @@ impl CaptureBackend for NativeCaptureBackend {
             Err(err) => {
                 encoder.abort();
                 sink.close();
-                start_idle_imu_preview_worker(
-                    &self.imu_preview,
-                    self.imu_device.as_deref(),
-                    &self.imu_xu_unavailable,
-                );
                 return Err(StorageError::invalid_input("segment_invalid", err.message));
             }
         };
 
-        let audio_requested_mode = if self.config.audio.enabled {
+        let audio_enabled = self.config.audio.enabled && req.mode != CaptureMode::Calibration;
+        let audio_requested_mode = if audio_enabled {
             "enabled".to_owned()
         } else {
             "disabled".to_owned()
         };
-        let (audio, audio_not_recorded_reason) = if self.config.audio.enabled {
+        let (audio, audio_not_recorded_reason) = if audio_enabled {
             if !audio::available() {
                 eprintln!(
                     "miro-ego: audio enabled in config ({}) but ALSA capture is unavailable; recording without audio",
@@ -1032,6 +1098,7 @@ impl CaptureBackend for NativeCaptureBackend {
             effective_fps,
             completed: false,
         });
+        imu_restore_guard.armed = false;
 
         runtime
             .prepare_recording(Duration::from_secs(2))

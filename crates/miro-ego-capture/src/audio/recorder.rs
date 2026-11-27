@@ -770,6 +770,7 @@ fn start_and_capture(
                 anchor,
                 min_tail_gap,
                 total_len,
+                u64::from(config.sample_rate_hz),
                 pcm.buffer_frames,
                 pcm.period_frames,
             );
@@ -787,6 +788,7 @@ fn start_and_capture(
             anchor,
             min_tail_gap,
             total_len,
+            u64::from(config.sample_rate_hz),
             pcm.buffer_frames,
             pcm.period_frames,
         );
@@ -879,6 +881,7 @@ fn append_or_replace_tail_anchor(
     anchor: clock::Anchor,
     min_tail_gap: u64,
     total_len: usize,
+    rate: u64,
     buffer_frames: u64,
     period_frames: u64,
 ) {
@@ -888,19 +891,25 @@ fn append_or_replace_tail_anchor(
         }
         return;
     }
-    let Some(last) = anchors.last_mut() else {
+    let Some(last) = anchors.last().copied() else {
         return;
     };
-    if *last == anchor {
+    if last == anchor {
         return;
     }
     let close_tail = anchor[0] >= last[0] && anchor[0] - last[0] < min_tail_gap;
+    let prev_anchor_within_window = anchors.len() < 2
+        || anchor[0].saturating_sub(anchors[anchors.len() - 2][0])
+            <= rate.saturating_add(buffer_frames);
     if close_tail
+        && prev_anchor_within_window
         && (total_len >= 2
             || (total_len == 1 && anchor[0] <= buffer_frames.saturating_add(period_frames)))
     {
-        *last = anchor;
-    } else {
+        if let Some(tail) = anchors.last_mut() {
+            *tail = anchor;
+        }
+    } else if anchor[0] > last[0] {
         anchors.push(anchor);
     }
 }
@@ -1146,7 +1155,7 @@ mod tests {
             3_002_350_000,
         ];
         let len = anchors.len();
-        append_or_replace_tail_anchor(&mut anchors, tail, 4_800, len, 48_000, 1024);
+        append_or_replace_tail_anchor(&mut anchors, tail, 4_800, len, 48_000, 48_000, 1024);
         assert_eq!(anchors.len(), 2);
         assert_eq!(anchors[1], tail);
 
@@ -1164,6 +1173,60 @@ mod tests {
             48_072,
             1_100_000_000,
             2_105_000_000,
+            &anchors,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(clock["continuity"], "verified");
+    }
+
+    #[test]
+    fn small_buffer_tail_stop_after_one_second_boundary_pushes_instead_of_widening_gap() {
+        let mut anchors = vec![
+            [
+                48,
+                2_001_000_000,
+                1_101_400_000,
+                2_001_010_000,
+                2_001_810_000,
+            ],
+            [
+                48_048,
+                3_001_000_000,
+                2_101_400_000,
+                3_001_010_000,
+                3_001_810_000,
+            ],
+        ];
+        // 4_152 samples (~86.5ms) after the 1s boundary: within min_tail_gap=4_800,
+        // but 52_200 - 48 = 52_152 > rate (48_000) + buffer_frames (4_096) = 52_096.
+        let dt_ns = 4_152_u64 * 1_000_000_000 / 48_000;
+        let tail = [
+            52_200,
+            3_001_000_000 + dt_ns,
+            2_101_400_000 + dt_ns,
+            3_001_010_000 + dt_ns,
+            3_001_810_000 + dt_ns,
+        ];
+        let len = anchors.len();
+        append_or_replace_tail_anchor(&mut anchors, tail, 4_800, len, 48_000, 4_096, 1_024);
+        assert_eq!(anchors.len(), 3);
+        assert_eq!(anchors[2], tail);
+
+        let config = RecorderConfig {
+            session_root: PathBuf::new(),
+            device: "hw:test".into(),
+            sample_rate_hz: 48_000,
+            channels: 2,
+            segment_seconds: 5.0,
+        };
+        let progress = AudioProgress::default();
+        let clock = capture_clock(
+            &config,
+            (1_024, 4_096),
+            52_200,
+            1_100_000_000,
+            2_200_000_000,
             &anchors,
             &progress,
         )

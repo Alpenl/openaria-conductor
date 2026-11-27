@@ -13,10 +13,10 @@ use crate::nmcli::{
 };
 use crate::state::{
     CredentialState, DesiredEthernet, DesiredMode, DesiredState, EthernetAddressing,
-    NetworkDeviceDeadline, NetworkStateStore, NetworkTransaction, RecoveryAction,
-    RetainedCandidate, StateSnapshot, TransactionError, TransactionOperation, TransactionReceipt,
-    TransactionStage, TransactionStatus, TransactionUpdate, TransactionWindow, format_utc_iso8601,
-    utc_now_iso8601,
+    NetworkDeviceDeadline, NetworkStateStore, NetworkTransaction, PersistedNetworkState,
+    RecoveryAction, RetainedCandidate, StateSnapshot, TransactionError, TransactionOperation,
+    TransactionReceipt, TransactionStage, TransactionStatus, TransactionUpdate, TransactionWindow,
+    format_utc_iso8601, utc_now_iso8601,
 };
 use crate::{NetworkController, NetworkError, NetworkResult, StationCredentials, WifiStatus};
 use miro_ego_core::ids::{hex_encode, new_uuid_v4};
@@ -643,80 +643,77 @@ impl AuthoritativeNetworkController {
                 self.core.activate_rescue_hotspot_locked()
             }
             DesiredMode::EthernetDhcp => {
-                if !latest_unhealthy {
-                    if let Some(lkg_eth) = &full.lkg_ethernet_profile {
-                        if self.core.backend.profile_path(lkg_eth).is_file() {
-                            let connected_ok = self
-                                .core
-                                .backend
-                                .activate_connection(
-                                    lkg_eth,
-                                    self.core.backend.ethernet_interface(),
-                                    self.core.config.activation_wait_secs,
-                                    false,
-                                )
-                                .and_then(|()| {
-                                    self.core
-                                        .backend
-                                        .verify_activated_profile(
-                                            lkg_eth,
-                                            &ProfileSpec::EthernetDhcp,
-                                        )
-                                        .map(|_| ())
-                                });
-                            if connected_ok.is_ok() {
-                                let _ = self
-                                    .core
-                                    .backend
-                                    .disconnect_device(self.core.backend.wifi_interface());
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-                let _ = self.core.state.set_verified(false);
-                self.core.activate_rescue_hotspot_locked()
+                self.reconcile_ethernet_startup(&full, latest_unhealthy, &ProfileSpec::EthernetDhcp)
             }
             DesiredMode::EthernetStatic => {
-                if !latest_unhealthy {
-                    if let (Some(lkg_eth), Some(cfg)) = (
-                        &full.lkg_ethernet_profile,
-                        full.desired
-                            .ethernet
-                            .as_ref()
-                            .and_then(|e| e.static_ipv4.clone()),
-                    ) {
-                        if self.core.backend.profile_path(lkg_eth).is_file() {
-                            let spec = ProfileSpec::EthernetStatic(cfg);
-                            let connected_ok = self
-                                .core
-                                .backend
-                                .activate_connection(
-                                    lkg_eth,
-                                    self.core.backend.ethernet_interface(),
-                                    self.core.config.activation_wait_secs,
-                                    false,
-                                )
-                                .and_then(|()| {
-                                    self.core
-                                        .backend
-                                        .verify_activated_profile(lkg_eth, &spec)
-                                        .map(|_| ())
-                                });
-                            if connected_ok.is_ok() {
-                                let _ = self
-                                    .core
-                                    .backend
-                                    .disconnect_device(self.core.backend.wifi_interface());
-                                return Ok(());
-                            }
-                        }
-                    }
+                if let Some(cfg) = full
+                    .desired
+                    .ethernet
+                    .as_ref()
+                    .and_then(|e| e.static_ipv4.clone())
+                {
+                    return self.reconcile_ethernet_startup(
+                        &full,
+                        latest_unhealthy,
+                        &ProfileSpec::EthernetStatic(cfg),
+                    );
                 }
                 let _ = self.core.state.set_verified(false);
                 self.core.activate_rescue_hotspot_locked()
             }
         }
+    }
+
+    fn reconcile_ethernet_startup(
+        &self,
+        full: &PersistedNetworkState,
+        latest_unhealthy: bool,
+        spec: &ProfileSpec,
+    ) -> NetworkResult<()> {
+        if full.verified || !latest_unhealthy {
+            if let Some(lkg_eth) = &full.lkg_ethernet_profile {
+                if self.core.backend.profile_path(lkg_eth).is_file() {
+                    let connected_ok = self
+                        .core
+                        .backend
+                        .activate_connection(
+                            lkg_eth,
+                            self.core.backend.ethernet_interface(),
+                            self.core.config.activation_wait_secs,
+                            false,
+                        )
+                        .and_then(|()| {
+                            self.core
+                                .backend
+                                .verify_activated_profile(lkg_eth, spec)
+                                .map(|_| ())
+                        });
+                    if connected_ok.is_ok() {
+                        let _ = self
+                            .core
+                            .backend
+                            .disconnect_device(self.core.backend.wifi_interface());
+                        if full.verified && latest_unhealthy {
+                            let _ = self
+                                .core
+                                .state
+                                .record_startup_wifi_recovered(utc_now_iso8601());
+                        }
+                        return Ok(());
+                    }
+                    if full.verified {
+                        let rescue_res = self.core.activate_rescue_hotspot_locked();
+                        let _ = self.core.state.record_startup_rescue_preserving_verified(
+                            rescue_res.is_ok(),
+                            utc_now_iso8601(),
+                        );
+                        return rescue_res;
+                    }
+                }
+            }
+        }
+        let _ = self.core.state.set_verified(false);
+        self.core.activate_rescue_hotspot_locked()
     }
 
     /// Notify any newly accepted background mutation that the RPC server has flushed its
@@ -3015,7 +3012,8 @@ mod tests {
             "committing Ethernet mode must disconnect wlan0"
         );
 
-        // 3. Reboot with eth0 cable unplugged -> reconcile_startup falls back to rescue hotspot!
+        // 3. Reboot with eth0 cable unplugged -> reconcile_startup falls back to rescue hotspot
+        //    while preserving `verified = true` so subsequent reboots retry eth0!
         drop(ctrl);
         let mock_unplugged = MockNmcli::new(true);
         let backend2 = NmcliBackend::new(mock_unplugged, root.join("profiles"), "wlan0", "eth0");
@@ -3027,7 +3025,84 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ctrl2.status().unwrap().mode, crate::NetworkMode::Hotspot);
-        assert!(!ctrl2.controller_status().unwrap().verified);
+        assert!(ctrl2.controller_status().unwrap().verified);
+
+        // 4. Reboot with eth0 cable plugged back in -> recovers EthernetDhcp automatically!
+        drop(ctrl2);
+        let mock_plugged = MockNmcli::new(false);
+        let backend3 = NmcliBackend::new(mock_plugged, root.join("profiles"), "wlan0", "eth0");
+        let state3 = NetworkStateStore::open_or_init(&state_path).unwrap();
+        let ctrl3 = AuthoritativeNetworkController::new(
+            backend3,
+            state3,
+            ControllerConfig::new("rdk-x5-eth-boot", root.join("run")),
+        )
+        .unwrap();
+        assert_eq!(ctrl3.status().unwrap().mode, crate::NetworkMode::Offline);
+        assert!(ctrl3.controller_status().unwrap().verified);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ethernet_static_startup_unplugged_preserves_verified_and_recovers() {
+        let root = temp_root("eth-static-boot");
+        let state_path = root.join("network-state.json");
+        let mock = MockNmcli::new(false);
+        let backend = NmcliBackend::new(mock, root.join("profiles"), "wlan0", "eth0");
+        let state = NetworkStateStore::open_or_init(&state_path).unwrap();
+        let cfg = ControllerConfig::new("rdk-x5-eth-static", root.join("run"))
+            .with_synchronous_mutations(true);
+        let ctrl = AuthoritativeNetworkController::new(backend, state, cfg).unwrap();
+
+        let applied = ctrl
+            .apply(
+                "client-eth",
+                "idem-eth-static",
+                &ApplyDesiredState {
+                    mode: DesiredMode::EthernetStatic,
+                    wifi_client: None,
+                    ethernet: Some(DesiredEthernet {
+                        addressing: EthernetAddressing::Static,
+                        static_ipv4: Some(StaticIpv4Config {
+                            address: "10.0.0.20".to_owned(),
+                            prefix_length: 24,
+                            gateway: Some("10.0.0.1".to_owned()),
+                            dns: vec!["1.1.1.1".to_owned()],
+                        }),
+                    }),
+                },
+            )
+            .unwrap();
+        assert_eq!(applied.final_status, TransactionStatus::Committed);
+
+        // Reboot with cable unplugged -> Hotspot, verified preserved!
+        drop(ctrl);
+        let mock_unplugged = MockNmcli::new(true);
+        let backend2 = NmcliBackend::new(mock_unplugged, root.join("profiles"), "wlan0", "eth0");
+        let state2 = NetworkStateStore::open_or_init(&state_path).unwrap();
+        let ctrl2 = AuthoritativeNetworkController::new(
+            backend2,
+            state2,
+            ControllerConfig::new("rdk-x5-eth-static", root.join("run")),
+        )
+        .unwrap();
+        assert_eq!(ctrl2.status().unwrap().mode, crate::NetworkMode::Hotspot);
+        assert!(ctrl2.controller_status().unwrap().verified);
+
+        // Reboot with cable plugged back in -> EthernetStatic restored!
+        drop(ctrl2);
+        let mock_plugged = MockNmcli::new(false);
+        let backend3 = NmcliBackend::new(mock_plugged, root.join("profiles"), "wlan0", "eth0");
+        let state3 = NetworkStateStore::open_or_init(&state_path).unwrap();
+        let ctrl3 = AuthoritativeNetworkController::new(
+            backend3,
+            state3,
+            ControllerConfig::new("rdk-x5-eth-static", root.join("run")),
+        )
+        .unwrap();
+        assert_eq!(ctrl3.status().unwrap().mode, crate::NetworkMode::Offline);
+        assert!(ctrl3.controller_status().unwrap().verified);
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -3,7 +3,6 @@ set -eu
 
 # Use the same inode as capture and maintenance tasks. Never create or unlink it.
 LOCK=${MIRO_EGO_MAINTENANCE_LOCK:-/run/miro-ego/maintenance.lock}
-DATA=${MIRO_EGO_DATA_MOUNT:-/data}
 if [ ! -f "$LOCK" ] || [ -L "$LOCK" ]; then
     echo 'Miro-Ego maintenance lock is missing or invalid; refusing TRIM' >&2
     exit 1
@@ -23,7 +22,4 @@ fi
 
 # Descriptor 8 is inherited by fstrim: even if this shell dies, the active
 # discard keeps the lease until the child exits. Do not use flock --close.
-if mountpoint --quiet "$DATA"; then
-    fstrim --verbose --quiet-unsupported "$DATA" || exit 1
-fi
 fstrim --listed-in /etc/fstab:/proc/self/mountinfo --verbose --quiet-unsupported || exit 1

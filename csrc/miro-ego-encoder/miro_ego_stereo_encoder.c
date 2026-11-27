@@ -59,6 +59,17 @@ static void handle_stop_signal(int signum)
     }
 }
 
+static void disarm_stop_signals(void)
+{
+    struct sigaction sa_dfl;
+    memset(&sa_dfl, 0, sizeof(sa_dfl));
+    sa_dfl.sa_handler = SIG_DFL;
+    sigemptyset(&sa_dfl.sa_mask);
+    (void)sigaction(SIGINT, &sa_dfl, NULL);
+    (void)sigaction(SIGTERM, &sa_dfl, NULL);
+    atomic_store_explicit(&g_active_pipeline, NULL, memory_order_release);
+}
+
 static FILE *event_output(void)
 {
     return event_stream == NULL ? stdout : event_stream;
@@ -234,6 +245,8 @@ int main(int argc, char **argv)
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_stop_signal;
     sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGINT);
+    sigaddset(&sa.sa_mask, SIGTERM);
     (void)sigaction(SIGINT, &sa, NULL);
     (void)sigaction(SIGTERM, &sa, NULL);
 
@@ -423,6 +436,7 @@ int main(int argc, char **argv)
         payload = malloc(MAX_FRAME_BYTES);
         if (payload == NULL) {
             emit_error_event("out_of_memory", "frame buffer");
+            disarm_stop_signals();
             miro_ego_pipeline_close(pipeline);
             return 4;
         }
@@ -504,7 +518,7 @@ int main(int argc, char **argv)
     emit_stats("done", &stats, dropped);
 
     free(payload);
-    atomic_store_explicit(&g_active_pipeline, NULL, memory_order_release);
+    disarm_stop_signals();
     miro_ego_pipeline_close(pipeline);
     if (use_shm) {
         miro_ego_shm_ring_detach(&shm_ring);

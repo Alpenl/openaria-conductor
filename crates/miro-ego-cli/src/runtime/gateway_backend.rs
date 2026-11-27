@@ -25,7 +25,7 @@ use miro_ego_api::{
 use miro_ego_core::config::{DeviceConfig, SecurityConfig};
 use miro_ego_core::ids::hex_encode;
 use miro_ego_deploy::{
-    DefaultOfflinePackageHook, DeployRpcClient, OfflinePackageHook, ReleaseManager,
+    DefaultOfflinePackageHook, DeployError, DeployRpcClient, OfflinePackageHook, ReleaseManager,
     ReleaseManagerPaths, validate_commit_sha,
 };
 use miro_ego_hw::{SysfsLedController, VoiceController};
@@ -38,7 +38,7 @@ use miro_ego_storage::{
     ApiAuditEvent, AuditLogger, AuditWriteTarget, BinarySessionCatalog, CameraFocusSetRequest,
     CaptureBackend, CaptureCoordinator, CapturePhase, CaptureStartRequest, CaptureStopRequest,
     CaptureTimerSetRequest, DeleteSessionsRequest, ExfatVolumeManager, LogStore, StorageError,
-    VolumeManager, open_manifest, open_verified_artifact_checked_with_lease,
+    VolumeManager, open_manifest, open_verified_artifact_checked_with_volume,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -897,7 +897,6 @@ impl GatewayBackend for ProductionGatewayBackend {
         artifact_id: &str,
     ) -> ApiResult<OpenRepresentation> {
         let catalog = Arc::clone(&self.catalog);
-        let coordinator = Arc::clone(&self.coordinator);
         let volume = Arc::clone(&self.volume);
         let recordings_root = self.volume.paths().recordings_dir();
         let sid = session_id.to_owned();
@@ -926,15 +925,14 @@ impl GatewayBackend for ProductionGatewayBackend {
                 };
                 return Err(ApiError::session_not_verified(reason));
             }
-            let counter = coordinator.open_handle_counter();
-            let mut verified = open_verified_artifact_checked_with_lease(
+            let mut verified = open_verified_artifact_checked_with_volume(
                 &recordings_root,
                 &indexed.relative_dir,
                 &aid,
                 Some(&sid),
                 Some(&verification.manifest_sha256),
                 false,
-                Some(&counter),
+                Some(&volume),
             )
             .map_err(|err| match err {
                 StorageError::Integrity {
@@ -1035,13 +1033,18 @@ impl GatewayBackend for ProductionGatewayBackend {
         let etag_cache = Arc::clone(&self.log_etag_cache);
         let log_name = name.to_owned();
         run_blocking(move || {
-            if volume.is_volume_released() || !volume.is_mounted_and_writable() {
+            let Some(lease) = coordinator.try_acquire_open_handle_lease() else {
+                return Err(ApiError::storage_unavailable(
+                    "diagnostic logs are unavailable while storage volume is unmounted or released",
+                ));
+            };
+            if !volume.is_mounted_and_writable() {
                 return Err(ApiError::storage_unavailable(
                     "diagnostic logs are unavailable while storage volume is unmounted or released",
                 ));
             }
             let repr = open_safe_log_file_with_cache(&logs_dir, &log_name, &etag_cache)?;
-            Ok(repr.with_lease_guard(coordinator.acquire_open_handle_lease()))
+            Ok(repr.with_lease_guard(lease))
         })
         .await
     }
@@ -1636,25 +1639,6 @@ impl GatewayBackend for ProductionGatewayBackend {
             .to_owned();
         validate_commit_sha(&commit).map_err(map_deploy_error)?;
 
-        let idem_key = (
-            "firmware_update".to_owned(),
-            cmd.principal_id.clone(),
-            cmd.idempotency_key.clone(),
-        );
-        {
-            let mut guard = self
-                .firmware
-                .lock()
-                .map_err(|_| ApiError::internal("firmware_poisoned", "firmware state poisoned"))?;
-            if let Some(replayed) = guard.lookup_idempotency(
-                &idem_key,
-                &cmd.canonical_body,
-                "Idempotency-Key reused with different firmware update payload",
-            )? {
-                return Ok(replayed);
-            }
-        }
-
         let Some(rpc) = self.deploy_client.clone() else {
             return Err(ApiError::service_unavailable(
                 "firmware_unavailable",
@@ -1671,14 +1655,30 @@ impl GatewayBackend for ProductionGatewayBackend {
         let idem_for_rpc = cmd.idempotency_key.clone();
         let req_hash = hex_encode(Sha256::digest(&cmd.canonical_body).as_slice());
         let (task, rpc_replayed) = run_blocking(move || {
-            if volume.is_volume_released() || !volume.is_mounted_and_writable() {
+            let bundle_meta = fs::symlink_metadata(&staged_bundle);
+            if let Ok(ref meta) = bundle_meta {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    return Err(ApiError::unprocessable(
+                        "invalid_firmware_bundle",
+                        "staged firmware bundle path must be a non-symlink directory",
+                    )
+                    .with_error_code_header());
+                }
+            } else if volume.is_volume_released() || !volume.is_mounted_and_writable() {
                 return Err(ApiError::storage_unavailable(
                     "recording volume is unavailable or released for safe swap",
                 ));
             }
-            let meta = match fs::symlink_metadata(&staged_bundle) {
-                Ok(m) => m,
-                Err(_) => {
+            let out = match rpc.install_idempotent(
+                &staged_bundle,
+                &commit_for_task,
+                true,
+                Some(&principal_for_rpc),
+                Some(&idem_for_rpc),
+                Some(&req_hash),
+            ) {
+                Ok(out) => out,
+                Err(DeployError::InvalidBundle { .. }) if bundle_meta.is_err() => {
                     return Err(ApiError::conflict(
                         "update_not_staged",
                         format!(
@@ -1687,24 +1687,13 @@ impl GatewayBackend for ProductionGatewayBackend {
                     )
                     .with_error_code_header());
                 }
+                Err(err) => return Err(map_deploy_error(err)),
             };
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(ApiError::unprocessable(
-                    "invalid_firmware_bundle",
-                    "staged firmware bundle path must be a non-symlink directory",
-                )
-                .with_error_code_header());
+            if !out.replayed && (volume.is_volume_released() || !volume.is_mounted_and_writable()) {
+                return Err(ApiError::storage_unavailable(
+                    "recording volume is unavailable or released for safe swap",
+                ));
             }
-            let out = rpc
-                .install_idempotent(
-                    &staged_bundle,
-                    &commit_for_task,
-                    true,
-                    Some(&principal_for_rpc),
-                    Some(&idem_for_rpc),
-                    Some(&req_hash),
-                )
-                .map_err(map_deploy_error)?;
             let val = serde_json::to_value(out.task).map_err(|err| {
                 ApiError::internal("serialize_failed", format!("serialize firmware task: {err}"))
             })?;
@@ -1716,18 +1705,9 @@ impl GatewayBackend for ProductionGatewayBackend {
             .firmware
             .lock()
             .map_err(|_| ApiError::internal("firmware_poisoned", "firmware state poisoned"))?;
-        if let Some(replayed) = guard.lookup_idempotency(
-            &idem_key,
-            &cmd.canonical_body,
-            "Idempotency-Key reused with different firmware update payload",
-        )? {
-            return Ok(replayed);
-        }
         guard.checked_instant = None;
         guard.task = Some(task.clone());
-        let outcome = CommandOutcome::accepted(task, rpc_replayed);
-        guard.insert_idempotency(idem_key, cmd.canonical_body, outcome.clone());
-        Ok(outcome)
+        Ok(CommandOutcome::accepted(task, rpc_replayed))
     }
 
     async fn firmware_rollback(&self, cmd: IdempotentCommand) -> ApiResult<CommandOutcome> {
@@ -1751,25 +1731,6 @@ impl GatewayBackend for ProductionGatewayBackend {
             .to_owned();
         validate_commit_sha(&commit).map_err(map_deploy_error)?;
 
-        let idem_key = (
-            "firmware_rollback".to_owned(),
-            cmd.principal_id.clone(),
-            cmd.idempotency_key.clone(),
-        );
-        {
-            let mut guard = self
-                .firmware
-                .lock()
-                .map_err(|_| ApiError::internal("firmware_poisoned", "firmware state poisoned"))?;
-            if let Some(replayed) = guard.lookup_idempotency(
-                &idem_key,
-                &cmd.canonical_body,
-                "Idempotency-Key reused with different firmware rollback payload",
-            )? {
-                return Ok(replayed);
-            }
-        }
-
         let Some(rpc) = self.deploy_client.clone() else {
             return Err(ApiError::service_unavailable(
                 "firmware_unavailable",
@@ -1784,14 +1745,6 @@ impl GatewayBackend for ProductionGatewayBackend {
         let idem_for_rpc = cmd.idempotency_key.clone();
         let req_hash = hex_encode(Sha256::digest(&cmd.canonical_body).as_slice());
         let (task, rpc_replayed) = run_blocking(move || {
-            let ctrl = rpc.status().map_err(map_deploy_error)?;
-            if ctrl.deployment.previous.as_deref() != Some(commit_for_task.as_str()) {
-                return Err(ApiError::conflict(
-                    "rollback_unavailable",
-                    "requested commit does not match installed previous release",
-                )
-                .with_error_code_header());
-            }
             let out = rpc
                 .rollback_idempotent(
                     &commit_for_task,
@@ -1815,18 +1768,9 @@ impl GatewayBackend for ProductionGatewayBackend {
             .firmware
             .lock()
             .map_err(|_| ApiError::internal("firmware_poisoned", "firmware state poisoned"))?;
-        if let Some(replayed) = guard.lookup_idempotency(
-            &idem_key,
-            &cmd.canonical_body,
-            "Idempotency-Key reused with different firmware rollback payload",
-        )? {
-            return Ok(replayed);
-        }
         guard.checked_instant = None;
         guard.task = Some(task.clone());
-        let outcome = CommandOutcome::accepted(task, rpc_replayed);
-        guard.insert_idempotency(idem_key, cmd.canonical_body, outcome.clone());
-        Ok(outcome)
+        Ok(CommandOutcome::accepted(task, rpc_replayed))
     }
 
     fn record_audit(&self, event: AuditEvent) -> ApiResult<()> {

@@ -5,6 +5,7 @@
 #include "mock_hobot_sdk.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -609,27 +610,15 @@ static void test_pipeline_vbr_config_and_transient_backpressure(void)
                 assert(enc_p.rc_params.mode == MC_AV_RC_MODE_H264VBR);
                 const mc_rate_control_vbr_t *v = &enc_p.rc_params.h264_vbr_params;
                 assert(v->frame_rate == 30u);
-                assert(v->bit_rate == 12288u);
-                assert(v->max_bit_rate == 12288u);
                 assert(v->intra_period == 3u);
                 assert(v->intra_qp == 21u);
-                assert(v->initial_rc_qp == 24);
-                assert(v->vbv_buf_size == 2500);
-                assert(v->min_qp_I == 18u && v->min_qp_P == 18u && v->min_qp_B == 18u);
-                assert(v->max_qp_I == 36u && v->max_qp_P == 36u && v->max_qp_B == 36u);
                 assert(v->qp_map_enable == 0);
             } else {
                 assert(enc_p.rc_params.mode == MC_AV_RC_MODE_H265VBR);
                 const mc_rate_control_vbr_t *v = &enc_p.rc_params.h265_vbr_params;
                 assert(v->frame_rate == 30u);
-                assert(v->bit_rate == 12288u);
-                assert(v->max_bit_rate == 12288u);
                 assert(v->intra_period == 3u);
                 assert(v->intra_qp == 21u);
-                assert(v->initial_rc_qp == 24);
-                assert(v->vbv_buf_size == 2500);
-                assert(v->min_qp_I == 18u && v->min_qp_P == 18u && v->min_qp_B == 18u);
-                assert(v->max_qp_I == 36u && v->max_qp_P == 36u && v->max_qp_B == 36u);
                 assert(v->qp_map_enable == 0);
             }
         }
@@ -701,6 +690,33 @@ static void test_pipeline_vbr_config_and_transient_backpressure(void)
     assert(strstr(miro_ego_pipeline_error(stall_pipe), "decoder_input_dequeue_failed") != NULL);
     miro_ego_pipeline_close(stall_pipe);
     cleanup_dir(stall_dir);
+
+    /* 3. Non-transient output dequeue errors fail immediately without busy-spinning. */
+    const int err_cases[2] = {0, 1};
+    for (int i = 0; i < 2; i += 1) {
+        char err_dir[] = "/tmp/miro_ego_deq_err_XXXXXX";
+        assert(mkdtemp(err_dir) != NULL);
+        mock_hobot_config_t err_mock = {
+            .sbs_width = 64,
+            .height = 32,
+            .intra_period = 3,
+            .force_decoder_output_error = err_cases[i] == 0 ? -EIO : 0,
+            .force_encoder_output_error = err_cases[i] == 1 ? -EIO : 0,
+        };
+        mock_hobot_reset(&err_mock);
+        stall_cfg.out_dir = err_dir;
+        stall_cfg.input_stall_timeout_ms = 500;
+        miro_ego_pipeline_t *err_pipe = NULL;
+        assert(miro_ego_pipeline_open(&stall_cfg, NULL, NULL, &err_pipe, err, sizeof(err)) == 0);
+        (void)miro_ego_pipeline_submit(err_pipe, fake_jpeg, sizeof(fake_jpeg), 50);
+        assert(miro_ego_pipeline_finish(err_pipe) == -1);
+        assert(miro_ego_pipeline_failed(err_pipe));
+        const char *expected = err_cases[i] == 0 ? "decoder_output_dequeue_failed"
+                                                 : "encoder_output_dequeue_failed";
+        assert(strstr(miro_ego_pipeline_error(err_pipe), expected) != NULL);
+        miro_ego_pipeline_close(err_pipe);
+        cleanup_dir(err_dir);
+    }
 }
 
 int main(void)

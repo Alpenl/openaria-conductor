@@ -481,6 +481,10 @@ impl AuditLogger {
             .disk
             .lock()
             .map_err(|_| StorageError::Core(miro_ego_core::CoreError::poisoned("audit_disk")))?;
+        if !(self.volume_ready)() {
+            Self::close_disk_handle_locked(&mut guard, true);
+            return Ok(0);
+        }
         if guard
             .enospc_backoff_until
             .is_some_and(|until| Instant::now() < until)
@@ -508,11 +512,7 @@ impl AuditLogger {
         self.fallback.snapshot().map_err(StorageError::from)
     }
 
-    fn close_disk_handle(&self, clear_backoff: bool) {
-        let mut guard = match self.disk.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+    fn close_disk_handle_locked(guard: &mut AuditDiskState, clear_backoff: bool) {
         if let Some(mut writer) = guard.active_file.take() {
             let _ = writer.flush();
         }
@@ -521,6 +521,14 @@ impl AuditLogger {
         if clear_backoff {
             guard.enospc_backoff_until = None;
         }
+    }
+
+    fn close_disk_handle(&self, clear_backoff: bool) {
+        let mut guard = match self.disk.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Self::close_disk_handle_locked(&mut guard, clear_backoff);
     }
 
     fn reset_disk_state_on_error(guard: &mut AuditDiskState, err: &io::Error, backoff: Duration) {
@@ -548,6 +556,11 @@ impl AuditLogger {
             .disk
             .lock()
             .map_err(|_| io::Error::other("audit disk lock poisoned"))?;
+
+        if !(self.volume_ready)() {
+            Self::close_disk_handle_locked(&mut guard, true);
+            return Err(io::Error::other("recording volume unavailable"));
+        }
 
         if guard
             .enospc_backoff_until

@@ -1,23 +1,10 @@
-//! Firmware status formatting, check caching, and principal-scoped idempotency tracking
-//! for `/api/v1/firmware*`.
+//! Firmware status formatting and check caching for `/api/v1/firmware*`.
 
-use miro_ego_api::{ApiError, ApiResult, CommandOutcome};
 use miro_ego_deploy::{DeployRpcClient, ReleaseManager};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub(super) const FIRMWARE_CHECK_CACHE_TTL: Duration = Duration::from_secs(30);
-const FIRMWARE_IDEMPOTENCY_TTL: Duration = Duration::from_secs(86_400);
-const MAX_FIRMWARE_IDEMPOTENCY_ENTRIES: usize = 256;
-
-pub(super) type FirmwareIdempotencyKey = (String, String, String);
-
-struct FirmwareIdempotencyRecord {
-    canonical_body: Vec<u8>,
-    outcome: CommandOutcome,
-    recorded_at: Instant,
-}
 
 #[derive(Default)]
 pub(super) struct FirmwareRuntimeState {
@@ -25,63 +12,6 @@ pub(super) struct FirmwareRuntimeState {
     pub checked_instant: Option<Instant>,
     pub available: Option<Value>,
     pub task: Option<Value>,
-    idempotency: HashMap<FirmwareIdempotencyKey, FirmwareIdempotencyRecord>,
-}
-
-impl FirmwareRuntimeState {
-    fn prune_idempotency(&mut self) {
-        let now = Instant::now();
-        self.idempotency.retain(|_, rec| {
-            now.saturating_duration_since(rec.recorded_at) < FIRMWARE_IDEMPOTENCY_TTL
-        });
-    }
-
-    pub fn lookup_idempotency(
-        &mut self,
-        key: &FirmwareIdempotencyKey,
-        canonical_body: &[u8],
-        conflict_msg: &str,
-    ) -> ApiResult<Option<CommandOutcome>> {
-        self.prune_idempotency();
-        let Some(existing) = self.idempotency.get(key) else {
-            return Ok(None);
-        };
-        if existing.canonical_body == canonical_body {
-            let mut replayed = existing.outcome.clone();
-            replayed.replayed = true;
-            Ok(Some(replayed))
-        } else {
-            Err(ApiError::conflict("idempotency_conflict", conflict_msg).with_error_code_header())
-        }
-    }
-
-    pub fn insert_idempotency(
-        &mut self,
-        key: FirmwareIdempotencyKey,
-        canonical_body: Vec<u8>,
-        outcome: CommandOutcome,
-    ) {
-        self.prune_idempotency();
-        while self.idempotency.len() >= MAX_FIRMWARE_IDEMPOTENCY_ENTRIES {
-            let Some(oldest_key) = self
-                .idempotency
-                .iter()
-                .min_by_key(|(_, rec)| rec.recorded_at)
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            self.idempotency.remove(&oldest_key);
-        }
-        self.idempotency.insert(
-            key,
-            FirmwareIdempotencyRecord {
-                canonical_body,
-                outcome,
-                recorded_at: Instant::now(),
-            },
-        );
-    }
 }
 
 pub(super) fn build_firmware_status_payload(

@@ -63,7 +63,7 @@ fn is_kernel_ntp_synchronized() -> bool {
     let mut tx: libc::timex = unsafe { std::mem::zeroed() };
     tx.modes = 0;
     let rc = unsafe { libc::adjtimex(&mut tx) };
-    rc >= 0 && (tx.status & libc::STA_UNSYNC) == 0
+    rc >= 0 && rc != libc::TIME_ERROR && (tx.status & libc::STA_UNSYNC) == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,10 +207,20 @@ impl ClockRuntimeInner {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkPersistedClockState {
+    schema: String,
+    boot_id: String,
+    synchronized_at_ms: u64,
+    synchronized_mono_ns: u64,
+}
+
 /// Shared boot-scoped clock service bridging `/api/v1/clock*`, `NetworkRpcClient`,
 /// `<run_dir>/clock-state.json`, and `CaptureCoordinator`'s [`ClockSyncProbe`].
 pub struct ClockStateService {
     state_path: Option<PathBuf>,
+    network_state_fallback_path: Option<PathBuf>,
     network_probe_client: Option<NetworkRpcClient>,
     network_mutation_client: Option<NetworkRpcClient>,
     allow_kernel_ntp: bool,
@@ -225,21 +235,37 @@ impl ClockStateService {
         allow_kernel_ntp: bool,
     ) -> Self {
         let boot_id = read_linux_boot_id();
+        let network_state_fallback_path = run_dir.as_ref().map(|dir| dir.join("clock-state.json"));
         // When `miro-ego-network` RPC is configured, `AuthoritativeNetworkController` owns
         // `<run_dir>/clock-state.json`; only use local file persistence in standalone mode.
         let state_path = if network_probe_client.is_none() && network_mutation_client.is_none() {
-            run_dir.map(|dir| dir.join("clock-state.json"))
+            network_state_fallback_path.clone()
         } else {
             None
         };
         let inner = ClockRuntimeInner::load(boot_id, state_path.as_deref());
         Self {
             state_path,
+            network_state_fallback_path,
             network_probe_client,
             network_mutation_client,
             allow_kernel_ntp,
             inner: Mutex::new(inner),
         }
+    }
+
+    fn read_network_clock_state_fallback(
+        &self,
+        expected_boot_id: &str,
+    ) -> Option<NetworkPersistedClockState> {
+        let path = self.network_state_fallback_path.as_deref()?;
+        let loaded: NetworkPersistedClockState = read_bounded_json(path, 8192, 8).ok()?;
+        if loaded.schema != miro_ego_network::clock::CLOCK_STATE_SCHEMA
+            || loaded.boot_id != expected_boot_id
+        {
+            return None;
+        }
+        Some(loaded)
     }
 
     fn local_source(&self, guard: &ClockRuntimeInner) -> ClockSyncSource {
@@ -254,35 +280,72 @@ impl ClockStateService {
 
     pub fn status_blocking(&self, principal_id: &str, inspect: bool) -> ApiResult<Value> {
         if let Some(ref rpc) = self.network_probe_client {
-            let snap = rpc.clock_status().map_err(map_clock_rpc_error)?;
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|_| ApiError::internal("clock_poisoned", "clock state mutex poisoned"))?;
-            let (challenge, expires_in_ms) = if inspect {
-                (
-                    Value::String(guard.issue_challenge(principal_id, true)),
-                    5000_u64,
-                )
-            } else if snap.source == "unsynchronized" {
-                (
-                    Value::String(guard.issue_challenge(principal_id, false)),
-                    5000_u64,
-                )
-            } else {
-                (Value::Null, 0_u64)
-            };
-            return Ok(json!({
-                "schema": "miro-ego.clock-status.v1",
-                "source": snap.source,
-                "unix_time_ms": snap.unix_time_ms,
-                "challenge": challenge,
-                "expires_in_ms": expires_in_ms,
-                "applied": snap.applied,
-                "boot_id": snap.boot_id,
-                "synchronized_at_ms": snap.synchronized_at_ms,
-                "age_seconds": snap.age_seconds,
-            }));
+            match rpc.clock_status() {
+                Ok(snap) => {
+                    let mut guard = self.inner.lock().map_err(|_| {
+                        ApiError::internal("clock_poisoned", "clock state mutex poisoned")
+                    })?;
+                    let (challenge, expires_in_ms) = if inspect {
+                        (
+                            Value::String(guard.issue_challenge(principal_id, true)),
+                            5000_u64,
+                        )
+                    } else if snap.source == "unsynchronized" {
+                        (
+                            Value::String(guard.issue_challenge(principal_id, false)),
+                            5000_u64,
+                        )
+                    } else {
+                        (Value::Null, 0_u64)
+                    };
+                    return Ok(json!({
+                        "schema": "miro-ego.clock-status.v1",
+                        "source": snap.source,
+                        "unix_time_ms": snap.unix_time_ms,
+                        "challenge": challenge,
+                        "expires_in_ms": expires_in_ms,
+                        "applied": snap.applied,
+                        "boot_id": snap.boot_id,
+                        "synchronized_at_ms": snap.synchronized_at_ms,
+                        "age_seconds": snap.age_seconds,
+                    }));
+                }
+                Err(rpc_err) => {
+                    let mut guard = self.inner.lock().map_err(|_| {
+                        ApiError::internal("clock_poisoned", "clock state mutex poisoned")
+                    })?;
+                    if let Some(net_st) = self.read_network_clock_state_fallback(&guard.boot_id) {
+                        let source = if self.allow_kernel_ntp && is_kernel_ntp_synchronized() {
+                            ClockSyncSource::Ntp
+                        } else {
+                            ClockSyncSource::Client
+                        };
+                        let mono_now = monotonic_ns().unwrap_or(net_st.synchronized_mono_ns);
+                        let age_seconds =
+                            mono_now.saturating_sub(net_st.synchronized_mono_ns) / 1_000_000_000;
+                        let (challenge, expires_in_ms) = if inspect {
+                            (
+                                Value::String(guard.issue_challenge(principal_id, true)),
+                                5000_u64,
+                            )
+                        } else {
+                            (Value::Null, 0_u64)
+                        };
+                        return Ok(json!({
+                            "schema": "miro-ego.clock-status.v1",
+                            "source": source.as_str(),
+                            "unix_time_ms": now_unix_ms(),
+                            "challenge": challenge,
+                            "expires_in_ms": expires_in_ms,
+                            "applied": source == ClockSyncSource::Client,
+                            "boot_id": net_st.boot_id,
+                            "synchronized_at_ms": net_st.synchronized_at_ms,
+                            "age_seconds": age_seconds,
+                        }));
+                    }
+                    return Err(map_clock_rpc_error(rpc_err));
+                }
+            }
         }
 
         let mut guard = self
@@ -421,6 +484,20 @@ impl ClockSyncProbe for ClockStateService {
             }
         }
         if let Ok(guard) = self.inner.lock() {
+            if let Some(net_st) = self.read_network_clock_state_fallback(&guard.boot_id) {
+                let source = if self.allow_kernel_ntp && is_kernel_ntp_synchronized() {
+                    ClockSyncSource::Ntp
+                } else {
+                    ClockSyncSource::Client
+                };
+                return ClockSyncSnapshot {
+                    boot_id: net_st.boot_id,
+                    source,
+                    unix_time_ms: now_unix_ms(),
+                    monotonic_ns: mono_ns,
+                    synchronized_at_ms: Some(net_st.synchronized_at_ms),
+                };
+            }
             let source = self.local_source(&guard);
             ClockSyncSnapshot {
                 boot_id: guard.boot_id.clone(),
@@ -438,5 +515,72 @@ impl ClockSyncProbe for ClockStateService {
                 synchronized_at_ms: None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn clock_state_service_falls_back_to_run_dir_clock_state_json_on_rpc_failure() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let run_dir = std::env::temp_dir().join(format!(
+            "miro-ego-cli-clock-fb-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&run_dir).unwrap();
+
+        let boot_id = read_linux_boot_id();
+        let doc = json!({
+            "schema": miro_ego_network::clock::CLOCK_STATE_SCHEMA,
+            "boot_id": boot_id,
+            "synchronized_at_ms": 1_760_000_000_000_u64,
+            "synchronized_mono_ns": 1_000_000_000_u64,
+        });
+        fs::write(
+            run_dir.join("clock-state.json"),
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .unwrap();
+
+        let unreachable_sock = run_dir.join("missing-network.sock");
+        let svc = ClockStateService::new(
+            Some(run_dir.clone()),
+            Some(NetworkRpcClient::new(&unreachable_sock).with_timeout(Duration::from_millis(50))),
+            None,
+            false,
+        );
+
+        let snap = svc.snapshot();
+        assert_eq!(snap.source, ClockSyncSource::Client);
+        assert_eq!(snap.boot_id, boot_id);
+        assert_eq!(snap.synchronized_at_ms, Some(1_760_000_000_000));
+
+        let status = svc.status_blocking("p1", false).unwrap();
+        assert_eq!(status["source"], "client");
+        assert_eq!(status["applied"], true);
+
+        // Wrong boot_id must NOT be accepted!
+        let stale_doc = json!({
+            "schema": miro_ego_network::clock::CLOCK_STATE_SCHEMA,
+            "boot_id": "00000000-0000-4000-8000-000000000000",
+            "synchronized_at_ms": 1_760_000_000_000_u64,
+            "synchronized_mono_ns": 1_000_000_000_u64,
+        });
+        fs::write(
+            run_dir.join("clock-state.json"),
+            serde_json::to_vec(&stale_doc).unwrap(),
+        )
+        .unwrap();
+        let stale_snap = svc.snapshot();
+        assert_eq!(stale_snap.source, ClockSyncSource::Unsynchronized);
+        assert!(svc.status_blocking("p1", false).is_err());
+
+        fs::remove_dir_all(run_dir).unwrap();
     }
 }

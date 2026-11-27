@@ -602,6 +602,12 @@ def main(argv: list[str] | None = None) -> None:
         restore(args)
     elif args.action in {"compose", "auto-flash"}:
         disk = disks.select(args.disk) if args.action == "auto-flash" else None
+        if disk is not None:
+            disks.check_path_not_on_disk(
+                disk.path,
+                args.output,
+                message="Output image cannot be stored on target disk",
+            )
         card_bytes = disk.size if disk is not None else args.card_bytes
         if card_bytes is None:
             raise RuntimeError("MIRO-EGO exFAT composition requires --card-bytes")

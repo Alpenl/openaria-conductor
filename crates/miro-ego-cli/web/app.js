@@ -2291,6 +2291,9 @@ function saveCredentials(accessToken, csrfToken = "") {
       sessionStorage.setItem(STORAGE_KEYS.csrfToken, trimmedCsrf);
     } else {
       sessionStorage.removeItem(STORAGE_KEYS.csrfToken);
+      try {
+        localStorage.removeItem(STORAGE_KEYS.csrfToken);
+      } catch {}
     }
   } catch {}
 }
@@ -2831,29 +2834,42 @@ async function consumeSseStream(url, expectedSchema, mismatchMessage, options) {
       });
       observeResponseAuditHeader(response);
       if (!response.ok) throw await parseErrorResponse(response);
+      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (!contentType.startsWith("text/event-stream")) {
+        throw new Error("设备事件流 Content-Type 不是 text/event-stream");
+      }
       if (!response.body) throw new Error("设备事件流没有响应正文");
       const reader = response.body.getReader();
       try {
         const decoder = new TextDecoder();
         let buffer = "";
         let connectedNotified = false;
+        const markConnected = () => {
+          if (!connectedNotified) {
+            disconnectSince = null;
+            options.onConnection?.("connected");
+            connectedNotified = true;
+          }
+        };
+        if (lastEventId !== null) {
+          markConnected();
+        }
         while (!options.signal.aborted) {
           const { done, value } = await reader.read();
+          if (value && value.byteLength > 0) {
+            markConnected();
+          }
           buffer += decoder.decode(value, { stream: !done });
           let boundaryIdx = buffer.search(/\r?\n\r?\n/);
           while (boundaryIdx !== -1) {
             const frame = buffer.slice(0, boundaryIdx);
             const sep = buffer.slice(boundaryIdx).match(/^\r?\n\r?\n/)?.[0] ?? "\n\n";
             buffer = buffer.slice(boundaryIdx + sep.length);
+            markConnected();
             const parsed = parseSseFrame(frame, expectedSchema, mismatchMessage, options.validatePayload);
             if (parsed) {
               await options.onEvent(parsed.payload);
               lastEventId = parsed.id;
-              if (!connectedNotified) {
-                disconnectSince = null;
-                options.onConnection?.("connected");
-                connectedNotified = true;
-              }
             }
             boundaryIdx = buffer.search(/\r?\n\r?\n/);
           }
@@ -3865,7 +3881,9 @@ class ConsoleStore {
     if (
       current &&
       ev.authority_epoch === current.authority_epoch &&
-      ev.source_revision <= current.source_revision
+      (ev.type === "snapshot"
+        ? ev.source_revision < current.source_revision
+        : ev.source_revision <= current.source_revision)
     ) {
       return;
     }
@@ -8250,7 +8268,7 @@ async function runH264MsePreviewLoop(options) {
 
   try {
     try {
-      if ("srcObject" in videoEl && typeof MediaSource.prototype.handle === "object") {
+      if ("srcObject" in videoEl && "handle" in mediaSource && mediaSource.handle) {
         videoEl.srcObject = mediaSource.handle;
       } else {
         objectUrl = URL.createObjectURL(mediaSource);
@@ -8337,20 +8355,29 @@ async function runH264MsePreviewLoop(options) {
     videoEl.play().catch(() => {});
 
     const firstFrameDeadline = performance.now() + 2500;
-    while (!options.signal.aborted && !failed) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value && value.byteLength > 0) {
-        queue.push(value);
-        if (queue.length > 32) queue.splice(0, queue.length - 16);
-        pumpBuffer();
+    try {
+      while (!options.signal.aborted && !failed) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && value.byteLength > 0) {
+          queue.push(value);
+          if (queue.length > 32) queue.splice(0, queue.length - 16);
+          pumpBuffer();
+        }
+        if (!gotFirstDecodedFrame && performance.now() > firstFrameDeadline) {
+          // Stream did not produce decodable fMP4 frames (e.g. mock synthetic header or CSP media block)
+          return false;
+        }
       }
-      if (!gotFirstDecodedFrame && performance.now() > firstFrameDeadline) {
-        // Stream did not produce decodable fMP4 frames (e.g. mock synthetic header or CSP media block)
-        return false;
-      }
+    } catch (err) {
+      if (options.signal.aborted) return false;
+      if (!gotFirstDecodedFrame) throw err;
     }
-    return gotFirstDecodedFrame;
+    if (!options.signal.aborted && gotFirstDecodedFrame) {
+      options.onState("unavailable");
+      return true;
+    }
+    return false;
   } finally {
     if (rafId !== null) window.cancelAnimationFrame(rafId);
     try {
@@ -8895,24 +8922,39 @@ function LivePreviewStage({ state, active }) {
       // Strictly check device.capabilities.preview_h264 BEFORE ever touching /preview/h264!
       const wantH264 = h264Cap && transportPref !== "mjpeg";
       if (wantH264 && mseVideoRef.current) {
-        try {
-          const ok = await runH264MsePreviewLoop({
-            signal: controller.signal,
-            videoElement: mseVideoRef.current,
-            onVideoTick: () => {
-              if (mounted) setVideoTick((n) => (n + 1) & 0x3fffffff || 1);
-            },
-            onState: (st) => {
-              if (mounted) setPreviewState(st);
-            },
-          });
-          if (controller.signal.aborted || !mounted) return;
-          if (ok) return;
-        } catch {
-          if (controller.signal.aborted || !mounted) return;
+        let retriesAfterLive = 0;
+        while (!controller.signal.aborted && mounted) {
+          try {
+            const hadLiveFrames = await runH264MsePreviewLoop({
+              signal: controller.signal,
+              videoElement: mseVideoRef.current,
+              onVideoTick: () => {
+                if (mounted) setVideoTick((n) => (n + 1) & 0x3fffffff || 1);
+              },
+              onState: (st) => {
+                if (mounted) setPreviewState(st);
+              },
+            });
+            if (controller.signal.aborted || !mounted) return;
+            if (mounted) setVideoTick(0);
+            if (!hadLiveFrames) break;
+            retriesAfterLive += 1;
+            if (mounted) setPreviewState("unavailable");
+            await abortableDelay(500, controller.signal);
+            if (retriesAfterLive >= 3) break;
+          } catch (err) {
+            if (controller.signal.aborted || !mounted) return;
+            if (mounted) setVideoTick(0);
+            const camDisconnected =
+              err instanceof DeviceApiError &&
+              err.status === 503 &&
+              err.code === "camera_not_connected";
+            if (mounted) setPreviewState(camDisconnected ? "disconnected" : "unavailable");
+            break;
+          }
         }
-        if (mounted) setVideoTick(0);
       }
+      if (controller.signal.aborted || !mounted) return;
 
       // Clean MJPEG/JPEG preview stream (primary when preview_h264=false, automatic fallback when true)
       await runMjpegPreviewLoop({

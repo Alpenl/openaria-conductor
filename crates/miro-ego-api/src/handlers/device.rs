@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub const WEB_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' blob: data:; object-src 'none'; script-src 'self'; worker-src 'self' blob:; style-src 'self'";
+pub const WEB_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' blob: data:; media-src 'self' blob:; object-src 'none'; script-src 'self'; worker-src 'self' blob:; style-src 'self'";
 
 const CLOCK_MIN_MS: u64 = 1_704_067_200_000;
 const CLOCK_MAX_MS: u64 = 4_102_444_799_999;

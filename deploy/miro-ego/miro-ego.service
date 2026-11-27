@@ -31,7 +31,11 @@ ProtectKernelTunables=no
 ReadOnlyPaths=/proc/sys -/proc/sysrq-trigger -/proc/latency_stats -/proc/acpi -/proc/timer_stats -/proc/fs -/proc/irq
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-ProtectClock=yes
+# Keep ProtectClock=no: on systemd 249 (Ubuntu 22.04 / RDK X5), ProtectClock=yes
+# implicitly sets DevicePolicy=auto + DeviceAllow=char-rtc r, denying /dev/video*,
+# /dev/ion, /dev/vpu, /dev/jpu, and /dev/snd/* with EPERM. CapabilityBoundingSet=
+# already strips CAP_SYS_TIME.
+ProtectClock=no
 ProtectKernelLogs=yes
 ProtectHostname=yes
 CapabilityBoundingSet=

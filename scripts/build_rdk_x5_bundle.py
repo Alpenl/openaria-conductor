@@ -346,6 +346,9 @@ def compile_encoder_binary(
     common_flags = ["-O2", "-Wall", "-Wextra", "-Werror", "-std=gnu11"]
     if sdk_paths is not None:
         inc_dir, lib_dir = sdk_paths
+        sdk_libs = ["-lmultimedia", "-lpthread"]
+        if (lib_dir / "libhbmem.so").is_file():
+            sdk_libs.append("-lhbmem")
         cmd = [
             *cc_prefix,
             *common_flags,
@@ -355,8 +358,7 @@ def compile_encoder_binary(
             f"-L{lib_dir}",
             "-Wl,-rpath,/usr/hobot/lib",
             f"-Wl,-rpath-link,{lib_dir}",
-            "-lmultimedia",
-            "-lpthread",
+            *sdk_libs,
             "-o",
             str(output_bin),
         ]

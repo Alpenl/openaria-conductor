@@ -4,7 +4,7 @@ After=systemd-tmpfiles-setup.service
 
 [Socket]
 ListenStream=/run/miro-ego/deploy-control.sock
-SocketUser=miro-ego
+SocketUser=root
 SocketGroup=miro-ego
 SocketMode=0660
 DirectoryMode=0750

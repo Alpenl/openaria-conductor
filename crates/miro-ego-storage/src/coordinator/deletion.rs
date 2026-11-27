@@ -160,25 +160,19 @@ impl CaptureCoordinator {
         let mut trash_dirs_to_unlink: Vec<PathBuf> = Vec::new();
         let run_res: StorageResult<(DeleteSessionsResult, Value)> =
             (|| {
-                if self.volume.is_volume_released() {
-                    return Err(StorageError::locked(
-                        "volume_released",
-                        "cannot delete sessions while recording volume is released",
-                    ));
-                }
                 let maintenance_lock = self.acquire_shared_maintenance_lock()?;
                 {
                     let mut guard = self.state.lock().map_err(|_| {
                         StorageError::Core(CoreError::poisoned("coordinator_state"))
                     })?;
+                    if guard.phase != CapturePhase::Idle || guard.is_busy_for_ops() {
+                        return Err(guard.busy_error("delete sessions"));
+                    }
                     if guard.volume_released || self.volume.is_volume_released() {
                         return Err(StorageError::locked(
                             "volume_released",
                             "cannot delete sessions while recording volume is released",
                         ));
-                    }
-                    if guard.phase != CapturePhase::Idle {
-                        return Err(guard.busy_error("delete sessions"));
                     }
                     guard.transition(CapturePhase::Deleting)?;
                     self.phase_cv.notify_all();
@@ -345,7 +339,8 @@ impl CaptureCoordinator {
         let mut touched_date_parents: HashSet<PathBuf> = HashSet::new();
 
         // Phase A: atomically rename each `recordings/<rel_dir>` into `.miro-ego/deleting/<sid>`.
-        for entry in ordered {
+        let mut iter = ordered.into_iter();
+        while let Some(entry) = iter.next() {
             if !is_valid_uuid_v7(&entry.session_id)
                 || !is_valid_sha256(&entry.manifest_sha256)
                 || !is_canonical_session_relative_dir(&entry.relative_dir)
@@ -354,6 +349,12 @@ impl CaptureCoordinator {
                     session_id: entry.session_id,
                     error: "refusing to delete non-canonical session path".to_owned(),
                 });
+                for remaining in iter {
+                    failed_sessions.push(FailedDeleteSession {
+                        session_id: remaining.session_id,
+                        error: "aborted after earlier session deletion failure".to_owned(),
+                    });
+                }
                 break;
             }
             let target_dir = recordings_root.join(&entry.relative_dir);
@@ -365,6 +366,12 @@ impl CaptureCoordinator {
                     session_id: entry.session_id,
                     error: "parent date directory failed symlink or st_dev check".to_owned(),
                 });
+                for remaining in iter {
+                    failed_sessions.push(FailedDeleteSession {
+                        session_id: remaining.session_id,
+                        error: "aborted after earlier session deletion failure".to_owned(),
+                    });
+                }
                 break;
             }
             match fs::symlink_metadata(&target_dir) {
@@ -375,6 +382,12 @@ impl CaptureCoordinator {
                             session_id: entry.session_id,
                             error: "session directory failed symlink or st_dev check".to_owned(),
                         });
+                        for remaining in iter {
+                            failed_sessions.push(FailedDeleteSession {
+                                session_id: remaining.session_id,
+                                error: "aborted after earlier session deletion failure".to_owned(),
+                            });
+                        }
                         break;
                     }
                     let staged_trash = deleting_root.join(&entry.session_id);
@@ -400,6 +413,12 @@ impl CaptureCoordinator {
                         }
                     };
                     if !moved_ok {
+                        for remaining in iter {
+                            failed_sessions.push(FailedDeleteSession {
+                                session_id: remaining.session_id,
+                                error: "aborted after earlier session deletion failure".to_owned(),
+                            });
+                        }
                         break;
                     }
                 }
@@ -409,6 +428,12 @@ impl CaptureCoordinator {
                         session_id: entry.session_id,
                         error: format!("failed to stat session directory: {err}"),
                     });
+                    for remaining in iter {
+                        failed_sessions.push(FailedDeleteSession {
+                            session_id: remaining.session_id,
+                            error: "aborted after earlier session deletion failure".to_owned(),
+                        });
+                    }
                     break;
                 }
             }
@@ -435,14 +460,9 @@ impl CaptureCoordinator {
         // Phase B: commit single-batch `forget_paths` in `BinarySessionCatalog` + persist final
         // `delete_sessions` receipt BEFORE unlinking `.miro-ego/deleting/<sid>`!
         if !deleted_relative_dirs.is_empty()
-            && let Err(err) = self.catalog.forget_paths(&deleted_relative_dirs)
+            && self.catalog.forget_paths(&deleted_relative_dirs).is_err()
         {
-            if let Some(last_sid) = deleted_session_ids.last().cloned() {
-                failed_sessions.push(FailedDeleteSession {
-                    session_id: last_sid,
-                    error: format!("failed to update session catalog: {err}"),
-                });
-            }
+            let _ = self.catalog.forget_paths_in_memory(&deleted_relative_dirs);
         }
 
         let result = DeleteSessionsResult {

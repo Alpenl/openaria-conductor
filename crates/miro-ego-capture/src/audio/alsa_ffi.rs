@@ -414,10 +414,10 @@ impl Pcm {
                 "ALSA PCM frame size is unconfigured",
             ));
         }
-        if !frames
+        if frames
             .checked_mul(self.bytes_per_frame)
             .and_then(|n| usize::try_from(n).ok())
-            .is_some_and(|n| n <= buffer.len())
+            .is_none_or(|n| n > buffer.len())
         {
             return Err(AudioError::new(
                 "invalid_argument",

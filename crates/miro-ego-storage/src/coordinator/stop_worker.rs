@@ -2,14 +2,14 @@
 //! `SafeSwapReceipt` persistence) plus non-blocking async `begin_stop_capture_for_principal`
 //! background finalization worker.
 
-use super::fsm::{CaptureCoordinator, SessionMetadata};
+use super::fsm::{CaptureCoordinator, CoordinatorState, SessionMetadata};
 use super::manifest_builder::{count_captured_artifacts, sum_captured_artifact_bytes};
 use super::receipts::InFlightRegistration;
 use super::types::{
     ActiveCaptureHandle, CAPTURE_STATE_EVENT_SCHEMA, CAPTURE_STOP_SCHEMA, CaptureEventType,
-    CapturePhase, CaptureProgressSnapshot, CaptureStatusSnapshot, CaptureStopRequest,
-    IdempotentOutcome, SAFE_SWAP_RECEIPT_SCHEMA, SafeSwapReceipt, StopReason, VerificationCounter,
-    request_fingerprint, validate_idempotency_key,
+    CapturePhase, CaptureProgressSnapshot, CaptureSnapshotEventData, CaptureStatusSnapshot,
+    CaptureStopRequest, IdempotentOutcome, SAFE_SWAP_RECEIPT_SCHEMA, SafeSwapReceipt, StopReason,
+    VerificationCounter, request_fingerprint, validate_idempotency_key,
 };
 use crate::artifact_io::open_manifest;
 use crate::recovery::is_transient_storage_error;
@@ -19,10 +19,45 @@ use crate::{StorageError, StorageResult, VolumeManager};
 use miro_ego_core::CoreError;
 use miro_ego_core::ids::{is_valid_uuid_v7, new_uuid_v7};
 use serde_json::{Value, json};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+struct SafeSwapBusyGuard<'a> {
+    state: &'a Mutex<CoordinatorState>,
+    cv: &'a Condvar,
+    active: bool,
+}
+
+impl<'a> SafeSwapBusyGuard<'a> {
+    fn new(state: &'a Mutex<CoordinatorState>, cv: &'a Condvar) -> Self {
+        Self {
+            state,
+            cv,
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for SafeSwapBusyGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            if let Ok(mut guard) = self.state.lock() {
+                guard.safe_swap_in_progress = false;
+                self.cv.notify_all();
+            } else if let Err(poisoned) = self.state.lock() {
+                let mut guard = poisoned.into_inner();
+                guard.safe_swap_in_progress = false;
+                self.cv.notify_all();
+            }
+        }
+    }
+}
 
 impl CaptureCoordinator {
     /// Idempotently stop, seal (zero-reread), and publish the active recording synchronously.
@@ -315,30 +350,46 @@ impl CaptureCoordinator {
                 }),
             );
             let coord = Arc::clone(self);
+            let job_slot = Arc::new(Mutex::new(Some((
+                meta,
+                handle,
+                last_progress,
+                authority_epoch,
+            ))));
+            let thread_job_slot = Arc::clone(&job_slot);
             let spawn_res = thread::Builder::new()
                 .name("miro-ego-stop-finalizer".to_owned())
                 .spawn(move || {
-                    let _ = coord.complete_stopping_session(
-                        meta,
-                        handle,
-                        last_progress,
-                        authority_epoch,
-                        StopReason::User,
-                        None,
-                    );
+                    let job = thread_job_slot
+                        .lock()
+                        .ok()
+                        .and_then(|mut guard| guard.take());
+                    if let Some((m, h, prog, epoch)) = job {
+                        let _ = coord.complete_stopping_session(
+                            m,
+                            h,
+                            prog,
+                            epoch,
+                            StopReason::User,
+                            None,
+                        );
+                    }
                 });
             if spawn_res.is_err() {
-                // Fallback if OS refuses thread creation under extreme memory pressure:
-                // we cannot recover `handle` because closure was dropped on error? No: `Builder::spawn`
-                // drops the closure on Err, so let's ensure coordinator never stays stuck in `Stopping`!
-                let mut guard = match self.state.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                if guard.phase == CapturePhase::Stopping {
-                    let _ = guard.active.take();
-                    let _ = guard.transition(CapturePhase::Idle);
-                    self.phase_cv.notify_all();
+                let fallback_job = job_slot.lock().ok().and_then(|mut guard| guard.take());
+                if let Some((m, h, prog, epoch)) = fallback_job {
+                    let _ =
+                        self.complete_stopping_session(m, h, prog, epoch, StopReason::User, None);
+                } else {
+                    let mut guard = match self.state.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    if guard.phase == CapturePhase::Stopping {
+                        let _ = guard.active.take();
+                        let _ = guard.transition(CapturePhase::Idle);
+                        self.phase_cv.notify_all();
+                    }
                 }
             }
         }
@@ -395,15 +446,24 @@ impl CaptureCoordinator {
                     idle_safe_swap_admission: None,
                 }
             } else if matches!(guard.phase, CapturePhase::Idle | CapturePhase::Failed) {
+                if req.reason == StopReason::SafeSwap
+                    && guard.phase == CapturePhase::Idle
+                    && (guard.safe_swap_in_progress || guard.volume_admission_in_progress)
+                {
+                    return Err(guard.busy_error("safe-swap volume"));
+                }
                 let idle_safe_swap_admission = if req.reason == StopReason::SafeSwap
                     && guard.phase == CapturePhase::Idle
                     && !guard.volume_released
                     && !self.volume.is_volume_released()
                 {
-                    guard
-                        .admission
-                        .clone()
-                        .map(|adm| (adm, guard.authority_epoch.clone()))
+                    if let Some(adm) = guard.admission.clone() {
+                        guard.safe_swap_in_progress = true;
+                        self.phase_cv.notify_all();
+                        Some((adm, guard.authority_epoch.clone()))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -522,6 +582,7 @@ impl CaptureCoordinator {
         idempotency_key: Option<&str>,
         req_hash: &str,
     ) -> StorageResult<()> {
+        let mut busy_guard = SafeSwapBusyGuard::new(&self.state, &self.phase_cv);
         if !self.volume.is_raw_mounted_and_writable() {
             if let Some(key) = idempotency_key {
                 self.receipts.store_idempotency(
@@ -539,7 +600,8 @@ impl CaptureCoordinator {
         // Look up any latest sealed session on this volume BEFORE gating `/data` reads.
         let candidate_receipt = self.build_latest_session_safe_swap_receipt(adm);
 
-        // Temporarily gate new `/data` opens and drain all active handles to 0.
+        // Gate new `/data` opens and drain all active handles to 0; keep `released == true`
+        // asserted continuously across compaction, receipt persistence, and handle re-verification.
         self.volume.set_volume_released(true);
         self.close_all_volume_handles_for_safe_swap();
         let drain_budget =
@@ -560,8 +622,8 @@ impl CaptureCoordinator {
             ));
         }
 
-        // Pre-release durable receipt commit while `/data` is still writable on disk!
-        self.volume.set_volume_released(false);
+        // Pre-release durable receipt commit while `/data` is still writable on disk and
+        // `volume.is_volume_released() == true` blocks any new handle acquisitions.
         let _ = self.catalog.compact();
         let idem_tuple = idempotency_key.map(|k| (principal_id, k, req_hash, Value::Null));
         self.receipts.commit_safe_swap_bundle(
@@ -571,7 +633,20 @@ impl CaptureCoordinator {
             adm.writable,
         );
         self.close_all_volume_handles_for_safe_swap();
-        self.volume.set_volume_released(true);
+        let post_remaining = self.open_handle_count();
+        if post_remaining > 0 {
+            self.receipts.rollback_safe_swap_bundle(
+                idempotency_key.map(|k| (principal_id, k)),
+                adm.writable,
+            );
+            self.volume.set_volume_released(false);
+            return Err(StorageError::service_unavailable(
+                "volume_busy",
+                format!(
+                    "cannot release volume for safe swap: {post_remaining} open file handle(s) detected after receipt commit"
+                ),
+            ));
+        }
 
         let runtime_json = self.backend.runtime_observation().to_openapi_runtime_json();
         let (snap, rev) = {
@@ -586,6 +661,9 @@ impl CaptureCoordinator {
                 adm.mount_identity.clone(),
             ));
             guard.saw_unmount_since_release = false;
+            guard.safe_swap_in_progress = false;
+            busy_guard.disarm();
+            self.phase_cv.notify_all();
             let rev = guard.bump_revision();
             let snap = self.build_status_snapshot_locked(&guard, runtime_json);
             (snap, rev)
@@ -833,7 +911,8 @@ impl CaptureCoordinator {
         };
         drop(released_ctx);
 
-        if stop_reason == StopReason::SafeSwap {
+        let runtime_json = self.backend.runtime_observation().to_openapi_runtime_json();
+        let (wrapped, done_rev, safe_swap_receipt) = if stop_reason == StopReason::SafeSwap {
             self.volume.set_volume_released(true);
             self.close_all_volume_handles_for_safe_swap();
             let drain_budget =
@@ -846,7 +925,6 @@ impl CaptureCoordinator {
             let remaining = self.open_handle_count();
             if remaining > 0 {
                 self.volume.set_volume_released(false);
-                let runtime_json = self.backend.runtime_observation().to_openapi_runtime_json();
                 let (idle_snap, idle_rev) = {
                     let mut guard = self.state.lock().map_err(|_| {
                         StorageError::Core(CoreError::poisoned("coordinator_state"))
@@ -873,34 +951,10 @@ impl CaptureCoordinator {
                     ),
                 ));
             }
-        }
 
-        let runtime_json = self.backend.runtime_observation().to_openapi_runtime_json();
-        let (final_snapshot, done_rev) = {
-            let mut guard = self
-                .state
-                .lock()
-                .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
-            if stop_reason == StopReason::SafeSwap {
-                guard.volume_released = true;
-                guard.released_mount_signature = Some((
-                    meta.admission.volume_id.clone(),
-                    meta.admission.device_id,
-                    meta.admission.mount_identity.clone(),
-                ));
-                guard.saw_unmount_since_release = false;
-            }
-            guard.transition(CapturePhase::Idle)?;
-            self.phase_cv.notify_all();
-            let snap = self.build_status_snapshot_locked(&guard, runtime_json);
-            (snap, guard.source_revision)
-        };
-
-        let wrapped = Some(final_snapshot);
-
-        let safe_swap_receipt = if stop_reason == StopReason::SafeSwap {
-            // Persist SafeSwapReceipt + compacted catalog BEFORE marking volume released!
-            self.volume.set_volume_released(false);
+            // Keep `CapturePhase::Stopping` and `volume.is_volume_released() == true`
+            // asserted continuously while compacting catalog, committing receipt bundle,
+            // closing handles, and re-verifying zero open handles.
             let _ = self.catalog.compact();
             let receipt = SafeSwapReceipt {
                 schema: SAFE_SWAP_RECEIPT_SCHEMA.to_owned(),
@@ -914,7 +968,26 @@ impl CaptureCoordinator {
                 release_state: "device-released".to_owned(),
                 open_handle_count: 0,
             };
-            let idem_json = serde_json::to_value(&wrapped).unwrap_or(Value::Null);
+            let pre_idle_snapshot = {
+                let guard = self
+                    .state
+                    .lock()
+                    .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+                CaptureStatusSnapshot {
+                    schema: super::types::CAPTURE_STATUS_SCHEMA.to_owned(),
+                    authority_epoch: guard.authority_epoch.clone(),
+                    source_revision: guard.source_revision.saturating_add(1),
+                    snapshot: CaptureSnapshotEventData {
+                        schema: super::types::CAPTURE_SNAPSHOT_EVENT_SCHEMA.to_owned(),
+                        device_state: "idle".to_owned(),
+                        active_recording: None,
+                        retained_unsuccessful: guard.retained_unsuccessful.clone(),
+                        runtime: runtime_json.clone(),
+                    },
+                }
+            };
+            let pre_wrapped = Some(pre_idle_snapshot);
+            let idem_json = serde_json::to_value(&pre_wrapped).unwrap_or(Value::Null);
             let idem_tuple =
                 idem_ctx.map(|(principal_id, k, req_hash)| (principal_id, k, req_hash, idem_json));
             self.receipts.commit_safe_swap_bundle(
@@ -924,9 +997,70 @@ impl CaptureCoordinator {
                 admission_writable,
             );
             self.close_all_volume_handles_for_safe_swap();
-            self.volume.set_volume_released(true);
-            Some(receipt)
+            let post_remaining = self.open_handle_count();
+            if post_remaining > 0 {
+                self.receipts.rollback_safe_swap_bundle(
+                    idem_ctx.map(|(principal_id, k, _)| (principal_id, k)),
+                    admission_writable,
+                );
+                self.volume.set_volume_released(false);
+                let (idle_snap, idle_rev) = {
+                    let mut guard = self.state.lock().map_err(|_| {
+                        StorageError::Core(CoreError::poisoned("coordinator_state"))
+                    })?;
+                    guard.volume_released = false;
+                    guard.released_mount_signature = None;
+                    guard.saw_unmount_since_release = false;
+                    guard.transition(CapturePhase::Idle)?;
+                    self.phase_cv.notify_all();
+                    let snap = self.build_status_snapshot_locked(&guard, runtime_json);
+                    (snap, guard.source_revision)
+                };
+                self.events.emit(
+                    &authority_epoch,
+                    idle_rev,
+                    CaptureEventType::Snapshot,
+                    None,
+                    serde_json::to_value(&idle_snap.snapshot).unwrap_or(Value::Null),
+                );
+                return Err(StorageError::service_unavailable(
+                    "volume_busy",
+                    format!(
+                        "cannot release volume for safe swap: {post_remaining} open file handle(s) detected after receipt commit"
+                    ),
+                ));
+            }
+
+            let (final_snapshot, done_rev) = {
+                let mut guard = self
+                    .state
+                    .lock()
+                    .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+                guard.volume_released = true;
+                guard.released_mount_signature = Some((
+                    meta.admission.volume_id.clone(),
+                    meta.admission.device_id,
+                    meta.admission.mount_identity.clone(),
+                ));
+                guard.saw_unmount_since_release = false;
+                guard.transition(CapturePhase::Idle)?;
+                self.phase_cv.notify_all();
+                let snap = self.build_status_snapshot_locked(&guard, runtime_json);
+                (snap, guard.source_revision)
+            };
+            (Some(final_snapshot), done_rev, Some(receipt))
         } else {
+            let (final_snapshot, done_rev) = {
+                let mut guard = self
+                    .state
+                    .lock()
+                    .map_err(|_| StorageError::Core(CoreError::poisoned("coordinator_state")))?;
+                guard.transition(CapturePhase::Idle)?;
+                self.phase_cv.notify_all();
+                let snap = self.build_status_snapshot_locked(&guard, runtime_json);
+                (snap, guard.source_revision)
+            };
+            let wrapped = Some(final_snapshot);
             if let Some((principal_id, key, req_hash)) = idem_ctx
                 && let Ok(json_val) = serde_json::to_value(&wrapped)
             {
@@ -939,7 +1073,7 @@ impl CaptureCoordinator {
                     admission_writable,
                 );
             }
-            None
+            (wrapped, done_rev, None)
         };
 
         if let Some(receipt) = safe_swap_receipt {

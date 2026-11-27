@@ -514,6 +514,27 @@ impl<IO: AsyncRead + Unpin> AsyncRead for IdleTimeoutIo<IO> {
     }
 }
 
+impl<IO> IdleTimeoutIo<IO> {
+    fn poll_write_stall(
+        &mut self,
+        cx: &mut Context<'_>,
+        timeout_msg: &'static str,
+    ) -> Poll<std::io::Result<()>> {
+        let stall_timeout = self.write_stall_timeout;
+        let stall_sleep = self
+            .write_stall_sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall_timeout)));
+        if stall_sleep.as_mut().poll(cx).is_ready() {
+            self.write_stall_sleep = None;
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                timeout_msg,
+            )));
+        }
+        Poll::Pending
+    }
+}
+
 impl<IO: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutIo<IO> {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -537,20 +558,10 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutIo<IO> {
                 this.write_stall_sleep = None;
                 Poll::Ready(Err(err))
             }
-            Poll::Pending => {
-                let stall_timeout = this.write_stall_timeout;
-                let stall_sleep = this
-                    .write_stall_sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall_timeout)));
-                if stall_sleep.as_mut().poll(cx).is_ready() {
-                    this.write_stall_sleep = None;
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "HTTP response write stalled",
-                    )));
-                }
-                Poll::Pending
-            }
+            Poll::Pending => match this.poll_write_stall(cx, "HTTP response write stalled") {
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                _ => Poll::Pending,
+            },
         }
     }
 
@@ -561,25 +572,19 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutIo<IO> {
                 this.write_stall_sleep = None;
                 Poll::Ready(res)
             }
-            Poll::Pending => {
-                let stall_timeout = this.write_stall_timeout;
-                let stall_sleep = this
-                    .write_stall_sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall_timeout)));
-                if stall_sleep.as_mut().poll(cx).is_ready() {
-                    this.write_stall_sleep = None;
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "HTTP response flush stalled",
-                    )));
-                }
-                Poll::Pending
-            }
+            Poll::Pending => this.poll_write_stall(cx, "HTTP response flush stalled"),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.io).poll_shutdown(cx)
+        let this = &mut *self;
+        match Pin::new(&mut this.io).poll_shutdown(cx) {
+            Poll::Ready(res) => {
+                this.write_stall_sleep = None;
+                Poll::Ready(res)
+            }
+            Poll::Pending => this.poll_write_stall(cx, "HTTP response shutdown stalled"),
+        }
     }
 }
 
@@ -622,5 +627,54 @@ async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
         if *rx.borrow() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    struct PendingShutdownIo;
+
+    impl AsyncRead for PendingShutdownIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingShutdownIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_io_poll_shutdown_enforces_write_stall_timeout() {
+        let tracker = ConnectionIdleTracker::new();
+        let mut io = IdleTimeoutIo::new(
+            PendingShutdownIo,
+            Duration::from_secs(5),
+            Duration::from_millis(30),
+            tracker,
+        );
+        let err = io.shutdown().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 }

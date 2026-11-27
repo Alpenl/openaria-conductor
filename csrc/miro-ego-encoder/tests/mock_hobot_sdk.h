@@ -17,6 +17,8 @@ typedef struct {
     int transient_jpu_input_timeouts;
     int transient_vpu_input_timeouts;
     int permanent_input_timeout;
+    int force_decoder_output_error;
+    int force_encoder_output_error;
 } mock_hobot_config_t;
 
 void mock_hobot_reset(const mock_hobot_config_t *cfg);

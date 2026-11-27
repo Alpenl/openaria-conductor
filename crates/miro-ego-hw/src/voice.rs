@@ -104,8 +104,19 @@ impl AplayAudioPlayer {
     }
 }
 
+fn validate_alsa_device(device: &str) -> HwResult<()> {
+    if device.is_empty() || device.starts_with('-') || device.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        return Err(HwError::Io {
+            message: format!("invalid ALSA audio device string: {device:?}"),
+        });
+    }
+    Ok(())
+}
+
 impl AudioPlayer for AplayAudioPlayer {
     fn play_wav(&self, device: &str, wav_bytes: &[u8], timeout: Duration) -> HwResult<()> {
+        validate_alsa_device(device)?;
         let mut cmd = Command::new(&self.aplay_bin);
         cmd.args(["-q", "-D", device, "-"])
             .stdin(Stdio::piped())
@@ -357,6 +368,8 @@ impl VoiceController {
         settings_path: impl Into<PathBuf>,
         player: Arc<dyn AudioPlayer>,
     ) -> HwResult<Self> {
+        let audio_device = audio_device.into();
+        validate_alsa_device(&audio_device)?;
         let settings_path = settings_path.into();
         let settings = match fs::symlink_metadata(&settings_path) {
             Ok(_) => {
@@ -384,7 +397,7 @@ impl VoiceController {
         };
 
         let shared = Arc::new(VoiceWorkerShared {
-            audio_device: audio_device.into(),
+            audio_device,
             assets_dir: assets_dir.into(),
             playback_timeout_ms: AtomicU64::new(DEFAULT_PLAYBACK_TIMEOUT.as_millis() as u64),
             player,
@@ -490,7 +503,7 @@ impl VoiceController {
         Ok(())
     }
 
-    /// Drain queued cues and shut down the background voice playback thread cleanly.
+    /// Clear pending queued cues and shut down the background voice playback thread cleanly.
     pub fn close(&self) {
         {
             let mut guard = self
@@ -499,7 +512,9 @@ impl VoiceController {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             guard.closed = true;
+            guard.queue.clear();
             self.shared.work_cv.notify_all();
+            self.shared.idle_cv.notify_all();
         }
         let handle = self
             .worker_handle
@@ -847,6 +862,86 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(2));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn close_discards_pending_cues_and_rejects_invalid_alsa_device() {
+        struct SlowPlayer;
+        impl AudioPlayer for SlowPlayer {
+            fn play_wav(
+                &self,
+                _device: &str,
+                _wav_bytes: &[u8],
+                _timeout: Duration,
+            ) -> HwResult<()> {
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(())
+            }
+        }
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "miro-ego-voice-close-{}-{unique}",
+            std::process::id()
+        ));
+        let assets = dir.join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        let wav = make_pcm16_wav(&[100, -100]);
+        for cue in [
+            VoiceCue::DeviceReady,
+            VoiceCue::RecordingStarted,
+            VoiceCue::RecordingStopped,
+            VoiceCue::StorageLow,
+        ] {
+            fs::write(assets.join(cue_asset_filename(cue)), &wav).unwrap();
+        }
+
+        assert!(
+            VoiceController::open(
+                "-evil",
+                &assets,
+                dir.join("voice.json"),
+                Arc::new(SlowPlayer),
+            )
+            .is_err()
+        );
+        assert!(
+            VoiceController::open(
+                "hw:0\n",
+                &assets,
+                dir.join("voice.json"),
+                Arc::new(SlowPlayer),
+            )
+            .is_err()
+        );
+        assert!(
+            AplayAudioPlayer::default()
+                .play_wav("-D", &wav, Duration::from_millis(10))
+                .is_err()
+        );
+
+        let ctrl = VoiceController::open(
+            DEFAULT_VOICE_DEVICE,
+            &assets,
+            dir.join("voice.json"),
+            Arc::new(SlowPlayer),
+        )
+        .unwrap();
+        ctrl.play_cue(VoiceCue::DeviceReady).unwrap();
+        ctrl.play_cue(VoiceCue::RecordingStarted).unwrap();
+        ctrl.play_cue(VoiceCue::RecordingStopped).unwrap();
+        ctrl.play_cue(VoiceCue::StorageLow).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let t0 = Instant::now();
+        ctrl.close();
+        // Should finish after the single in-flight cue (~150ms), NOT drain all 4 (~600ms).
+        assert!(t0.elapsed() < Duration::from_millis(350));
 
         fs::remove_dir_all(dir).unwrap();
     }

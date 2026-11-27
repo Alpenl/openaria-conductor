@@ -1083,6 +1083,212 @@ class FactoryRecoveryTests(unittest.TestCase):
                 )
                 self.assertIn("deferring driver recovery", proc2.stdout)
 
+    def test_compose_records_trusted_public_key_and_auto_flash_checks_output_disk(self) -> None:
+        import types
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        custom_seed = hashlib.sha256(b"custom-compose-seed-030").digest()
+        custom_pub_hex = (
+            Ed25519PrivateKey.from_private_bytes(custom_seed)
+            .public_key()
+            .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            .hex()
+        )
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base_img = root / "vendor.img"
+            with base_img.open("wb") as dst:
+                dst.write(vendor_mbr())
+                dst.truncate(532480 * 512)
+            base_sha = disks.sha256_file(base_img)
+            bundle = make_native_bundle(root / "bundle.tar", signing_seed=custom_seed)
+            bundle_sha = disks.sha256_file(bundle)
+            profile = factory_profile(board="a" * 64)
+            output = root / "composed.img"
+            exfat_deb = root / partition_layout.EXFATPROGS_PACKAGE
+            logrotate_deb = root / partition_layout.LOGROTATE_PACKAGE
+            exfat_deb.write_bytes(b"exfat")
+            logrotate_deb.write_bytes(b"logrotate")
+
+            fat_files: dict[str, bytes] = {}
+
+            class FakePyFatFS:
+                def __init__(self, *_a: object, **_kw: object) -> None:
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_a: object) -> None:
+                    return None
+
+                def readtext(self, path: str) -> str:
+                    if path == "/hobot_config.sh":
+                        return "#!/bin/bash -e\nexit 0\n"
+                    raise FileNotFoundError(path)
+
+                def exists(self, path: str) -> bool:
+                    return path in fat_files
+
+                def makedir(self, _path: str) -> None:
+                    return None
+
+                def writebytes(self, path: str, data: bytes) -> None:
+                    fat_files[path] = data
+
+                def writetext(self, path: str, text: str) -> None:
+                    fat_files[path] = text.encode("utf-8")
+
+                def openbin(self, path: str, _mode: str = "r") -> io.BytesIO:
+                    buf = io.BytesIO()
+                    orig_close = buf.close
+
+                    def save_on_close() -> None:
+                        fat_files[path] = buf.getvalue()
+                        orig_close()
+
+                    buf.close = save_on_close  # type: ignore[method-assign]
+                    return buf
+
+            fake_pyfatfs = types.ModuleType("pyfatfs")
+            fake_pyfatfs_sub = types.ModuleType("pyfatfs.PyFatFS")
+            fake_pyfatfs_sub.PyFatFS = FakePyFatFS  # type: ignore[attr-defined]
+            fake_pyfatfs.PyFatFS = fake_pyfatfs_sub  # type: ignore[attr-defined]
+
+            with (
+                patch.dict(
+                    sys.modules,
+                    {"pyfatfs": fake_pyfatfs, "pyfatfs.PyFatFS": fake_pyfatfs_sub},
+                ),
+                patch.dict(
+                    os.environ,
+                    {"MIRO_EGO_RELEASE_PUBLIC_KEY_HEX": custom_pub_hex.upper()},
+                ),
+                patch.object(
+                    partition_layout, "prepare_tools", side_effect=[exfat_deb, logrotate_deb]
+                ),
+            ):
+                provision.compose(
+                    base_img,
+                    base_sha,
+                    bundle,
+                    bundle_sha,
+                    profile,
+                    output,
+                    card_bytes=64 * 1024**3,
+                )
+
+            manifest = json.loads(fat_files["/miro-ego/manifest.json"])
+            self.assertEqual(manifest["bundle"]["trusted_public_key_hex"], custom_pub_hex)
+
+            # auto-flash must check output path safety before compose() runs.
+            fake_disk = disks.Disk("/dev/sdb", 64 * 1024**3, "SER", "SD Card")
+            with (
+                patch.object(disks, "select", return_value=fake_disk),
+                patch.object(
+                    disks,
+                    "check_path_not_on_disk",
+                    side_effect=RuntimeError("Output image cannot be stored on target disk"),
+                ) as check_mock,
+                patch.object(provision, "compose") as compose_mock,
+                self.assertRaisesRegex(RuntimeError, "target disk"),
+            ):
+                recover.main(
+                    [
+                        "auto-flash",
+                        "--image",
+                        str(base_img),
+                        "--sha256",
+                        base_sha,
+                        "--bundle",
+                        str(bundle),
+                        "--bundle-sha256",
+                        bundle_sha,
+                        "--profile",
+                        str(root / "unused.mer"),
+                        "--output",
+                        str(root / "never-composed.img"),
+                        "--disk",
+                        "/dev/sdb",
+                    ]
+                )
+            check_mock.assert_called_once()
+            compose_mock.assert_not_called()
+
+    def test_deploy_units_sockets_tmpfiles_and_shell_scripts_r3_hardening(self) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        deploy_dir = repo_root / "deploy" / "miro-ego"
+
+        deploy_svc = (deploy_dir / "miro-ego-deploy.service").read_text(encoding="utf-8")
+        self.assertNotIn("ProtectSystem=strict", deploy_svc)
+        self.assertNotIn("ProtectHome=yes", deploy_svc)
+        self.assertNotIn("ReadWritePaths=-", deploy_svc)
+        for line in (
+            "PrivateTmp=yes",
+            "ProtectKernelTunables=yes",
+            "ProtectKernelModules=yes",
+            "ProtectControlGroups=yes",
+            "ProtectClock=yes",
+            "LockPersonality=yes",
+            "RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6",
+        ):
+            self.assertIn(line, deploy_svc)
+
+        tmpfiles = (deploy_dir / "miro-ego.tmpfiles").read_text(encoding="utf-8")
+        self.assertIn("d /data - - - -", tmpfiles)
+        self.assertNotIn("d /data 0755 root root -", tmpfiles)
+        self.assertIn("d /var/lib/miro-ego-deploy 0750 root root -", tmpfiles)
+
+        for sock_name in ("miro-ego-deploy.socket", "miro-ego-network.socket"):
+            sock_text = (deploy_dir / sock_name).read_text(encoding="utf-8")
+            self.assertIn("SocketUser=root", sock_text)
+            self.assertIn("SocketGroup=miro-ego", sock_text)
+            self.assertIn("SocketMode=0660", sock_text)
+
+        idle_fstrim = (deploy_dir / "miro-ego-idle-fstrim").read_text(encoding="utf-8")
+        self.assertNotIn('fstrim --verbose --quiet-unsupported "$DATA"', idle_fstrim)
+        self.assertIn("fstrim --listed-in /etc/fstab:/proc/self/mountinfo", idle_fstrim)
+
+        watchdog = (deploy_dir / "miro-ego-wifi-watchdog").read_text(encoding="utf-8")
+        self.assertNotIn("logger -t", watchdog)
+        self.assertIn("/^default via / {print $3; exit}", watchdog)
+
+        data_vol = (deploy_dir / "miro-ego-data-volume").read_text(encoding="utf-8")
+        self.assertIn("/etc/default/miro-ego-data-volume", data_vol)
+        for req_opt in (
+            '"uid=$capture_uid"',
+            '"gid=$capture_gid"',
+            '"nosuid"',
+            '"nodev"',
+            '"noexec"',
+        ):
+            self.assertIn(req_opt, data_vol)
+
+        # miro-ego-device-login skips usermod when shell is already /bin/bash.
+        if os.name == "posix":
+            with tempfile.TemporaryDirectory() as folder:
+                bin_dir = Path(folder)
+                usermod_log = bin_dir / "usermod.log"
+                (bin_dir / "getent").write_text(
+                    "#!/bin/sh\nprintf 'MiroEgo:x:1001:1001::/home/MiroEgo:/bin/bash\\n'\n",
+                    encoding="utf-8",
+                )
+                (bin_dir / "usermod").write_text(
+                    f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {str(usermod_log)!r}\n",
+                    encoding="utf-8",
+                )
+                (bin_dir / "getent").chmod(0o755)
+                (bin_dir / "usermod").chmod(0o755)
+                subprocess.run(
+                    ["/bin/sh", str(deploy_dir / "miro-ego-device-login")],
+                    env={**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"},
+                    check=True,
+                )
+                self.assertFalse(usermod_log.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -377,7 +377,21 @@ def execute() -> None:
             raise RuntimeError("Unsafe staging directory")
         if bundle.exists():
             shutil.rmtree(bundle)
-        provision.require_native_bundle(archive)
+        bundle_section = manifest.get("bundle")
+        manifest_trusted_key = (
+            bundle_section.get("trusted_public_key_hex")
+            if isinstance(bundle_section, dict)
+            else None
+        )
+        trusted_public_key_hex = (
+            manifest_trusted_key
+            or (os.environ.get("MIRO_EGO_RELEASE_PUBLIC_KEY_HEX") or "").strip()
+            or provision.default_release_public_key_hex()
+        )
+        provision.require_native_bundle(
+            archive,
+            trusted_public_key_hex=trusted_public_key_hex,
+        )
         extract_bundle(archive, bundle)
         run("sha256sum", "-c", "SHA256SUMS", cwd=bundle)
         install_bundle(bundle)

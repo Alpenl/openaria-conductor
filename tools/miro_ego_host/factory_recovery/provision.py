@@ -627,17 +627,20 @@ def compose(
             fat.writebytes("/miro-ego/profile.bin", sealed)
             with bundle_path.open("rb") as src, fat.openbin("/miro-ego/bundle.tar", "w") as dst:
                 shutil.copyfileobj(src, dst, 4 * 1024**2)
+            manifest_payload: dict[str, Any] = {
+                "schema": AUTOINSTALL_SCHEMA,
+                "bundle_sha256": bundle_sha.lower(),
+                "profile_sha256": hashlib.sha256(sealed).hexdigest(),
+                "storage": layout,
+            }
+            trusted_key = os.environ.get("MIRO_EGO_RELEASE_PUBLIC_KEY_HEX", "").strip()
+            if trusted_key:
+                manifest_payload["bundle"] = {
+                    "trusted_public_key_hex": trusted_key.lower(),
+                }
             fat.writebytes(
                 "/miro-ego/manifest.json",
-                json.dumps(
-                    {
-                        "schema": AUTOINSTALL_SCHEMA,
-                        "bundle_sha256": bundle_sha.lower(),
-                        "profile_sha256": hashlib.sha256(sealed).hexdigest(),
-                        "storage": layout,
-                    },
-                    indent=2,
-                ).encode("utf-8"),
+                json.dumps(manifest_payload, indent=2).encode("utf-8"),
             )
             fat.writetext("/hobot_config.sh", HOOK)
 

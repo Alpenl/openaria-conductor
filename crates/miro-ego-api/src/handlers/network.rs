@@ -517,7 +517,9 @@ fn validate_network_apply_body(body: &Value) -> Result<(), ApiError> {
     let wifi = desired
         .get("wifi_client")
         .ok_or_else(|| ApiError::bad_request("desired must include wifi_client"))?;
-    let ethernet = desired.get("ethernet").unwrap_or(&Value::Null);
+    let ethernet = desired
+        .get("ethernet")
+        .ok_or_else(|| ApiError::bad_request("desired must include ethernet"))?;
 
     if mode == "wifi-client" {
         let Some(w) = wifi.as_object() else {

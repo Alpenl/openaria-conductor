@@ -637,11 +637,20 @@ pub fn is_same_gateway_origin(
     if rest.eq_ignore_ascii_case(host_header.trim()) {
         return true;
     }
+    let default_port = if external_scheme.eq_ignore_ascii_case("https") {
+        Some(443)
+    } else if external_scheme.eq_ignore_ascii_case("http") {
+        Some(80)
+    } else {
+        None
+    };
     match (
         extract_host_and_port(rest),
         extract_host_and_port(host_header),
     ) {
-        (Some(orig_hp), Some(host_hp)) => orig_hp == host_hp,
+        (Some((orig_host, orig_port)), Some((host_host, host_port))) => {
+            orig_host == host_host && orig_port.or(default_port) == host_port.or(default_port)
+        }
         _ => false,
     }
 }
@@ -696,6 +705,42 @@ mod tests {
         assert!(is_same_gateway_origin(
             "http://[fe80::1%25wlan0]:8080",
             "[fe80::1%wlan0]:8080",
+            "http",
+            &allowed,
+        ));
+        assert!(is_same_gateway_origin(
+            "https://miro-ego.local",
+            "miro-ego.local:443",
+            "https",
+            &allowed,
+        ));
+        assert!(is_same_gateway_origin(
+            "https://miro-ego.local:443",
+            "miro-ego.local",
+            "https",
+            &allowed,
+        ));
+        assert!(is_same_gateway_origin(
+            "http://localhost",
+            "localhost:80",
+            "http",
+            &allowed,
+        ));
+        assert!(is_same_gateway_origin(
+            "http://localhost:80",
+            "localhost",
+            "http",
+            &allowed,
+        ));
+        assert!(!is_same_gateway_origin(
+            "https://miro-ego.local:8443",
+            "miro-ego.local",
+            "https",
+            &allowed,
+        ));
+        assert!(!is_same_gateway_origin(
+            "http://localhost:8080",
+            "localhost",
             "http",
             &allowed,
         ));

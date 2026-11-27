@@ -13,7 +13,13 @@ LDLIBS ?= -lmultimedia -lpthread
 ifneq ($(strip $(HB_SDK_ROOT)),)
 CFLAGS += -DHB_SDK_ROOT -I$(HB_SDK_ROOT)/include
 LDFLAGS += -L$(HB_SDK_ROOT)/lib -Wl,-rpath,$(HB_SDK_ROOT)/lib
+ifneq ($(wildcard $(HB_SDK_ROOT)/lib/libhbmem.so),)
 LDLIBS += -lhbmem
+endif
+else
+ifneq ($(wildcard /usr/hobot/lib/libhbmem.so),)
+LDLIBS += -lhbmem
+endif
 endif
 DESTDIR ?= .
 

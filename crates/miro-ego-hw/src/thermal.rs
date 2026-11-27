@@ -1,13 +1,14 @@
 //! RDK X5 SoC thermal zone reader (`/sys/class/thermal/thermal_zone*/temp`) and
-//! device-tree board model reader (`/proc/device-tree/model`).
+//! device-tree board model reader (`/sys/firmware/devicetree/base/model`).
 
 use crate::{HwError, HwResult};
+use miro_ego_core::sys::fs::read_bounded_bytes;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
 pub const DEFAULT_THERMAL_ROOT: &str = "/sys/class/thermal";
-pub const DEFAULT_BOARD_MODEL_PATH: &str = "/proc/device-tree/model";
+pub const DEFAULT_BOARD_MODEL_PATH: &str = "/sys/firmware/devicetree/base/model";
 pub const RDK_X5_BOARD_MODEL: &str = "D-Robotics RDK X5 V1.0";
 pub const MIN_VALID_TEMP_C: f64 = -40.0;
 pub const MAX_VALID_TEMP_C: f64 = 125.0;
@@ -89,7 +90,7 @@ pub fn read_soc_temperature_c() -> Option<f64> {
 
 /// Read and normalize the device-tree board model string from `path`.
 pub fn read_board_model_from(path: &Path) -> HwResult<String> {
-    let raw = fs::read(path).map_err(|err| {
+    let raw = read_bounded_bytes(path, MAX_MODEL_BYTES).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             HwError::Unavailable {
                 message: format!("board model file not found: {}", path.display()),
@@ -100,11 +101,6 @@ pub fn read_board_model_from(path: &Path) -> HwResult<String> {
             }
         }
     })?;
-    if raw.len() > MAX_MODEL_BYTES {
-        return Err(HwError::Io {
-            message: format!("board model exceeds {MAX_MODEL_BYTES} bytes"),
-        });
-    }
     let trimmed = String::from_utf8_lossy(&raw);
     let cleaned: Vec<&str> = trimmed
         .trim_matches(|c: char| c == '\0' || c.is_whitespace())
@@ -118,7 +114,7 @@ pub fn read_board_model_from(path: &Path) -> HwResult<String> {
     Ok(cleaned.join(" "))
 }
 
-/// Read and normalize `/proc/device-tree/model`.
+/// Read and normalize `/sys/firmware/devicetree/base/model`.
 pub fn read_board_model() -> HwResult<String> {
     read_board_model_from(Path::new(DEFAULT_BOARD_MODEL_PATH))
 }
@@ -180,6 +176,13 @@ mod tests {
         assert_eq!(model, "D-Robotics RDK X5 V1.0");
         assert!(is_rdk_x5_model(&model));
         assert!(!is_rdk_x5_model("Raspberry Pi 5 Model B"));
+
+        let oversized_path = dir.join("oversized-model");
+        fs::write(&oversized_path, vec![b'A'; MAX_MODEL_BYTES + 1]).unwrap();
+        assert!(matches!(
+            read_board_model_from(&oversized_path),
+            Err(HwError::Io { .. })
+        ));
 
         fs::remove_dir_all(dir).unwrap();
     }

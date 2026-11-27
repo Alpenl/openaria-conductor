@@ -1,5 +1,6 @@
 d /var/lib/miro-ego 0750 miro-ego miro-ego -
-d /data 0755 root root -
+d /data - - - -
+d /var/lib/miro-ego-deploy 0750 root root -
 d /var/lib/miro-ego-network 0750 root root -
 d /etc/miro-ego 0750 root miro-ego -
 d /run/miro-ego 0750 root miro-ego -

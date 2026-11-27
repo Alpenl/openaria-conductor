@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -2035,10 +2035,60 @@ fn sanitize_ndjson_with_filter(
     let mut chunk = vec![0_u8; CHUNK_BYTES];
     let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut read_offset = 0_u64;
-    let mut line_start_offset = 0_u64;
-    let mut write_offset = 0_u64;
+    let mut prefix_end = 0_u64;
     let mut valid_count = 0_u64;
     let mut needs_truncate = false;
+    let mut saw_skip = false;
+    let mut tmp_writer: Option<(PathBuf, BufWriter<File>)> = None;
+
+    let open_compaction_tmp = |prefix_bytes: u64| -> StorageResult<(PathBuf, BufWriter<File>)> {
+        let fname = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            StorageError::invalid_input("invalid_path", "invalid ndjson filename")
+        })?;
+        let tmp_path = path.with_file_name(format!("{fname}.tmp"));
+        let tmp_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o640)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp_path)
+            .map_err(|err| {
+                StorageError::io(
+                    "recovery_ndjson_compact",
+                    "create ndjson compaction tmp",
+                    err,
+                )
+            })?;
+        let mut writer = BufWriter::with_capacity(CHUNK_BYTES, tmp_file);
+        let mut copy_off = 0_u64;
+        let mut copy_buf = vec![0_u8; CHUNK_BYTES];
+        while copy_off < prefix_bytes {
+            let want = usize::try_from((prefix_bytes - copy_off).min(CHUNK_BYTES as u64))
+                .unwrap_or(CHUNK_BYTES);
+            let off = libc::off_t::try_from(copy_off).map_err(|_| {
+                StorageError::integrity("recovery_ndjson_invalid", "ndjson offset overflow")
+            })?;
+            let read =
+                pread_retry(file.as_raw_fd(), &mut copy_buf[..want], off).map_err(|err| {
+                    StorageError::io("recovery_ndjson_read", "copy ndjson prefix to tmp", err)
+                })?;
+            if read == 0 {
+                break;
+            }
+            if let Err(err) = writer.write_all(&copy_buf[..read]) {
+                drop(writer);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(StorageError::io(
+                    "recovery_ndjson_compact",
+                    "write ndjson prefix to tmp",
+                    err,
+                ));
+            }
+            copy_off += read as u64;
+        }
+        Ok((tmp_path, writer))
+    };
 
     'scan: while read_offset < file_size {
         let to_read = usize::try_from((file_size - read_offset).min(CHUNK_BYTES as u64))
@@ -2070,32 +2120,38 @@ fn sanitize_ndjson_with_filter(
                 let trimmed = &line_buf[..line_buf.len() - 1];
                 if trimmed.is_empty() {
                     needs_truncate = true;
+                    saw_skip = true;
                     line_buf.clear();
-                    line_start_offset = read_offset + consumed_in_chunk;
                     continue;
                 }
                 if let Ok(parsed_val) = serde_json::from_slice::<Value>(trimmed) {
                     if !keep_record(valid_count, &parsed_val) {
                         needs_truncate = true;
+                        saw_skip = true;
                         line_buf.clear();
-                        line_start_offset = read_offset + consumed_in_chunk;
                         continue;
                     }
-                    if write_offset < line_start_offset {
-                        pwrite_all_fd(file.as_raw_fd(), &line_buf, write_offset).map_err(
-                            |err| {
-                                StorageError::io(
-                                    "recovery_ndjson_compact",
-                                    "compact sanitized ndjson in-place",
-                                    err,
-                                )
-                            },
-                        )?;
+                    if !saw_skip {
+                        prefix_end = read_offset + consumed_in_chunk;
+                    } else {
+                        if tmp_writer.is_none() {
+                            tmp_writer = Some(open_compaction_tmp(prefix_end)?);
+                        }
+                        if let Some((ref tmp_path, ref mut writer)) = tmp_writer
+                            && let Err(err) = writer.write_all(&line_buf)
+                        {
+                            let cleanup_path = tmp_path.clone();
+                            drop(tmp_writer.take());
+                            let _ = fs::remove_file(&cleanup_path);
+                            return Err(StorageError::io(
+                                "recovery_ndjson_compact",
+                                "write sanitized ndjson record to tmp",
+                                err,
+                            ));
+                        }
                     }
-                    write_offset += line_buf.len() as u64;
                     valid_count += 1;
                     line_buf.clear();
-                    line_start_offset = read_offset + consumed_in_chunk;
                 } else {
                     needs_truncate = true;
                     line_buf.clear();
@@ -2119,8 +2175,48 @@ fn sanitize_ndjson_with_filter(
         needs_truncate = true;
     }
 
-    if needs_truncate || write_offset < file_size {
-        ftruncate_ndjson_fd(file.as_raw_fd(), write_offset).map_err(|err| {
+    if let Some((tmp_path, mut writer)) = tmp_writer {
+        if let Err(err) = writer.flush() {
+            drop(writer);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(StorageError::io(
+                "recovery_ndjson_compact",
+                "flush sanitized ndjson tmp",
+                err,
+            ));
+        }
+        let tmp_file = writer.into_inner().map_err(|err| {
+            let _ = fs::remove_file(&tmp_path);
+            StorageError::io(
+                "recovery_ndjson_compact",
+                "unwrap sanitized ndjson tmp writer",
+                err.into_error(),
+            )
+        })?;
+        if let Err(err) = tmp_file.sync_all() {
+            drop(tmp_file);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(StorageError::io(
+                "recovery_ndjson_sync",
+                "fsync sanitized ndjson tmp",
+                err,
+            ));
+        }
+        drop(tmp_file);
+        drop(file);
+        if let Err(err) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(StorageError::io(
+                "recovery_ndjson_compact",
+                "rename sanitized ndjson tmp over target",
+                err,
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            let _ = fsync_directory(parent);
+        }
+    } else if needs_truncate || prefix_end < file_size {
+        ftruncate_ndjson_fd(file.as_raw_fd(), prefix_end).map_err(|err| {
             StorageError::io(
                 "recovery_ndjson_truncate",
                 "ftruncate sanitized ndjson file",
@@ -2133,32 +2229,6 @@ fn sanitize_ndjson_with_filter(
     }
 
     Ok(valid_count)
-}
-
-fn pwrite_all_fd(fd: libc::c_int, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
-    while !buf.is_empty() {
-        let off = libc::off_t::try_from(offset)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pwrite offset overflow"))?;
-        // SAFETY: `fd` is a valid open file descriptor and `buf` points to valid memory.
-        let written = unsafe { libc::pwrite(fd, buf.as_ptr().cast(), buf.len(), off) };
-        if written < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        if written == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "pwrite returned zero bytes",
-            ));
-        }
-        let n = written as usize;
-        buf = &buf[n..];
-        offset += n as u64;
-    }
-    Ok(())
 }
 
 fn ftruncate_ndjson_fd(fd: libc::c_int, new_size: u64) -> io::Result<()> {

@@ -371,6 +371,7 @@ async fn full_stack_live_http_e2e_with_real_c_shm_encoder_and_network_rpc() {
         install_root: root.join("opt"),
         config_root: root.join("etc"),
         state_root: system_dir.clone(),
+        deploy_state_root: root.join("var/lib/miro-ego-deploy"),
         run_dir: root.join("deploy-run"),
         system_root: root.join("sysroot"),
     };

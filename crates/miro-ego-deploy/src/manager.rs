@@ -19,7 +19,8 @@ use miro_ego_core::paths::{
     SYSTEM_CONFIG_DIR, SYSTEM_INSTALL_ROOT, SYSTEM_RUN_DIR, SYSTEM_STATE_DIR,
 };
 use miro_ego_core::sys::fs::{
-    fsync_directory, open_directory_safe, read_bounded_bytes, read_bounded_json, write_bytes_atomic,
+    fsync_directory, open_directory_safe, openat_retry, read_bounded_bytes, read_bounded_json,
+    write_bytes_atomic,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
@@ -28,12 +29,13 @@ use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureSch
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,6 +46,7 @@ pub const INSTALLED_ASSETS_SCHEMA: &str = "miro-ego.installed-assets.v1";
 pub const INSTALL_TRANSACTION_SCHEMA: &str = "miro-ego.install-transaction.v1";
 pub const ACTIVATION_FAILURE_SCHEMA: &str = "miro-ego.activation-failure.v1";
 pub const DEPLOYMENT_LOCK_NAME: &str = "deployment.lock";
+pub const SYSTEM_DEPLOY_STATE_DIR: &str = "/var/lib/miro-ego-deploy";
 pub const MAX_DEPLOY_JSON_BYTES: usize = 64 * 1024;
 const INSTALLED_ASSETS_FILENAME: &str = "installed-assets.json";
 
@@ -522,6 +525,19 @@ fn format_authority_host(addr: &SocketAddr) -> String {
     }
 }
 
+fn validate_http_header_token(token: &str, label: &str) -> DeployResult<()> {
+    if token.is_empty()
+        || token
+            .bytes()
+            .any(|b| b == b'\r' || b == b'\n' || b < 0x20 || b == 0x7f)
+    {
+        return Err(DeployError::Failed {
+            message: format!("{label} contains invalid control or newline characters"),
+        });
+    }
+    Ok(())
+}
+
 /// Loopback HTTP/HTTPS health checker querying `GET /api/v1/device` until healthy or timed out.
 #[derive(Debug, Clone)]
 pub struct LocalHttpHealthChecker {
@@ -600,6 +616,7 @@ fn resolve_probe_target_from_path(
                     message: "customer bearer token file is empty".to_owned(),
                 });
             }
+            validate_http_header_token(&token, "customer bearer token")?;
             let cert_pem = read_bounded_bytes(&tls_certificate_file, 64 * 1024).map_err(|err| {
                 DeployError::Failed {
                     message: format!(
@@ -637,6 +654,9 @@ impl LocalHttpHealthChecker {
         cert_pem: &[u8],
         bearer_token: Option<String>,
     ) -> DeployResult<Self> {
+        if let Some(ref tok) = bearer_token {
+            validate_http_header_token(tok, "bearer_token")?;
+        }
         self.tls_config = Some(build_pinned_tls_client_config(cert_pem)?);
         self.bearer_token = bearer_token;
         self.config_path = None;
@@ -850,6 +870,7 @@ pub struct ReleaseManagerPaths {
     pub install_root: PathBuf,
     pub config_root: PathBuf,
     pub state_root: PathBuf,
+    pub deploy_state_root: PathBuf,
     pub run_dir: PathBuf,
     pub system_root: PathBuf,
 }
@@ -860,8 +881,21 @@ impl ReleaseManagerPaths {
             install_root: PathBuf::from(SYSTEM_INSTALL_ROOT),
             config_root: PathBuf::from(SYSTEM_CONFIG_DIR),
             state_root: PathBuf::from(SYSTEM_STATE_DIR),
+            deploy_state_root: PathBuf::from(SYSTEM_DEPLOY_STATE_DIR),
             run_dir: PathBuf::from(SYSTEM_RUN_DIR),
             system_root: PathBuf::from("/"),
+        }
+    }
+
+    pub fn for_system_root(system_root: impl Into<PathBuf>) -> Self {
+        let system_root = system_root.into();
+        Self {
+            install_root: system_root.join("opt/miro-ego"),
+            config_root: system_root.join("etc/miro-ego"),
+            state_root: system_root.join("var/lib/miro-ego"),
+            deploy_state_root: system_root.join("var/lib/miro-ego-deploy"),
+            run_dir: system_root.join("run/miro-ego"),
+            system_root,
         }
     }
 
@@ -870,15 +904,15 @@ impl ReleaseManagerPaths {
     }
 
     pub fn transaction_file(&self) -> PathBuf {
-        self.state_root.join("install-transaction.json")
+        self.deploy_state_root.join("install-transaction.json")
     }
 
     pub fn activation_failure_file(&self) -> PathBuf {
-        self.state_root.join("activation-failure.json")
+        self.deploy_state_root.join("activation-failure.json")
     }
 
     pub fn firmware_task_file(&self) -> PathBuf {
-        self.state_root.join("firmware-task.json")
+        self.deploy_state_root.join("firmware-task.json")
     }
 
     pub fn deployment_lock_file(&self) -> PathBuf {
@@ -1011,10 +1045,10 @@ impl ReleaseManager {
             self.quiesce_services()?;
         }
 
-        let release_dir = match staged_before_quiesce {
-            Some(dir) => dir,
+        let (release_dir, backup_dir) = match staged_before_quiesce {
+            Some(pair) => pair,
             None => match self.stage_release(verified) {
-                Ok(dir) => dir,
+                Ok(pair) => pair,
                 Err(err) => {
                     if quiesced {
                         locks.drop_maintenance();
@@ -1046,11 +1080,21 @@ impl ReleaseManager {
             self.bootstrap_system()?;
             if release_changed {
                 self.switch_current_for_transaction(&tx)?;
+            } else {
+                let _ = self.read_release_metadata(&tx.new_current)?;
+                let mut switched = tx.clone();
+                switched.state = TransactionState::Switched;
+                self.write_transaction(&switched)?;
             }
             Ok(())
         })();
 
         if let Err(err) = switch_res {
+            if let Some(bak) = backup_dir {
+                let _ = fs::remove_dir_all(&release_dir);
+                let _ = fs::rename(&bak, &release_dir);
+                let _ = fsync_directory(&self.paths.releases_dir());
+            }
             if let Some(old) = &old_current {
                 let old_dir = self.paths.releases_dir().join(old);
                 let _ = self.sync_assets_between_releases(Some(&release_dir), &old_dir);
@@ -1082,9 +1126,14 @@ impl ReleaseManager {
                 old_previous.as_deref(),
                 committed_previous,
                 &new_commit,
+                backup_dir.as_deref(),
             )?;
         } else {
             self.finalize_verified_switch(&new_commit, committed_previous)?;
+            if let Some(bak) = backup_dir {
+                let _ = fs::remove_dir_all(bak);
+                let _ = fsync_directory(&self.paths.releases_dir());
+            }
         }
 
         self.status()
@@ -1158,6 +1207,7 @@ impl ReleaseManager {
                 Some(&previous),
                 committed_previous,
                 &previous,
+                None,
             )?;
         } else {
             self.finalize_verified_switch(&previous, committed_previous)?;
@@ -1364,16 +1414,21 @@ impl ReleaseManager {
         old_previous: Option<&str>,
         committed_previous: Option<&str>,
         new_current: &str,
+        backup_dir: Option<&Path>,
     ) -> DeployResult<()> {
         match self.start_services(true) {
             Ok(()) => {
                 self.finalize_verified_switch(new_current, committed_previous)?;
+                if let Some(bak) = backup_dir {
+                    let _ = fs::remove_dir_all(bak);
+                    let _ = fsync_directory(&self.paths.releases_dir());
+                }
                 let _ = fs::remove_file(self.paths.activation_failure_file());
                 Ok(())
             }
             Err(activation_err) => {
                 let release_changed = old_current != Some(new_current);
-                let rolled_back_to = if release_changed {
+                let rolled_back_to = if release_changed || backup_dir.is_some() {
                     old_current.map(str::to_owned)
                 } else {
                     None
@@ -1389,6 +1444,21 @@ impl ReleaseManager {
                 let rollback_result: DeployResult<()> = if let Some(old) = old_current {
                     if release_changed {
                         self.restore_previous_release(Some(new_current), old, old_previous)
+                    } else if let Some(bak) = backup_dir {
+                        let target_dir = self.paths.releases_dir().join(old);
+                        let _ = fs::remove_dir_all(&target_dir);
+                        match fs::rename(bak, &target_dir) {
+                            Ok(()) => {
+                                let _ = fsync_directory(&self.paths.releases_dir());
+                                self.restore_previous_release(None, old, old_previous)
+                            }
+                            Err(err) => Err(DeployError::Failed {
+                                message: format!(
+                                    "failed restoring backup release {}: {err}",
+                                    target_dir.display()
+                                ),
+                            }),
+                        }
                     } else {
                         let deact = self.deactivate_units(false);
                         let rev = self.revert_to_previous_links(Some(old), old_previous);
@@ -1447,7 +1517,7 @@ impl ReleaseManager {
         Ok(())
     }
 
-    fn stage_release(&self, verified: &VerifiedBundle) -> DeployResult<PathBuf> {
+    fn stage_release(&self, verified: &VerifiedBundle) -> DeployResult<(PathBuf, Option<PathBuf>)> {
         let releases = self.paths.releases_dir();
         let final_dir = releases.join(verified.commit());
         if final_dir.exists() && self.release_is_complete(verified.commit()) {
@@ -1456,7 +1526,7 @@ impl ReleaseManager {
                     if !verified.payloads_verified() {
                         let _ = verify_bundle_dir(&verified.root)?;
                     }
-                    return Ok(final_dir);
+                    return Ok((final_dir, None));
                 }
             }
         }
@@ -1468,7 +1538,7 @@ impl ReleaseManager {
         ));
         create_dir_with_mode(&stage_dir, 0o755)?;
 
-        let stage_result = (|| -> DeployResult<()> {
+        let stage_result = (|| -> DeployResult<Option<PathBuf>> {
             for entry in verified.all_entries() {
                 let rel = Path::new(&entry.path);
                 let dst = stage_dir.join(&entry.path);
@@ -1531,17 +1601,16 @@ impl ReleaseManager {
                 });
             }
             let _ = fsync_directory(&releases);
-            if let Some(bak) = backup {
-                let _ = fs::remove_dir_all(bak);
-            }
-            Ok(())
+            Ok(backup)
         })();
 
-        if stage_result.is_err() {
-            let _ = fs::remove_dir_all(&stage_dir);
+        match stage_result {
+            Ok(backup) => Ok((final_dir, backup)),
+            Err(err) => {
+                let _ = fs::remove_dir_all(&stage_dir);
+                Err(err)
+            }
         }
-        stage_result?;
-        Ok(final_dir)
     }
 
     /// Synchronize system/config assets when switching from `from_release_dir` to `to_release_dir`,
@@ -1849,7 +1918,7 @@ impl ReleaseManager {
         self.prune_releases(&keep)?;
 
         let _ = fs::remove_file(self.paths.transaction_file());
-        let _ = fsync_directory(&self.paths.state_root);
+        let _ = fsync_directory(&self.paths.deploy_state_root);
         Ok(())
     }
 
@@ -1875,7 +1944,7 @@ impl ReleaseManager {
         self.prune_releases(&keep)?;
 
         let _ = fs::remove_file(self.paths.transaction_file());
-        let _ = fsync_directory(&self.paths.state_root);
+        let _ = fsync_directory(&self.paths.deploy_state_root);
         Ok(())
     }
 
@@ -1949,14 +2018,25 @@ impl ReleaseManager {
         Ok(())
     }
 
+    fn resolve_system_path(&self, raw: &Path) -> PathBuf {
+        if self.paths.system_root != Path::new("/") {
+            if let Ok(rel) = raw.strip_prefix("/") {
+                return self.paths.system_root.join(rel);
+            }
+        }
+        raw.to_path_buf()
+    }
+
     fn ensure_service_ownership_if_root(&self) -> DeployResult<()> {
         create_dir_with_mode(&self.paths.config_root, 0o750)?;
         create_dir_with_mode(&self.paths.state_root, 0o750)?;
+        create_dir_with_mode(&self.paths.deploy_state_root, 0o750)?;
         create_dir_with_mode(&self.paths.run_dir, 0o750)?;
 
         if unsafe { libc::geteuid() } != 0 {
             return Ok(());
         }
+        chown_path(&self.paths.deploy_state_root, 0, 0);
         let (Some(uid), Some(gid)) = lookup_miro_ego_uid_gid() else {
             return Ok(());
         };
@@ -1967,13 +2047,27 @@ impl ReleaseManager {
             "button.json",
             "network.json",
             "bearer.token",
+            "calibration.json",
         ] {
             let p = self.paths.config_root.join(name);
-            if fs::symlink_metadata(&p).is_ok() {
+            if fs::symlink_metadata(&p).is_ok_and(|m| !m.file_type().is_symlink()) {
                 chown_path(&p, 0, gid);
             }
         }
+        chown_subdirs_nofollow(&self.paths.config_root, 0, gid);
+
+        let device_cfg_path = self.paths.config_root.join("device.json");
+        for referenced in collect_device_config_referenced_paths(&device_cfg_path) {
+            let resolved = self.resolve_system_path(&referenced);
+            if fs::symlink_metadata(&resolved)
+                .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_file())
+            {
+                chown_path(&resolved, 0, gid);
+            }
+        }
+
         chown_path(&self.paths.state_root, uid, gid);
+        chown_regular_tree_nofollow(&self.paths.state_root, uid, gid);
         chown_path(&self.paths.run_dir, 0, gid);
         Ok(())
     }
@@ -2095,6 +2189,7 @@ impl ReleaseManager {
         create_dir_with_mode(&self.paths.releases_dir(), 0o755)?;
         create_dir_with_mode(&self.paths.config_root, 0o750)?;
         create_dir_with_mode(&self.paths.state_root, 0o750)?;
+        create_dir_with_mode(&self.paths.deploy_state_root, 0o750)?;
         create_dir_with_mode(&self.paths.run_dir, 0o750)?;
         Ok(())
     }
@@ -2385,7 +2480,7 @@ fn discover_extra_release_assets(deploy_dir: &Path) -> Vec<(PathBuf, String, boo
             {
                 extras.push((path, format!("usr/lib/systemd/system/{name}"), false));
             }
-        } else if meta.file_type().is_dir() && name.ends_with(".d") && !name.contains('/') {
+        } else if meta.file_type().is_dir() && crate::bundle::is_allowed_systemd_dropin_dir(&name) {
             if let Ok(sub_entries) = fs::read_dir(&path) {
                 for sub in sub_entries.filter_map(Result::ok) {
                     let sub_path = sub.path();
@@ -2433,25 +2528,141 @@ fn map_lock_err(err: miro_ego_core::CoreError) -> DeployError {
     }
 }
 
-fn lookup_miro_ego_uid_gid() -> (Option<u32>, Option<u32>) {
+fn collect_device_config_referenced_paths(device_cfg_path: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(val) =
+        miro_ego_core::sys::fs::read_bounded_json_value(device_cfg_path, MAX_DEPLOY_JSON_BYTES, 16)
+    else {
+        return out;
+    };
+    if let Some(cal) = val
+        .get("camera")
+        .and_then(|c| c.get("calibration_file"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        out.push(PathBuf::from(cal));
+    }
+    if let Some(sec) = val.get("security").and_then(serde_json::Value::as_object) {
+        for key in [
+            "bearer_token_file",
+            "tls_certificate_file",
+            "tls_private_key_file",
+            "tls_ca_file",
+            "ca_certificate_file",
+        ] {
+            if let Some(p) = sec
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                out.push(PathBuf::from(p));
+            }
+        }
+    }
+    out
+}
+
+fn chown_subdirs_nofollow(root: &Path, uid: u32, gid: u32) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let p = entry.path();
+        if let Ok(meta) = fs::symlink_metadata(&p) {
+            if !meta.file_type().is_symlink() && meta.file_type().is_dir() {
+                chown_path(&p, uid, gid);
+                chown_subdirs_nofollow(&p, uid, gid);
+            }
+        }
+    }
+}
+
+fn chown_regular_tree_nofollow(root: &Path, uid: u32, gid: u32) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let p = entry.path();
+        if let Ok(meta) = fs::symlink_metadata(&p) {
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.file_type().is_file() {
+                chown_path(&p, uid, gid);
+            } else if meta.file_type().is_dir() {
+                chown_path(&p, uid, gid);
+                chown_regular_tree_nofollow(&p, uid, gid);
+            }
+        }
+    }
+}
+
+fn lookup_uid_r(name_c: &CString) -> Option<u32> {
+    let init_len = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
+        n if n > 0 => (n as usize).clamp(1024, 65_536),
+        _ => 4096,
+    };
+    let mut buf = vec![0u8; init_len];
+    loop {
+        let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwnam_r(
+                name_c.as_ptr(),
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                &raw mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1024 * 1024 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc == 0 && !result.is_null() {
+            let pwd = unsafe { pwd.assume_init() };
+            return Some(pwd.pw_uid);
+        }
+        return None;
+    }
+}
+
+fn lookup_gid_r(name_c: &CString) -> Option<u32> {
+    let init_len = match unsafe { libc::sysconf(libc::_SC_GETGR_R_SIZE_MAX) } {
+        n if n > 0 => (n as usize).clamp(1024, 65_536),
+        _ => 4096,
+    };
+    let mut buf = vec![0u8; init_len];
+    loop {
+        let mut grp = std::mem::MaybeUninit::<libc::group>::uninit();
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getgrnam_r(
+                name_c.as_ptr(),
+                grp.as_mut_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                &raw mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 1024 * 1024 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc == 0 && !result.is_null() {
+            let grp = unsafe { grp.assume_init() };
+            return Some(grp.gr_gid);
+        }
+        return None;
+    }
+}
+
+pub(crate) fn lookup_miro_ego_uid_gid() -> (Option<u32>, Option<u32>) {
     let Ok(name_c) = CString::new("miro-ego") else {
         return (None, None);
     };
-    unsafe {
-        let pwd = libc::getpwnam(name_c.as_ptr());
-        let uid = if pwd.is_null() {
-            None
-        } else {
-            Some((*pwd).pw_uid)
-        };
-        let grp = libc::getgrnam(name_c.as_ptr());
-        let gid = if grp.is_null() {
-            None
-        } else {
-            Some((*grp).gr_gid)
-        };
-        (uid, gid)
-    }
+    (lookup_uid_r(&name_c), lookup_gid_r(&name_c))
 }
 
 fn chown_path(path: &Path, uid: u32, gid: u32) {
@@ -2469,40 +2680,103 @@ fn chown_path(path: &Path, uid: u32, gid: u32) {
 }
 
 fn create_dir_with_mode(path: &Path, mode: u32) -> DeployResult<()> {
+    let existed = fs::symlink_metadata(path).is_ok();
     fs::create_dir_all(path).map_err(|err| DeployError::Failed {
         message: format!("failed creating directory {}: {err}", path.display()),
     })?;
     let dir_file = open_directory_safe(path).map_err(|err| DeployError::Failed {
         message: format!("directory {} is unsafe or a symlink: {err}", path.display()),
     })?;
-    dir_file
-        .set_permissions(fs::Permissions::from_mode(mode))
-        .map_err(|err| DeployError::Failed {
-            message: format!("failed chmod directory {}: {err}", path.display()),
-        })
+    if !existed || mode == 0o750 {
+        dir_file
+            .set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|err| DeployError::Failed {
+                message: format!("failed chmod directory {}: {err}", path.display()),
+            })?;
+    }
+    Ok(())
 }
 
-/// Ensure every directory between `stop_root` and `dir` exists with explicit mode (immune to UMask).
+/// Ensure every directory between `stop_root` and `dir` exists using `open_directory_safe` /
+/// `openat(O_DIRECTORY | O_NOFOLLOW)`, applying explicit mode ONLY to newly created directories.
 fn ensure_dir_tree_mode(dir: &Path, stop_root: &Path, leaf_mode: u32) -> DeployResult<()> {
-    let mut missing = Vec::new();
-    let mut cur = dir;
-    while cur != stop_root && !cur.exists() {
-        missing.push(cur.to_path_buf());
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => break,
-        }
-    }
-    for entry in missing.into_iter().rev() {
-        let mode = if entry == dir { leaf_mode } else { 0o755 };
-        create_dir_with_mode(&entry, mode)?;
-    }
-    if dir != stop_root && dir.exists() {
-        fs::set_permissions(dir, fs::Permissions::from_mode(leaf_mode)).map_err(|err| {
-            DeployError::Failed {
-                message: format!("failed chmod directory {}: {err}", dir.display()),
-            }
+    let rel = dir
+        .strip_prefix(stop_root)
+        .map_err(|_| DeployError::Failed {
+            message: format!(
+                "directory {} is not under root {}",
+                dir.display(),
+                stop_root.display()
+            ),
         })?;
+    let mut cur_dir: File = open_directory_safe(stop_root).map_err(|err| DeployError::Failed {
+        message: format!(
+            "root directory {} is unsafe or a symlink: {err}",
+            stop_root.display()
+        ),
+    })?;
+
+    let comps: Vec<_> = rel
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect();
+    for (idx, comp) in comps.iter().enumerate() {
+        let Component::Normal(seg) = comp else {
+            return Err(DeployError::Failed {
+                message: format!("invalid directory component in {}", dir.display()),
+            });
+        };
+        let seg_c = CString::new(seg.as_bytes()).map_err(|_| DeployError::Failed {
+            message: format!("directory name contains NUL byte: {}", dir.display()),
+        })?;
+        let is_leaf = idx + 1 == comps.len();
+        let mode = if is_leaf { leaf_mode } else { 0o755 };
+        let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        cur_dir = match openat_retry(cur_dir.as_raw_fd(), &seg_c, dir_flags) {
+            Ok(existing) => existing,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let mut created = false;
+                // SAFETY: `cur_dir` is an open directory fd and `seg_c` is NUL-terminated.
+                if unsafe { libc::mkdirat(cur_dir.as_raw_fd(), seg_c.as_ptr(), mode) } == 0 {
+                    created = true;
+                } else {
+                    let mk_err = std::io::Error::last_os_error();
+                    if mk_err.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(DeployError::Failed {
+                            message: format!(
+                                "failed creating directory {}: {mk_err}",
+                                dir.display()
+                            ),
+                        });
+                    }
+                }
+                let next_dir =
+                    openat_retry(cur_dir.as_raw_fd(), &seg_c, dir_flags).map_err(|open_err| {
+                        DeployError::Failed {
+                            message: format!(
+                                "directory {} is unsafe or a symlink: {open_err}",
+                                dir.display()
+                            ),
+                        }
+                    })?;
+                if created {
+                    next_dir
+                        .set_permissions(fs::Permissions::from_mode(mode))
+                        .map_err(|chmod_err| DeployError::Failed {
+                            message: format!(
+                                "failed chmod newly created directory {}: {chmod_err}",
+                                dir.display()
+                            ),
+                        })?;
+                }
+                next_dir
+            }
+            Err(err) => {
+                return Err(DeployError::Failed {
+                    message: format!("directory {} is unsafe or a symlink: {err}", dir.display()),
+                });
+            }
+        };
     }
     Ok(())
 }
@@ -2524,13 +2798,7 @@ mod tests {
             "miro-ego-deploy-{tag}-{}-{unique}",
             std::process::id()
         ));
-        let paths = ReleaseManagerPaths {
-            install_root: root.join("opt/miro-ego"),
-            config_root: root.join("etc/miro-ego"),
-            state_root: root.join("var/lib/miro-ego"),
-            run_dir: root.join("run/miro-ego"),
-            system_root: root.clone(),
-        };
+        let paths = ReleaseManagerPaths::for_system_root(&root);
         fs::create_dir_all(&root).unwrap();
         (root, paths)
     }
@@ -3348,6 +3616,97 @@ mod tests {
                 .join("etc/systemd/system/miro-ego.service.d/20-v2.conf")
                 .exists(),
             "explicit rollback must remove v2-only drop-in"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_commit_reinstall_persists_switched_tx_and_restores_backup_on_activation_failure() {
+        let (root, paths) = temp_env("same-commit-backup");
+        let c1 = "1".repeat(40);
+        let b1 = root.join("bundles/v1");
+        let b1_reinstall = root.join("bundles/v1-reinstall");
+        build_valid_bundle(
+            &b1,
+            "0.3.0",
+            &c1,
+            &[("miro-ego.service", b"[Unit]\nDescription=orig\n", false)],
+        );
+        build_valid_bundle(
+            &b1_reinstall,
+            "0.3.0-patch1",
+            &c1,
+            &[("miro-ego.service", b"[Unit]\nDescription=broken\n", false)],
+        );
+
+        let health = Arc::new(ToggleHealth {
+            healthy: AtomicBool::new(true),
+        });
+        let mgr = ReleaseManager::new(paths.clone(), MockSystemctl::new(), health.clone());
+        mgr.install(&b1, true).unwrap();
+        assert!(paths.deploy_state_root.is_dir());
+        assert!(!paths.state_root.join("install-transaction.json").exists());
+
+        // Check Switched transaction state during activation AND backup preservation on failure!
+        struct VerifySwitchedThenFail {
+            paths: ReleaseManagerPaths,
+            saw_switched: AtomicBool,
+        }
+        impl HealthChecker for VerifySwitchedThenFail {
+            fn check_health(&self) -> DeployResult<()> {
+                let tx = ReleaseManager::new(
+                    self.paths.clone(),
+                    MockSystemctl::new(),
+                    Arc::new(ToggleHealth {
+                        healthy: AtomicBool::new(true),
+                    }),
+                )
+                .read_transaction()
+                .unwrap()
+                .expect("Switched tx must exist during same-commit reinstall activation");
+                assert_eq!(tx.state, TransactionState::Switched);
+                self.saw_switched.store(true, Ordering::SeqCst);
+                Err(DeployError::Failed {
+                    message: "simulated same-commit activation failure".to_owned(),
+                })
+            }
+        }
+        let fail_health = Arc::new(VerifySwitchedThenFail {
+            paths: paths.clone(),
+            saw_switched: AtomicBool::new(false),
+        });
+        let mgr_fail =
+            ReleaseManager::new(paths.clone(), MockSystemctl::new(), fail_health.clone());
+        assert!(mgr_fail.install(&b1_reinstall, true).is_err());
+        assert!(fail_health.saw_switched.load(Ordering::SeqCst));
+        assert!(paths.activation_failure_file().is_file());
+
+        // Backup of original 0.3.0 release MUST have been restored!
+        let restored_meta = mgr.read_release_metadata(&c1).unwrap();
+        assert_eq!(restored_meta.version, "0.3.0");
+        let unit_txt =
+            fs::read_to_string(root.join("usr/lib/systemd/system/miro-ego.service")).unwrap();
+        assert!(unit_txt.contains("Description=orig"));
+
+        // Ensure drop-in allowlist & bundle path check reject arbitrary drop-in dirs and CRLF tokens.
+        assert!(!crate::bundle::is_allowed_bundle_asset_path(
+            "deploy/miro-ego/sshd.service.d/evil.conf"
+        ));
+        assert!(crate::bundle::is_allowed_bundle_asset_path(
+            "deploy/miro-ego/fstrim.service.d/50-miro-ego-idle.conf"
+        ));
+        assert!(
+            LocalHttpHealthChecker::new("127.0.0.1:8080".parse().unwrap(), Duration::from_secs(1))
+                .with_tls_and_bearer(
+                    rcgen::generate_simple_self_signed(vec!["localhost".into()])
+                        .unwrap()
+                        .cert
+                        .pem()
+                        .as_bytes(),
+                    Some("bad\r\ntoken".to_owned()),
+                )
+                .is_err()
         );
 
         fs::remove_dir_all(root).unwrap();

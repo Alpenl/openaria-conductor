@@ -333,6 +333,28 @@ impl ReceiptStore {
         }
     }
 
+    /// Roll back an aborted `SafeSwap` receipt (and optional `stop_capture` idempotency entry)
+    /// when post-commit zero-handle verification detects lingering handles.
+    pub(super) fn rollback_safe_swap_bundle(
+        &self,
+        idem_key: Option<(&str, &str)>,
+        volume_writable: bool,
+    ) {
+        self.ensure_loaded_from_disk(volume_writable);
+        let Ok(mut guard) = self.state.lock() else {
+            return;
+        };
+        guard.receipts.safe_swap = None;
+        if let Some((principal_id, key)) = idem_key {
+            guard.receipts.idempotency.retain(|r| {
+                !(r.principal_id == principal_id && r.operation == "stop_capture" && r.key == key)
+            });
+        }
+        if volume_writable {
+            self.persist_locked(&mut guard.receipts);
+        }
+    }
+
     pub(super) fn set_pending_delete_intent(
         &self,
         intent: Option<PendingDeleteIntent>,
@@ -348,19 +370,17 @@ impl ReceiptStore {
         }
     }
 
-    pub(super) fn take_pending_delete_intent(
+    /// Peek any uncompleted `PendingDeleteIntent` without clearing it from disk until
+    /// `commit_delete_sessions_bundle` succeeds after unlink + `forget_paths`.
+    pub(super) fn peek_pending_delete_intent(
         &self,
         volume_writable: bool,
     ) -> Option<PendingDeleteIntent> {
         self.ensure_loaded_from_disk(volume_writable);
-        let Ok(mut guard) = self.state.lock() else {
+        let Ok(guard) = self.state.lock() else {
             return None;
         };
-        let taken = guard.receipts.pending_delete.take();
-        if taken.is_some() && volume_writable {
-            self.persist_locked(&mut guard.receipts);
-        }
-        taken
+        guard.receipts.pending_delete.clone()
     }
 
     /// Atomically clear `pending_delete` and commit the `delete_sessions` idempotency receipt

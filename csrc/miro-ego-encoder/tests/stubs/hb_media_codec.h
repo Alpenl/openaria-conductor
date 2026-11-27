@@ -62,18 +62,8 @@ typedef struct {
 
 typedef struct {
     uint32_t frame_rate;
-    uint32_t bit_rate;
-    uint32_t max_bit_rate;
     uint32_t intra_period;
     uint32_t intra_qp;
-    int initial_rc_qp;
-    int vbv_buf_size;
-    uint32_t min_qp_I;
-    uint32_t min_qp_P;
-    uint32_t min_qp_B;
-    uint32_t max_qp_I;
-    uint32_t max_qp_P;
-    uint32_t max_qp_B;
     int qp_map_enable;
 } mc_rate_control_vbr_t;
 

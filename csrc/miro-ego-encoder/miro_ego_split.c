@@ -46,6 +46,36 @@ static inline void copy_row_fast(uint8_t *dst, const uint8_t *src, size_t width)
 #endif
 }
 
+static int compute_nv12_dst_bytes(const miro_ego_nv12_frame_t *dst,
+                                  int dst_stride,
+                                  int height,
+                                  uint32_t target_capacity,
+                                  uint64_t *out_bytes)
+{
+    const uint64_t total_rows = (uint64_t)height + (uint64_t)height / 2ULL;
+    if ((uint64_t)dst_stride > UINT64_MAX / total_rows) {
+        return -1;
+    }
+    const uint64_t dst_y_bytes = (uint64_t)dst_stride * (uint64_t)height;
+    const uint64_t dst_uv_bytes = (uint64_t)dst_stride * ((uint64_t)height / 2ULL);
+    uint64_t dst_bytes = (uint64_t)dst_stride * total_rows;
+
+    const uintptr_t y_addr = (uintptr_t)dst->y;
+    const uintptr_t uv_addr = (uintptr_t)dst->uv;
+    if (uv_addr >= y_addr && (uint64_t)(uv_addr - y_addr) <= (uint64_t)target_capacity) {
+        const uint64_t uv_offset = (uint64_t)(uv_addr - y_addr);
+        if (uv_offset < dst_y_bytes || uv_offset > UINT64_MAX - dst_uv_bytes) {
+            return -1;
+        }
+        dst_bytes = uv_offset + dst_uv_bytes;
+    }
+    if (dst_bytes > (uint64_t)target_capacity || dst_bytes > UINT32_MAX) {
+        return -1;
+    }
+    *out_bytes = dst_bytes;
+    return 0;
+}
+
 int miro_ego_split_eye_nv12(const miro_ego_nv12_frame_t *src,
                             miro_ego_nv12_frame_t *dst,
                             int eye_width,
@@ -75,16 +105,14 @@ int miro_ego_split_eye_nv12(const miro_ego_nv12_frame_t *src,
     }
 
     const uint64_t total_rows = (uint64_t)height + (uint64_t)height / 2ULL;
-    if ((uint64_t)src_stride > UINT64_MAX / total_rows ||
-        (uint64_t)dst_stride > UINT64_MAX / total_rows) {
+    if ((uint64_t)src_stride > UINT64_MAX / total_rows) {
         return -1;
     }
 
     const uint64_t src_bytes = (uint64_t)src_stride * total_rows;
-    const uint64_t dst_bytes = (uint64_t)dst_stride * total_rows;
+    uint64_t dst_bytes = 0;
     if (src_bytes > (uint64_t)src->size ||
-        dst_bytes > (uint64_t)target_capacity ||
-        dst_bytes > UINT32_MAX) {
+        compute_nv12_dst_bytes(dst, dst_stride, height, target_capacity, &dst_bytes) != 0) {
         return -1;
     }
 
@@ -145,16 +173,13 @@ int miro_ego_downscale_nv12_half(const miro_ego_nv12_frame_t *src,
     }
 
     const uint64_t src_rows = (uint64_t)src->height + (uint64_t)src->height / 2ULL;
-    const uint64_t dst_rows = (uint64_t)dst_h + (uint64_t)dst_h / 2ULL;
-    if ((uint64_t)src_stride > UINT64_MAX / src_rows ||
-        (uint64_t)dst_stride > UINT64_MAX / dst_rows) {
+    if ((uint64_t)src_stride > UINT64_MAX / src_rows) {
         return -1;
     }
     const uint64_t src_bytes = (uint64_t)src_stride * src_rows;
-    const uint64_t dst_bytes = (uint64_t)dst_stride * dst_rows;
+    uint64_t dst_bytes = 0;
     if (src_bytes > (uint64_t)src->size ||
-        dst_bytes > (uint64_t)target_capacity ||
-        dst_bytes > UINT32_MAX) {
+        compute_nv12_dst_bytes(dst, dst_stride, dst_h, target_capacity, &dst_bytes) != 0) {
         return -1;
     }
 

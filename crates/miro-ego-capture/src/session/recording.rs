@@ -89,6 +89,7 @@ pub struct CaptureFanoutDecision {
     pub dropped_before: u64,
     pub recovered_source_gap: u64,
     pub recovered_recorded_drops: u64,
+    pub corrupt_recorded_drops: u64,
     pub observed_frames: u64,
     pub inflight_frames: u64,
     pub recording_active: bool,
@@ -180,7 +181,17 @@ impl CaptureFanoutState {
 
     pub fn begin_frame(
         &mut self,
+        dropped_before: u64,
+        has_preview: bool,
+        recovery_time_ns: Option<u64>,
+    ) -> Result<CaptureFanoutDecision, RecordingError> {
+        self.begin_frame_with_corrupt_drops(dropped_before, 0, has_preview, recovery_time_ns)
+    }
+
+    pub fn begin_frame_with_corrupt_drops(
+        &mut self,
         mut dropped_before: u64,
+        corrupt_drops: u64,
         has_preview: bool,
         recovery_time_ns: Option<u64>,
     ) -> Result<CaptureFanoutDecision, RecordingError> {
@@ -191,6 +202,7 @@ impl CaptureFanoutState {
                 dropped_before,
                 recovered_source_gap: 0,
                 recovered_recorded_drops: 0,
+                corrupt_recorded_drops: 0,
                 observed_frames: 0,
                 inflight_frames: 0,
                 recording_active: false,
@@ -199,6 +211,7 @@ impl CaptureFanoutState {
         let mut record = false;
         let mut recovered_source_gap = 0;
         let mut recovered_recorded_drops = 0;
+        let mut corrupt_recorded_drops = 0;
         if !recording.stopping {
             if recording.observed_frames == 0 {
                 // Gaps before the first frame belong to preview, not this take.
@@ -207,7 +220,15 @@ impl CaptureFanoutState {
                 record = true;
             } else {
                 let gap_start = recording.observed_frames;
-                let observed_index = gap_start.checked_add(dropped_before).ok_or_else(|| {
+                let corrupt_end = gap_start.checked_add(corrupt_drops).ok_or_else(|| {
+                    RecordingError::new(
+                        "counter_overflow",
+                        "recording frame gate observed overflow",
+                    )
+                })?;
+                corrupt_recorded_drops =
+                    count_recorded_indices_in_range(gap_start, corrupt_end, self.frame_decimation);
+                let observed_index = corrupt_end.checked_add(dropped_before).ok_or_else(|| {
                     RecordingError::new(
                         "counter_overflow",
                         "recording frame gate observed overflow",
@@ -227,7 +248,7 @@ impl CaptureFanoutState {
                     }) {
                         recovered_source_gap = dropped_before;
                         recovered_recorded_drops = count_recorded_indices_in_range(
-                            gap_start,
+                            corrupt_end,
                             observed_index,
                             self.frame_decimation,
                         );
@@ -253,6 +274,7 @@ impl CaptureFanoutState {
             dropped_before,
             recovered_source_gap,
             recovered_recorded_drops,
+            corrupt_recorded_drops,
             observed_frames: recording.observed_frames,
             inflight_frames: recording.inflight_frames,
             recording_active: !recording.stopping,
@@ -1507,6 +1529,24 @@ mod tests {
         assert!(!f5.record);
         assert_eq!(f5.recovered_source_gap, 2);
         assert_eq!(f5.recovered_recorded_drops, 1);
+
+        // Corrupt frame index 6 (recorded-phase) before index 7 (preview-only):
+        // observed_frames advances 6 -> 8, corrupt_recorded_drops = 1.
+        let f7 = fanout
+            .begin_frame_with_corrupt_drops(0, 1, true, None)
+            .unwrap();
+        assert!(!f7.record);
+        assert_eq!(f7.observed_frames, 8);
+        assert_eq!(f7.corrupt_recorded_drops, 1);
+
+        // Index 8 is back in phase (8 % 2 == 0) -> recorded!
+        let f8 = fanout
+            .begin_frame_with_corrupt_drops(0, 0, true, None)
+            .unwrap();
+        assert!(f8.record);
+        assert_eq!(f8.observed_frames, 9);
+        assert_eq!(f8.corrupt_recorded_drops, 0);
+        fanout.finish_frame().unwrap();
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub use manager::{
     INSTALL_TRANSACTION_SCHEMA, INSTALLED_ASSETS_SCHEMA, InstallTransaction,
     InstalledAssetsManifest, InstalledReleaseMetadata, LocalHttpHealthChecker,
     RELEASE_METADATA_SCHEMA, RealSystemctlRunner, ReleaseManager, ReleaseManagerPaths,
-    SystemctlRunner, TransactionAction, TransactionState, UninstallReport,
+    SYSTEM_DEPLOY_STATE_DIR, SystemctlRunner, TransactionAction, TransactionState, UninstallReport,
 };
 pub use rpc::{
     DEFAULT_ALLOWED_UPDATES_ROOT, DEFAULT_DEPLOY_CLIENT_TIMEOUT, DEFAULT_DEPLOY_IDLE_TIMEOUT,

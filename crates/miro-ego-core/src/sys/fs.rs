@@ -10,8 +10,9 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const EXFAT_SUPER_MAGIC: i64 = 0x2011_bab0;
 pub const MSDOS_SUPER_MAGIC: i64 = 0x4d44;
@@ -33,6 +34,57 @@ pub const MAX_IO_BUFFER_BYTES: usize = 1024 * 1024;
 const PAGE_ALIGN: usize = 4096;
 
 static ATOMIC_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_TEMP_CREATE_ATTEMPTS: usize = 16;
+
+fn temp_nonce_ns() -> u64 {
+    let mono = crate::sys::clock::monotonic_ns().unwrap_or(0);
+    let real = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    mono ^ real.rotate_left(17)
+}
+
+fn create_unique_temp_file_with_nonce(
+    parent: &Path,
+    target_name: &std::ffi::OsStr,
+    mode: u32,
+    mut nonce_fn: impl FnMut() -> u64,
+) -> io::Result<(PathBuf, File)> {
+    let mut last_err = None;
+    for _ in 0..MAX_TEMP_CREATE_ATTEMPTS {
+        let seq = ATOMIC_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nonce = nonce_fn();
+        let temp_name = format!(
+            ".{}.{}.{nonce:016x}.{seq}.tmp",
+            target_name.to_string_lossy(),
+            std::process::id(),
+        );
+        let temp_path = parent.join(temp_name);
+        match open_create_exclusive(&temp_path, mode) {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                last_err = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "exhausted temporary file creation attempts",
+        )
+    }))
+}
+
+/// Create a unique temporary file in `parent` using PID, nanosecond nonce, and monotonic sequence,
+/// retrying boundedly on `AlreadyExists` so stale `.tmp` files from same-PID crashes never block saves.
+pub fn create_unique_temp_file(
+    parent: &Path,
+    target_name: &std::ffi::OsStr,
+    mode: u32,
+) -> io::Result<(PathBuf, File)> {
+    create_unique_temp_file_with_nonce(parent, target_name, mode, temp_nonce_ns)
+}
 
 pub fn fstat(fd: libc::c_int) -> io::Result<libc::stat> {
     if fd < 0 {
@@ -605,17 +657,9 @@ pub fn write_bytes_atomic(
             "atomic write path has no file name",
         )
     })?;
-    let seq = ATOMIC_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let temp_name = format!(
-        ".{}.{}.{}.tmp",
-        name.to_string_lossy(),
-        std::process::id(),
-        seq
-    );
-    let temp_path = parent.join(temp_name);
+    let (temp_path, mut file) = create_unique_temp_file(parent, name, mode)?;
 
     let result = (|| -> io::Result<()> {
-        let mut file = open_create_exclusive(&temp_path, mode)?;
         let fd = file.as_raw_fd();
         // SAFETY: `fchmod` operates on an open owned file descriptor.
         if unsafe { libc::fchmod(fd, mode as libc::mode_t) } != 0 {
@@ -1169,5 +1213,37 @@ mod tests {
         assert_eq!(eio.unwrap_err().raw_os_error(), Some(libc::EIO));
 
         assert_eq!(syncfs_fd(-1).unwrap_err().raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn unique_temp_file_includes_nonce_and_retries_already_exists() {
+        let root = temp_dir("unique-tmp");
+        let name = std::ffi::OsStr::new("state.json");
+        let current_seq = ATOMIC_TEMP_COUNTER.load(Ordering::Relaxed);
+        let stale = root.join(format!(
+            ".state.json.{}.{nonce:016x}.{current_seq}.tmp",
+            std::process::id(),
+            nonce = 0xdead_beef_cafe_babe_u64,
+        ));
+        fs::write(&stale, b"stale").unwrap();
+
+        let (temp_path, file) =
+            create_unique_temp_file_with_nonce(&root, name, 0o640, || 0xdead_beef_cafe_babe_u64)
+                .unwrap();
+        drop(file);
+        assert_ne!(temp_path, stale);
+        assert!(temp_path.exists());
+        assert!(
+            temp_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("deadbeefcafebabe")
+        );
+
+        let (other_path, other_file) = create_unique_temp_file(&root, name, 0o640).unwrap();
+        drop(other_file);
+        assert_ne!(other_path, temp_path);
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -29,6 +29,7 @@ MAX_NDJSON_LINE_BYTES = 1024 * 1024
 READ_CHUNK_BYTES = 1024 * 1024
 ZSTD_BLOCK_BYTES = 1024 * 1024
 ZSTD_MAGIC = (0xFD2FB528).to_bytes(4, "little")
+MAX_RATE_ERROR_PPM = 20_000.0
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")
 _UUID_V7_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z")
@@ -265,6 +266,8 @@ def _open_zstd_stream(raw: BinaryIO) -> Iterator[io.BufferedReader]:
             with stdlib_zstd.open(raw, "rb") as reader:
                 yield io.BufferedReader(reader)
                 return
+        except CaptureValidationError:
+            raise
         except Exception as error:
             raise CaptureValidationError(f"corrupt Zstandard metadata stream: {error}") from error
 
@@ -279,6 +282,8 @@ def _open_zstd_stream(raw: BinaryIO) -> Iterator[io.BufferedReader]:
             with dctx.stream_reader(raw) as reader:
                 yield io.BufferedReader(reader)
                 return
+        except CaptureValidationError:
+            raise
         except Exception as error:
             raise CaptureValidationError(f"corrupt Zstandard metadata stream: {error}") from error
 
@@ -872,7 +877,11 @@ def _normalize_device_imu(
         read_start = _integer(record["host_read_start_ns"], f"imu[{index}].host_read_start_ns")
         read_end = _integer(record["host_read_end_ns"], f"imu[{index}].host_read_end_ns")
         host = _integer(record["host_monotonic_ns"], f"imu[{index}].host_monotonic_ns")
-        if read_end < read_start or not read_start <= host <= read_end:
+        if read_end < read_start or host > read_end:
+            raise CaptureValidationError(f"Device Session IMU {index} host interval is invalid")
+        if sample_index == 1 and host < read_start:
+            raise CaptureValidationError(f"Device Session IMU {index} host interval is invalid")
+        if sample_index == 0 and host < read_start - 50_000_000:
             raise CaptureValidationError(f"Device Session IMU {index} host interval is invalid")
         raw = _mapping(record["raw"], f"imu[{index}].raw")
         if set(raw) != {"accelerometer", "gyroscope"}:
@@ -1096,7 +1105,12 @@ def _validate_video_encoding(encoding_raw: object, *, video_codec: str) -> None:
         raise CaptureValidationError(f"unsupported video.encoding.rate_control: {rc!r}")
 
 
-def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
+def _load_device_session(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    max_rate_error_ppm: float = MAX_RATE_ERROR_PPM,
+) -> LoadedCapture:
     session_id = _validate_manifest_metadata(manifest)
 
     video = _mapping(manifest["video"], "Device Session video")
@@ -1162,7 +1176,7 @@ def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
     frame_decimation = _integer(camera["frame_decimation"], "camera.frame_decimation", minimum=1)
     effective_fps = _number(camera["effective_fps"], "camera.effective_fps", positive=True)
     expected_fps = sensor_fps / frame_decimation
-    if not math.isclose(effective_fps, expected_fps, rel_tol=1e-6, abs_tol=1e-6):
+    if abs(effective_fps / expected_fps - 1.0) * 1e6 > max_rate_error_ppm:
         raise CaptureValidationError(
             f"camera.effective_fps ({effective_fps}) is inconsistent with "
             f"sensor_fps / frame_decimation ({sensor_fps} / {frame_decimation} = {expected_fps})"
@@ -1338,7 +1352,7 @@ def _load_device_session(root: Path, manifest: dict[str, Any]) -> LoadedCapture:
             layout="split-eyes",
             segments=tuple(segments),
         ),
-        fps=effective_fps,
+        fps=expected_fps,
         sensor_fps=sensor_fps,
         frame_decimation=frame_decimation,
         width=width,

@@ -183,14 +183,23 @@ def _imu_packets(capture: LoadedCapture) -> list[list[dict[str, Any]]]:
                 "device_ticks",
                 "host_read_start_ns",
                 "host_read_end_ns",
-                "host_monotonic_ns",
             )
             if any(
                 int(sample["samples_in_packet"]) != samples_per_packet
                 or any(sample[key] != first[key] for key in shared)
                 for sample in current
+            ) or any(
+                int(curr["host_monotonic_ns"]) < int(prev["host_monotonic_ns"])
+                for prev, curr in zip(current, current[1:], strict=False)
             ):
                 raise CaptureValidationError("Device Session records within an IMU packet disagree")
+            latest = current[-1]
+            if not (
+                int(latest["host_read_start_ns"])
+                <= int(latest["host_monotonic_ns"])
+                <= int(latest["host_read_end_ns"])
+            ):
+                raise CaptureValidationError("Device Session IMU host interval is invalid")
             packets.append(current)
             current = []
 
@@ -248,7 +257,7 @@ def _analyze_capture(
     )
 
     packets = _imu_packets(capture)
-    packet_records = [packet[0] for packet in packets]
+    packet_records = [packet[-1] for packet in packets]
     _validate_packet_timestamps(packets)
     packet_hosts = [int(record["host_monotonic_ns"]) for record in packet_records]
 

@@ -160,7 +160,7 @@ struct Resources {
     splitter: Option<TransformHandle>,
     width: i32,
     height: i32,
-    controls: Receiver<ControlCommand>,
+    controls: Option<Receiver<ControlCommand>>,
 }
 
 impl Resources {
@@ -303,7 +303,7 @@ impl Stream {
                     height: i32::try_from(height).map_err(|_| {
                         StreamError::new("unsupported_mode", "capture height is too large")
                     })?,
-                    controls: control_receiver,
+                    controls: Some(control_receiver),
                 }),
                 worker: None,
             }),
@@ -372,7 +372,16 @@ impl Stream {
                     &corrupt_counter,
                     &drop_callback,
                 );
-                drain_pending_controls(&resources.controls);
+                if let Some(controls) = resources.controls.as_ref() {
+                    drain_pending_controls(controls);
+                }
+                let fatal_exit = terminal_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some();
+                if fatal_exit {
+                    drop(resources.controls.take());
+                }
                 producer.close();
                 Some(resources)
             })
@@ -427,45 +436,79 @@ impl Stream {
         }
     }
 
-    pub fn focus_status(&self) -> Result<Option<FocusStatus>, StreamError> {
+    fn check_terminal_error(&self) -> Result<(), StreamError> {
+        if let Some(error) = self
+            .terminal_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn send_control<T>(
+        &self,
+        timeout_message: &'static str,
+        build: impl FnOnce(Sender<Result<T, CaptureError>>) -> ControlCommand,
+        direct: impl FnOnce(&Capture) -> Result<T, CaptureError>,
+    ) -> Result<T, StreamError> {
         let lifecycle = self.lifecycle.lock().map_err(|_| {
             StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
         })?;
         match lifecycle.state {
-            State::Open | State::Stopped => lifecycle
-                .resources
-                .as_ref()
-                .ok_or_else(|| {
-                    StreamError::new("invalid_state", "native camera resources are missing")
-                })?
-                .capture
-                .focus_status()
-                .map_err(StreamError::from),
+            State::Open | State::Stopped => direct(
+                &lifecycle
+                    .resources
+                    .as_ref()
+                    .ok_or_else(|| {
+                        StreamError::new("invalid_state", "native camera resources are missing")
+                    })?
+                    .capture,
+            )
+            .map_err(StreamError::from),
             State::Running => {
+                self.check_terminal_error()?;
                 let (response, result) = mpsc::channel();
-                self.controls
-                    .send(ControlCommand::FocusStatus(response))
-                    .map_err(|_| {
-                        StreamError::new(
+                if self.controls.send(build(response)).is_err() {
+                    self.check_terminal_error()?;
+                    return Err(StreamError::new(
+                        "native_camera_control_failed",
+                        "native camera control channel is closed",
+                    ));
+                }
+                drop(lifecycle);
+                match result.recv_timeout(CONTROL_TIMEOUT) {
+                    Ok(reply) => reply.map_err(StreamError::from),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        self.check_terminal_error()?;
+                        Err(StreamError::new(
                             "native_camera_control_failed",
                             "native camera control channel is closed",
-                        )
-                    })?;
-                drop(lifecycle);
-                result
-                    .recv_timeout(CONTROL_TIMEOUT)
-                    .map_err(|_| {
-                        StreamError::new(
+                        ))
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        self.check_terminal_error()?;
+                        Err(StreamError::new(
                             "native_camera_control_timeout",
-                            "native camera focus query timed out",
-                        )
-                    })?
-                    .map_err(StreamError::from)
+                            timeout_message,
+                        ))
+                    }
+                }
             }
             State::Stopping | State::Closed => {
                 Err(StreamError::new("invalid_state", "native camera is closed"))
             }
         }
+    }
+
+    pub fn focus_status(&self) -> Result<Option<FocusStatus>, StreamError> {
+        self.send_control(
+            "native camera focus query timed out",
+            ControlCommand::FocusStatus,
+            Capture::focus_status,
+        )
     }
 
     pub fn set_focus(
@@ -473,92 +516,26 @@ impl Stream {
         value: Option<i32>,
         auto_enabled: Option<bool>,
     ) -> Result<FocusStatus, StreamError> {
-        let lifecycle = self.lifecycle.lock().map_err(|_| {
-            StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
-        })?;
-        match lifecycle.state {
-            State::Open | State::Stopped => lifecycle
-                .resources
-                .as_ref()
-                .ok_or_else(|| {
-                    StreamError::new("invalid_state", "native camera resources are missing")
-                })?
-                .capture
-                .set_focus(value, auto_enabled)
-                .map_err(StreamError::from),
-            State::Running => {
-                let (response, result) = mpsc::channel();
-                self.controls
-                    .send(ControlCommand::SetFocus {
-                        value,
-                        auto_enabled,
-                        response,
-                    })
-                    .map_err(|_| {
-                        StreamError::new(
-                            "native_camera_control_failed",
-                            "native camera control channel is closed",
-                        )
-                    })?;
-                drop(lifecycle);
-                result
-                    .recv_timeout(CONTROL_TIMEOUT)
-                    .map_err(|_| {
-                        StreamError::new(
-                            "native_camera_control_timeout",
-                            "native camera focus update timed out",
-                        )
-                    })?
-                    .map_err(StreamError::from)
-            }
-            State::Stopping | State::Closed => {
-                Err(StreamError::new("invalid_state", "native camera is closed"))
-            }
-        }
+        self.send_control(
+            "native camera focus update timed out",
+            |response| ControlCommand::SetFocus {
+                value,
+                auto_enabled,
+                response,
+            },
+            |capture| capture.set_focus(value, auto_enabled),
+        )
     }
 
     pub fn set_exposure(&self, exposure: &ExposureSetting) -> Result<ExposureConfig, StreamError> {
-        let lifecycle = self.lifecycle.lock().map_err(|_| {
-            StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
-        })?;
-        match lifecycle.state {
-            State::Open | State::Stopped => lifecycle
-                .resources
-                .as_ref()
-                .ok_or_else(|| {
-                    StreamError::new("invalid_state", "native camera resources are missing")
-                })?
-                .capture
-                .set_exposure(exposure)
-                .map_err(StreamError::from),
-            State::Running => {
-                let (response, result) = mpsc::channel();
-                self.controls
-                    .send(ControlCommand::SetExposure {
-                        exposure: exposure.clone(),
-                        response,
-                    })
-                    .map_err(|_| {
-                        StreamError::new(
-                            "native_camera_control_failed",
-                            "native camera control channel is closed",
-                        )
-                    })?;
-                drop(lifecycle);
-                result
-                    .recv_timeout(CONTROL_TIMEOUT)
-                    .map_err(|_| {
-                        StreamError::new(
-                            "native_camera_control_timeout",
-                            "native camera exposure update timed out",
-                        )
-                    })?
-                    .map_err(StreamError::from)
-            }
-            State::Stopping | State::Closed => {
-                Err(StreamError::new("invalid_state", "native camera is closed"))
-            }
-        }
+        self.send_control(
+            "native camera exposure update timed out",
+            |response| ControlCommand::SetExposure {
+                exposure: exposure.clone(),
+                response,
+            },
+            |capture| capture.set_exposure(exposure),
+        )
     }
 
     pub fn stop(&self) -> Result<(), StreamError> {
@@ -603,7 +580,9 @@ impl Stream {
             });
         match joined {
             Ok(mut resources) => {
-                drain_pending_controls(&resources.controls);
+                if let Some(controls) = resources.controls.as_ref() {
+                    drain_pending_controls(controls);
+                }
                 let stop_result = if resources.capture.is_closed() {
                     Ok(())
                 } else {
@@ -617,7 +596,9 @@ impl Stream {
                     resources.close();
                     StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
                 })?;
-                drain_pending_controls(&resources.controls);
+                if let Some(controls) = resources.controls.as_ref() {
+                    drain_pending_controls(controls);
+                }
                 if must_close {
                     lifecycle.resources = None;
                     lifecycle.state = State::Closed;
@@ -860,8 +841,11 @@ fn run_producer(
 }
 
 fn process_control_commands(resources: &Resources) {
+    let Some(controls) = resources.controls.as_ref() else {
+        return;
+    };
     loop {
-        match resources.controls.try_recv() {
+        match controls.try_recv() {
             Ok(ControlCommand::FocusStatus(response)) => {
                 let _ = response.send(resources.capture.focus_status());
             }
@@ -1061,6 +1045,56 @@ mod tests {
         assert_eq!(stream.corrupt_frames_dropped(), 1);
         assert_eq!(cb_drops.load(Ordering::Acquire), 1);
 
+        stream.close().unwrap();
+    }
+
+    #[test]
+    fn control_calls_fail_immediately_after_producer_fatal_exit() {
+        use miro_ego_core::config::ExposureSetting;
+        use std::time::{Duration, Instant};
+
+        // Two consecutive truncated frames hit MAX_CONSECUTIVE_BAD_FRAMES? No, feed 6 consecutive
+        // bad frames or wait for fake stream EOF/bad_frame fatal exit.
+        let bad_frames = (1_u32..=super::MAX_CONSECUTIVE_BAD_FRAMES + 1)
+            .map(|seq| {
+                (
+                    seq,
+                    u64::from(seq) * 16_000_000,
+                    b"\xff\xd8truncated".to_vec(),
+                    0x2000,
+                )
+            })
+            .collect();
+        let capture = crate::hardware::v4l2::Capture::test_fake_with_frames(bad_frames).unwrap();
+        let stream = super::Stream::from_parts(capture, None, 3840, 1080, 4).unwrap();
+        stream.start().unwrap();
+
+        let Err(err) = stream.read(Duration::from_secs(2)) else {
+            panic!("expected fatal bad_frame error");
+        };
+        assert_eq!(err.code, "bad_frame");
+
+        // Wait briefly for worker exit to finish dropping `resources.controls` too.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let started = Instant::now();
+        assert_eq!(stream.focus_status().unwrap_err().code, "bad_frame");
+        assert_eq!(
+            stream.set_focus(Some(10), Some(false)).unwrap_err().code,
+            "bad_frame"
+        );
+        assert_eq!(
+            stream
+                .set_exposure(&ExposureSetting::Manual(50))
+                .unwrap_err()
+                .code,
+            "bad_frame"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "control calls stalled for {:?}",
+            started.elapsed()
+        );
         stream.close().unwrap();
     }
 }

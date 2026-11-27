@@ -13,7 +13,7 @@
 //! `/data/recordings/YYYY-MM-DD/HH-MM-SS/manifest.json` and writes a clean atomic snapshot.
 
 use crate::artifact_io::{
-    extract_manifest_artifacts, open_manifest_in_dir, open_pinned_directory,
+    extract_all_manifest_artifacts, open_manifest_in_dir, open_pinned_directory,
     open_relative_regular_in_dir, unique_downloadable_artifact_bytes,
 };
 use crate::util::{
@@ -23,27 +23,29 @@ use crate::util::{
 };
 use crate::{
     CATALOG_BINARY_FORMAT_VERSION, CATALOG_BINARY_MAGIC, CATALOG_FORMAT_VERSION, CATALOG_WAL_MAGIC,
-    CatalogEntry, SessionCatalog, SessionState, StorageError, StorageResult,
+    CATALOG_WAL_V2_MAGIC, CatalogEntry, SessionCatalog, SessionState, StorageError, StorageResult,
 };
 use miro_ego_core::CoreError;
 use miro_ego_core::ids::{is_valid_sha256, is_valid_uuid_v4, is_valid_uuid_v7, new_uuid_v4};
 use miro_ego_core::locks::{FlockGuard, LockMode, acquire_flock};
 use miro_ego_core::paths::DataVolumePaths;
 use miro_ego_core::sys::fs::{
-    fstat, fstatat_nofollow, is_exfat_or_msdos, open_directory_safe, openat_retry,
+    fstat, fstatat_nofollow, fsync_directory, is_exfat_or_msdos, open_directory_safe, openat_retry,
     read_bounded_bytes, write_bytes_atomic,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const SESSION_LIST_SCHEMA: &str = "miro-ego.session-list.v1";
 pub const DEVICE_SESSION_SCHEMA: &str = "miro-ego.device-session.v1";
@@ -53,6 +55,8 @@ pub const MAX_PAGE_LIMIT: usize = 200;
 pub const MAX_CATALOG_BIN_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CATALOG_WAL_BYTES: usize = 8 * 1024 * 1024;
 const CATALOG_HEADER_BYTES: usize = 20;
+const CATALOG_WAL_V2_HEADER_BYTES: usize = 16;
+const READONLY_FLOCK_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
 const WAL_COMPACT_THRESHOLD: usize = 64;
 const WAL_OP_ADMIT: u8 = 1;
 const WAL_OP_SET_VERIFICATION: u8 = 2;
@@ -480,6 +484,17 @@ enum WalMutation {
     ForgetPaths(Vec<String>),
 }
 
+struct ReadOnlyFlockGuard {
+    file: File,
+}
+
+impl Drop for ReadOnlyFlockGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.file` holds an open valid file descriptor until after drop.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// High-speed in-memory session catalog backed by `/data/.miro-ego/index/catalog.bin`
 /// (`MEGOCAT1` compact binary v2) and append-only `/data/.miro-ego/index/catalog.wal`.
 pub struct BinarySessionCatalog {
@@ -503,8 +518,9 @@ impl BinarySessionCatalog {
         let _ = sweep_stale_atomic_temps(&catalog.paths.index_dir());
         let loaded_res = catalog.load_snapshot_and_wal_from_disk(true);
         drop(_flock);
+        catalog.mark_mount_dirty();
         match loaded_res {
-            Ok((loaded, wal_count)) => {
+            Ok((loaded, wal_count, _)) => {
                 catalog.wal_ops.store(wal_count, Ordering::Release);
                 {
                     let mut guard = catalog
@@ -541,8 +557,12 @@ impl BinarySessionCatalog {
                 index: RwLock::new(CatalogIndex::new_empty()),
             };
             let _flock = catalog.try_acquire_index_flock(LockMode::Shared);
-            if let Ok((loaded, wal_count)) = catalog.load_snapshot_and_wal_from_disk(false) {
+            if let Ok((loaded, wal_count, torn_wal)) =
+                catalog.load_snapshot_and_wal_from_disk(false)
+                && !torn_wal
+            {
                 drop(_flock);
+                catalog.mark_mount_dirty();
                 catalog.wal_ops.store(wal_count, Ordering::Release);
                 let wrote = if let Ok(mut guard) = catalog.index.write() {
                     *guard = loaded;
@@ -568,9 +588,9 @@ impl BinarySessionCatalog {
             wal_ops: AtomicUsize::new(0),
             index: RwLock::new(CatalogIndex::new_empty()),
         };
-        let _flock = catalog.try_acquire_index_flock(LockMode::Shared);
+        let _flock = catalog.acquire_readonly_shared_index_flock()?;
         match catalog.load_snapshot_and_wal_from_disk(false) {
-            Ok((loaded, wal_count)) => {
+            Ok((loaded, wal_count, _)) => {
                 catalog.wal_ops.store(wal_count, Ordering::Release);
                 {
                     let mut guard = catalog
@@ -584,7 +604,7 @@ impl BinarySessionCatalog {
             Err(_) => {
                 let recordings_root = catalog.paths.recordings_dir();
                 if recordings_root.is_dir() {
-                    let (sessions, diags) = scan_recordings_tree(&recordings_root, None)?;
+                    let (sessions, diags) = scan_recordings_tree(&recordings_root, None, true)?;
                     let mut staged = CatalogIndex::new_empty();
                     for (rel, diag) in diags {
                         staged.diagnostics_by_path.insert(rel, diag);
@@ -622,7 +642,16 @@ impl BinarySessionCatalog {
 
     /// Clear `mount-clean.marker` before mutating `/data/recordings/` or `/data/.miro-ego/staging/`.
     pub fn mark_mount_dirty(&self) {
-        let _ = fs::remove_file(self.paths.mount_clean_marker_file());
+        let marker = self.paths.mount_clean_marker_file();
+        match fs::remove_file(&marker) {
+            Ok(()) => {
+                let _ = fsync_directory(&self.paths.index_dir());
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                let _ = fsync_directory(&self.paths.index_dir());
+            }
+        }
     }
 
     /// Compact any pending `catalog.wal` operations into `catalog.bin` and record `mount-clean.marker`
@@ -668,6 +697,60 @@ impl BinarySessionCatalog {
         }
         let nonblocking = matches!(mode, LockMode::Shared);
         acquire_flock(self.paths.catalog_lock_file(), mode, nonblocking).ok()
+    }
+
+    fn acquire_readonly_shared_index_flock(&self) -> StorageResult<Option<ReadOnlyFlockGuard>> {
+        let lock_path = self.paths.catalog_lock_file();
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(StorageError::io(
+                    "catalog_lock_open",
+                    "open catalog.lock read-only",
+                    err,
+                ));
+            }
+        };
+        let st = fstat(file.as_raw_fd())
+            .map_err(|err| StorageError::io("catalog_lock_stat", "fstat catalog.lock", err))?;
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageError::Catalog {
+                message: "catalog.lock must be a regular file".to_owned(),
+            });
+        }
+        let deadline = Instant::now() + READONLY_FLOCK_RETRY_TIMEOUT;
+        loop {
+            // SAFETY: `file` is an open regular descriptor owned by this scope.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+                return Ok(Some(ReadOnlyFlockGuard { file }));
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == io::ErrorKind::WouldBlock
+                || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+            {
+                if Instant::now() >= deadline {
+                    return Err(StorageError::Core(CoreError::lock_busy(format!(
+                        "catalog lock busy: {}",
+                        lock_path.display()
+                    ))));
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            return Err(StorageError::io(
+                "catalog_lock_failed",
+                "acquire shared catalog.lock",
+                err,
+            ));
+        }
     }
 
     pub fn paths(&self) -> &DataVolumePaths {
@@ -909,6 +992,40 @@ impl BinarySessionCatalog {
         })
     }
 
+    /// In-memory fallback for [`Self::forget_paths`] when disk persistence fails after
+    /// sessions were physically removed from `/data/recordings/`. Marks `wal_ops` at the
+    /// compaction threshold so the next mutation writes a clean snapshot.
+    pub fn forget_paths_in_memory(&self, relative_dirs: &[String]) -> StorageResult<usize> {
+        if relative_dirs.is_empty() {
+            return Ok(0);
+        }
+        let _persist_guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_write")))?;
+        let mut guard = self
+            .index
+            .write()
+            .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
+        let mut count = 0_usize;
+        for rel in relative_dirs {
+            let removed_id = guard.by_path.remove(rel.as_str());
+            let removed_entry = removed_id
+                .as_ref()
+                .and_then(|sid| guard.by_id.remove(sid))
+                .is_some();
+            let removed_diag = guard.diagnostics_by_path.remove(rel.as_str()).is_some();
+            if removed_entry || removed_diag {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            guard.bump_revision();
+        }
+        self.wal_ops.store(WAL_COMPACT_THRESHOLD, Ordering::Release);
+        Ok(count)
+    }
+
     /// Deterministic cursor-paginated listing matching OpenAPI v1 `GET /api/v1/sessions`
     /// (`limit`, `cursor`, `Prefer: include-recovery`, optional `take_id` filter).
     pub fn list_sessions_page(
@@ -1028,6 +1145,7 @@ impl BinarySessionCatalog {
                 .map_err(|_| StorageError::Core(CoreError::poisoned("catalog_index")))?;
             guard.clone()
         };
+        let base_revision_seq = staged.revision_seq;
         let (out, wal_op_opt) = mutator(&mut staged)?;
         let Some(wal_op) = wal_op_opt else {
             return Ok(out);
@@ -1036,7 +1154,7 @@ impl BinarySessionCatalog {
         let cur_wal_ops = self.wal_ops.load(Ordering::Acquire);
         let can_append_wal =
             cur_wal_ops < WAL_COMPACT_THRESHOLD && self.paths.catalog_file().is_file();
-        if can_append_wal && self.append_wal_mutation(&wal_op).is_ok() {
+        if can_append_wal && self.append_wal_mutation(&wal_op, base_revision_seq).is_ok() {
             self.wal_ops.fetch_add(1, Ordering::AcqRel);
         } else {
             let snapshot_bytes = encode_catalog_binary(&staged.to_payload())?;
@@ -1054,7 +1172,7 @@ impl BinarySessionCatalog {
     fn load_snapshot_and_wal_from_disk(
         &self,
         repair_torn_wal: bool,
-    ) -> StorageResult<(CatalogIndex, usize)> {
+    ) -> StorageResult<(CatalogIndex, usize, bool)> {
         let path = self.paths.catalog_file();
         let raw = read_bounded_bytes(&path, MAX_CATALOG_BIN_BYTES).map_err(|err| {
             StorageError::Catalog {
@@ -1063,12 +1181,12 @@ impl BinarySessionCatalog {
         })?;
         let payload = decode_catalog_binary(&raw)?;
         let mut idx = CatalogIndex::from_payload(payload)?;
-        let wal_replayed =
+        let (wal_replayed, torn_wal) =
             replay_catalog_wal(&self.paths.catalog_wal_file(), &mut idx, repair_torn_wal)?;
-        Ok((idx, wal_replayed))
+        Ok((idx, wal_replayed, torn_wal))
     }
 
-    fn append_wal_mutation(&self, op: &WalMutation) -> StorageResult<()> {
+    fn append_wal_mutation(&self, op: &WalMutation, base_revision_seq: u64) -> StorageResult<()> {
         let wal_path = self.paths.catalog_wal_file();
         let frame = encode_wal_frame(op)?;
         let mut file = OpenOptions::new()
@@ -1086,20 +1204,69 @@ impl BinarySessionCatalog {
                 message: "catalog.wal is not a regular file".to_owned(),
             });
         }
-        let cur_len = u64::try_from(st.st_size).unwrap_or(0);
-        if cur_len as usize + frame.len() + CATALOG_WAL_MAGIC.len() > MAX_CATALOG_WAL_BYTES {
+        #[allow(clippy::useless_conversion)]
+        let nlink = u64::from(st.st_nlink);
+        if nlink != 1 {
+            return Err(StorageError::Catalog {
+                message: "catalog.wal must not have hardlinks".to_owned(),
+            });
+        }
+        let cur_len = u64::try_from(st.st_size).map_err(|_| StorageError::Catalog {
+            message: "negative catalog.wal size".to_owned(),
+        })?;
+        if cur_len > 0 && self.wal_ops.load(Ordering::Acquire) == 0 {
+            return Err(StorageError::Catalog {
+                message: "catalog.wal unexpectedly non-empty with zero active wal ops".to_owned(),
+            });
+        }
+        let header_bytes = if cur_len == 0 {
+            CATALOG_WAL_V2_HEADER_BYTES
+        } else {
+            0
+        };
+        if cur_len as usize + header_bytes + frame.len() > MAX_CATALOG_WAL_BYTES {
             return Err(StorageError::Catalog {
                 message: "catalog.wal exceeded compaction size threshold".to_owned(),
             });
         }
-        if cur_len == 0 {
-            file.write_all(&CATALOG_WAL_MAGIC)
-                .map_err(|err| StorageError::io("catalog_wal_write", "write wal magic", err))?;
+        let write_res: StorageResult<()> = (|| {
+            if cur_len == 0 {
+                let mut hdr = [0_u8; CATALOG_WAL_V2_HEADER_BYTES];
+                hdr[..8].copy_from_slice(&CATALOG_WAL_V2_MAGIC);
+                hdr[8..16].copy_from_slice(&base_revision_seq.to_le_bytes());
+                file.write_all(&hdr).map_err(|err| {
+                    StorageError::io("catalog_wal_write", "write wal v2 header", err)
+                })?;
+            }
+            file.write_all(&frame)
+                .map_err(|err| StorageError::io("catalog_wal_write", "append wal frame", err))?;
+            if cur_len == 0 {
+                file.sync_all().map_err(|err| {
+                    StorageError::io("catalog_wal_sync", "fsync new catalog.wal", err)
+                })?;
+                fsync_directory(&self.paths.index_dir()).map_err(|err| {
+                    StorageError::io(
+                        "catalog_wal_dir_sync",
+                        "fsync index dir after creating catalog.wal",
+                        err,
+                    )
+                })?;
+            } else {
+                file.sync_data().map_err(|err| {
+                    StorageError::io("catalog_wal_sync", "fdatasync catalog.wal", err)
+                })?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = write_res {
+            if let Ok(off) = libc::off_t::try_from(cur_len) {
+                // SAFETY: `file` is a valid open regular descriptor and `off` is original length.
+                let _ = unsafe { libc::ftruncate(file.as_raw_fd(), off) };
+                let _ = file.sync_data();
+            }
+            self.wal_ops.store(WAL_COMPACT_THRESHOLD, Ordering::Release);
+            return Err(err);
         }
-        file.write_all(&frame)
-            .map_err(|err| StorageError::io("catalog_wal_write", "append wal frame", err))?;
-        file.sync_data()
-            .map_err(|err| StorageError::io("catalog_wal_sync", "fdatasync catalog.wal", err))?;
         Ok(())
     }
 
@@ -1118,7 +1285,25 @@ impl BinarySessionCatalog {
         write_bytes_atomic(&self.paths.catalog_file(), bytes, 0o640, true).map_err(|err| {
             StorageError::io("catalog_write_failed", "write catalog.bin atomically", err)
         })?;
-        let _ = fs::remove_file(self.paths.catalog_wal_file());
+        match fs::remove_file(self.paths.catalog_wal_file()) {
+            Ok(()) => {
+                fsync_directory(&index_dir).map_err(|err| {
+                    StorageError::io(
+                        "catalog_wal_clear_sync",
+                        "fsync index dir after removing catalog.wal",
+                        err,
+                    )
+                })?;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(StorageError::io(
+                    "catalog_wal_remove_failed",
+                    "remove compacted catalog.wal",
+                    err,
+                ));
+            }
+        }
         self.wal_ops.store(0, Ordering::Release);
         Ok(())
     }
@@ -1138,7 +1323,7 @@ impl BinarySessionCatalog {
 
         let recordings_root = self.paths.recordings_dir();
         let (scanned_sessions, scanned_diags) =
-            scan_recordings_tree(&recordings_root, Some(&current))?;
+            scan_recordings_tree(&recordings_root, Some(&current), false)?;
 
         let mut by_id: HashMap<String, IndexedSession> = HashMap::new();
         let mut by_path: HashMap<String, String> = HashMap::new();
@@ -1746,20 +1931,43 @@ fn replay_catalog_wal(
     wal_path: &Path,
     idx: &mut CatalogIndex,
     repair_torn_tail: bool,
-) -> StorageResult<usize> {
+) -> StorageResult<(usize, bool)> {
     let raw = match read_bounded_bytes(wal_path, MAX_CATALOG_WAL_BYTES) {
         Ok(b) => b,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(_) => return Ok(0),
-    };
-    if raw.len() < CATALOG_WAL_MAGIC.len() || raw[0..8] != CATALOG_WAL_MAGIC {
-        if repair_torn_tail {
-            let _ = fs::remove_file(wal_path);
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok((0, false)),
+        Err(err) => {
+            return Err(StorageError::Catalog {
+                message: format!("unable to read catalog.wal: {err}"),
+            });
         }
-        return Ok(0);
-    }
+    };
 
-    let mut offset = CATALOG_WAL_MAGIC.len();
+    let mut offset =
+        if raw.len() >= CATALOG_WAL_V2_HEADER_BYTES && raw[0..8] == CATALOG_WAL_V2_MAGIC {
+            let base_revision_seq = u64::from_le_bytes([
+                raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+            ]);
+            if base_revision_seq != idx.revision_seq {
+                if repair_torn_tail {
+                    let _ = fs::remove_file(wal_path);
+                    if let Some(parent) = wal_path.parent() {
+                        let _ = fsync_directory(parent);
+                    }
+                }
+                return Ok((0, false));
+            }
+            CATALOG_WAL_V2_HEADER_BYTES
+        } else if raw.len() >= CATALOG_WAL_MAGIC.len() && raw[0..8] == CATALOG_WAL_MAGIC {
+            CATALOG_WAL_MAGIC.len()
+        } else {
+            if repair_torn_tail {
+                let _ = fs::remove_file(wal_path);
+                if let Some(parent) = wal_path.parent() {
+                    let _ = fsync_directory(parent);
+                }
+            }
+            return Ok((0, true));
+        };
     let mut applied = 0_usize;
     while offset < raw.len() {
         if raw.len() - offset < 9 {
@@ -1849,8 +2057,9 @@ fn replay_catalog_wal(
         applied += 1;
     }
 
+    let torn_tail = offset < raw.len();
     if repair_torn_tail
-        && offset < raw.len()
+        && torn_tail
         && let Ok(file) = OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -1864,7 +2073,7 @@ fn replay_catalog_wal(
     if applied > 0 {
         idx.recompute_revision();
     }
-    Ok(applied)
+    Ok((applied, torn_tail))
 }
 
 fn encode_cursor(token: &PageCursorToken) -> StorageResult<String> {
@@ -1890,6 +2099,7 @@ type ScannedRecordings = (
 fn scan_recordings_tree(
     recordings_root: &Path,
     previous: Option<&CatalogIndex>,
+    read_only: bool,
 ) -> StorageResult<ScannedRecordings> {
     let root_dir = match open_directory_safe(recordings_root) {
         Ok(dir) => dir,
@@ -1999,10 +2209,12 @@ fn scan_recordings_tree(
                 Ok(opened) => {
                     match classify_and_parse_manifest(&rel_dir, &opened.parsed, &opened.sha256) {
                         Ok(mut indexed) => {
-                            sweep_leftover_control_markers_best_effort(
-                                &day_path.join(&child),
-                                &opened.parsed,
-                            );
+                            if !read_only {
+                                sweep_leftover_control_markers_best_effort(
+                                    &day_path.join(&child),
+                                    &opened.parsed,
+                                );
+                            }
                             let cached_verification = previous
                                 .and_then(|prev| prev.by_id.get(&indexed.session_id))
                                 .filter(|prev_entry| {
@@ -2128,7 +2340,7 @@ pub(crate) fn verify_discovered_session_artifacts(
     let build_sha256 = sha256_hex(format!("miro-ego:{version}:{commit}").as_bytes());
     let verified_at = now_rfc3339_utc();
 
-    let descriptors = match extract_manifest_artifacts(manifest) {
+    let descriptors = match extract_all_manifest_artifacts(manifest) {
         Ok(list) => list,
         Err(_) => {
             return GatewayVerification {
@@ -2307,10 +2519,10 @@ pub fn parse_indexed_session_from_manifest(
             "manifest is not sealed",
         ));
     }
-    if !obj
+    if obj
         .get("sealed_at")
         .and_then(Value::as_str)
-        .is_some_and(|s| parse_rfc3339_utc_nanos(s).is_some())
+        .is_none_or(|s| parse_rfc3339_utc_nanos(s).is_none())
     {
         return Err(StorageError::integrity(
             "manifest_invalid",
@@ -2975,10 +3187,10 @@ fn validate_manifest_camera_and_media(obj: &Map<String, Value>) -> StorageResult
         || enc.get("pixel_format").and_then(Value::as_str) != Some("yuv420p")
         || enc.get("bit_depth").and_then(Value::as_u64) != Some(8)
         || enc.get("b_frames").and_then(Value::as_u64) != Some(0)
-        || !enc
+        || enc
             .get("intra_qp")
             .and_then(Value::as_u64)
-            .is_some_and(|v| v <= 51)
+            .is_none_or(|v| v > 51)
         || !enc
             .get("gop_frames")
             .and_then(Value::as_u64)
@@ -2995,18 +3207,18 @@ fn validate_manifest_camera_and_media(obj: &Map<String, Value>) -> StorageResult
                 .get("bitrate_kbps")
                 .and_then(Value::as_u64)
                 .is_some_and(|v| (1..=100_000).contains(&v))
-                || !enc
+                || enc
                     .get("min_qp")
                     .and_then(Value::as_u64)
-                    .is_some_and(|v| v <= 51)
-                || !enc
+                    .is_none_or(|v| v > 51)
+                || enc
                     .get("max_qp")
                     .and_then(Value::as_u64)
-                    .is_some_and(|v| v <= 51)
-                || !enc
+                    .is_none_or(|v| v > 51)
+                || enc
                     .get("initial_qp")
                     .and_then(Value::as_u64)
-                    .is_some_and(|v| v <= 51)
+                    .is_none_or(|v| v > 51)
                 || !enc
                     .get("vbv_ms")
                     .and_then(Value::as_u64)
@@ -3036,10 +3248,10 @@ fn validate_manifest_camera_and_media(obj: &Map<String, Value>) -> StorageResult
                 || !matches!(enc.get("min_qp"), Some(Value::Null))
                 || !matches!(enc.get("max_qp"), Some(Value::Null))
                 || !matches!(enc.get("vbv_ms"), Some(Value::Null))
-                || !enc
+                || enc
                     .get("initial_qp")
                     .and_then(Value::as_u64)
-                    .is_some_and(|v| v <= 51)
+                    .is_none_or(|v| v > 51)
             {
                 return Err(StorageError::integrity(
                     "manifest_invalid",
@@ -3348,10 +3560,10 @@ fn validate_manifest_camera_and_media(obj: &Map<String, Value>) -> StorageResult
         ],
         "integrity",
     )?;
-    if !integ
+    if integ
         .get("verified_at")
         .and_then(Value::as_str)
-        .is_some_and(|s| parse_rfc3339_utc_nanos(s).is_some())
+        .is_none_or(|s| parse_rfc3339_utc_nanos(s).is_none())
         || integ
             .get("dropped_frames")
             .and_then(Value::as_u64)

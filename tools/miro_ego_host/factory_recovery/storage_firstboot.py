@@ -281,6 +281,26 @@ def _resolve_mount_ids(user: str = "miro-ego", group: str = "miro-ego") -> tuple
     return (pw.pw_uid, gid)
 
 
+def _read_env_file(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    parsed: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key:
+            parsed[key] = value
+    return parsed
+
+
 def mount_and_initialize(
     data_device: Path,
     *,
@@ -291,7 +311,8 @@ def mount_and_initialize(
 ) -> bool:
     """Mount ``/data`` as exFAT, ensure canonical layout, and apply ``ATTR_HIDDEN``."""
     if helper.is_file() and os.access(helper, os.X_OK):
-        run(str(helper), "ensure")
+        helper_env = {**os.environ, **_read_env_file(CONFIG)}
+        run(str(helper), "ensure", env=helper_env)
     elif not _is_mounted(mountpoint):
         mountpoint.mkdir(parents=True, mode=0o755, exist_ok=True)
         ids = service_ids if service_ids is not None else _resolve_mount_ids()

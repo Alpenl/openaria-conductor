@@ -36,8 +36,11 @@ where
         timer_poll_interval,
     } = daemon;
 
-    if let Some(led) = backend.indicator() {
-        let _ = led.set_state(IndicatorState::Ready);
+    if let Some(led) = backend.indicator().cloned() {
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = led.set_state(IndicatorState::Ready);
+        })
+        .await;
     }
     if let Some(voice) = backend.voice_controller() {
         let _ = voice.play_cue(VoiceCue::DeviceReady);
@@ -251,15 +254,25 @@ where
     // 3. Stop event bridge after terminal coordinator state/safe-swap events have been drained.
     bg_stop.store(true, Ordering::Release);
     if let Some(handle) = event_thread {
-        let _ = handle.join();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = handle.join();
+        })
+        .await;
     }
 
     // 4. Restore LED state & close background voice queue on exit.
-    if let Some(led) = backend.indicator() {
-        let _ = led.restore();
-    }
-    if let Some(voice) = backend.voice_controller() {
-        voice.close();
+    let shutdown_led = backend.indicator().cloned();
+    let shutdown_voice = backend.voice_controller().cloned();
+    if shutdown_led.is_some() || shutdown_voice.is_some() {
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(led) = shutdown_led {
+                let _ = led.restore();
+            }
+            if let Some(voice) = shutdown_voice {
+                voice.close();
+            }
+        })
+        .await;
     }
 
     serve_result.map_err(|err| format!("gateway server exited with error: {err}"))

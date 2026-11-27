@@ -1086,18 +1086,14 @@ fn process_frame(
                 .map(|_| frame.host_monotonic_ns);
             let decision = state
                 .fanout
-                .begin_frame(
+                .begin_frame_with_corrupt_drops(
                     unexplained_dropped_before,
+                    explained_corrupt_gap,
                     has_left || has_raw,
                     recovery_time_ns,
                 )
                 .map_err(RuntimeError::from)?;
-            let corrupt_recorded_drops =
-                if decision.recording_active && decision.observed_frames > 1 {
-                    corrupt_drops
-                } else {
-                    0
-                };
+            let corrupt_recorded_drops = decision.corrupt_recorded_drops;
             let dispatch = if decision.record
                 || decision.recovered_recorded_drops > 0
                 || corrupt_recorded_drops > 0
@@ -1164,21 +1160,22 @@ fn process_frame(
                             );
                         }
                     }
-                } else {
-                    if corrupt_recorded_drops > 0 {
-                        let _ = queue.try_enqueue(RecordWork::RecoveredDrops {
-                            dropped: corrupt_recorded_drops,
-                            host_monotonic_ns: frame.host_monotonic_ns,
-                            corrupt: true,
-                        })?;
-                    }
-                    if decision.recovered_recorded_drops > 0 {
-                        let _ = queue.try_enqueue(RecordWork::RecoveredDrops {
-                            dropped: decision.recovered_recorded_drops,
-                            host_monotonic_ns: frame.host_monotonic_ns,
-                            corrupt: false,
-                        })?;
-                    }
+                } else if enqueue_recovered_drops(
+                    queue,
+                    shared,
+                    &dispatch,
+                    corrupt_recorded_drops,
+                    frame.host_monotonic_ns,
+                    true,
+                )? {
+                    let _ = enqueue_recovered_drops(
+                        queue,
+                        shared,
+                        &dispatch,
+                        decision.recovered_recorded_drops,
+                        frame.host_monotonic_ns,
+                        false,
+                    )?;
                 }
             } else if decision.record {
                 let write_started = start_stage(metrics);
@@ -1247,6 +1244,38 @@ fn process_frame(
     result
 }
 
+fn enqueue_recovered_drops(
+    queue: &RecordWorkQueue,
+    shared: &Shared,
+    dispatch: &SplitSinkRecording,
+    dropped: u64,
+    host_monotonic_ns: u64,
+    corrupt: bool,
+) -> Result<bool, RuntimeError> {
+    if dropped == 0 {
+        return Ok(true);
+    }
+    match queue.try_enqueue(RecordWork::RecoveredDrops {
+        dropped,
+        host_monotonic_ns,
+        corrupt,
+    })? {
+        EnqueueOutcome::Enqueued => Ok(true),
+        EnqueueOutcome::Closed => Ok(false),
+        EnqueueOutcome::Full => {
+            report_recording_failure(
+                shared,
+                RuntimeError::new(
+                    "encoder_backpressure_exhausted",
+                    "capture recording drop queue exhausted",
+                ),
+                Some(Arc::clone(&dispatch.on_failure)),
+            );
+            Ok(false)
+        }
+    }
+}
+
 fn recording_accepts_queued_work(shared: &Shared, recording: &SplitSinkRecording) -> bool {
     if recording.encoder_abort.is_aborted() {
         return false;
@@ -1312,26 +1341,36 @@ fn run_record_loop(
                     write_started,
                 );
                 let _ = finish_recording_frame(&shared);
-                if let Err(mut error) = write_result {
-                    decorate_source_gap_error(
-                        &mut error,
-                        &item.frame,
-                        item.previous_source_frame,
-                        item.current_source_frame,
-                        item.validation_source_gap,
-                        item.validation_queue_rejected,
-                        &shared,
-                    );
-                    let remaining = queue.close_and_drain_remaining_frames();
-                    for _ in 0..remaining {
-                        let _ = finish_recording_frame(&shared);
+                match write_result {
+                    Ok(WriteFrameOutcome::Written) => {}
+                    Ok(WriteFrameOutcome::Stopped) => {
+                        let remaining = queue.close_and_drain_remaining_frames();
+                        for _ in 0..remaining {
+                            let _ = finish_recording_frame(&shared);
+                        }
+                        return;
                     }
-                    report_recording_failure(
-                        &shared,
-                        error,
-                        Some(Arc::clone(&recording.on_failure)),
-                    );
-                    return;
+                    Err(mut error) => {
+                        decorate_source_gap_error(
+                            &mut error,
+                            &item.frame,
+                            item.previous_source_frame,
+                            item.current_source_frame,
+                            item.validation_source_gap,
+                            item.validation_queue_rejected,
+                            &shared,
+                        );
+                        let remaining = queue.close_and_drain_remaining_frames();
+                        for _ in 0..remaining {
+                            let _ = finish_recording_frame(&shared);
+                        }
+                        report_recording_failure(
+                            &shared,
+                            error,
+                            Some(Arc::clone(&recording.on_failure)),
+                        );
+                        return;
+                    }
                 }
             }
         }
@@ -1402,6 +1441,12 @@ fn record_drops_on_take(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteFrameOutcome {
+    Written,
+    Stopped,
+}
+
 #[cfg(test)]
 fn write_split_sink_frame(
     recording: &SplitSinkRecording,
@@ -1419,6 +1464,7 @@ fn write_split_sink_frame(
         pre_extracted_jpeg,
         pre_extracted_counter,
     )
+    .map(|_| ())
 }
 
 fn write_split_sink_frame_with_drops(
@@ -1429,7 +1475,7 @@ fn write_split_sink_frame_with_drops(
     corrupt_recorded_drops: u64,
     pre_extracted_jpeg: Option<&[u8]>,
     pre_extracted_counter: Option<u32>,
-) -> Result<(), RuntimeError> {
+) -> Result<WriteFrameOutcome, RuntimeError> {
     if frame.raw_side_by_side.is_empty() {
         return Err(RuntimeError::new(
             "raw_frame_unavailable",
@@ -1464,6 +1510,30 @@ fn write_split_sink_frame_with_drops(
             source_gap: dropped_before,
         })?
     };
+    {
+        let mut encoder = recording.encoder.lock().map_err(|_| {
+            RuntimeError::new("encoder_failed", "encoder process mutex is poisoned")
+        })?;
+        let stopped_flag = &recording.capture_stopped_monotonic_ns;
+        if let Err(error) = encoder.submit_frame_with_stop_check(
+            reserved.record_sequence,
+            reserved.host_monotonic_ns,
+            payload,
+            || stopped_flag.load(Ordering::Acquire) != 0,
+        ) {
+            if error.code == "capture_stopped" {
+                let mut writer = recording.active_take.lock().map_err(|_| {
+                    RuntimeError::new(
+                        "active_take_writer_poisoned",
+                        "active take writer mutex is poisoned",
+                    )
+                })?;
+                writer.cancel_pending_frame(reserved)?;
+                return Ok(WriteFrameOutcome::Stopped);
+            }
+            return Err(encoder_runtime_error(error));
+        }
+    }
     let plan = {
         let mut planner = recording.segment_planner.lock().map_err(|_| {
             RuntimeError::new(
@@ -1473,20 +1543,6 @@ fn write_split_sink_frame_with_drops(
         })?;
         planner.next_frame(reserved.record_sequence, elapsed_seconds)?
     };
-    {
-        let mut encoder = recording.encoder.lock().map_err(|_| {
-            RuntimeError::new("encoder_failed", "encoder process mutex is poisoned")
-        })?;
-        let stopped_flag = &recording.capture_stopped_monotonic_ns;
-        encoder
-            .submit_frame_with_stop_check(
-                reserved.record_sequence,
-                reserved.host_monotonic_ns,
-                payload,
-                || stopped_flag.load(Ordering::Acquire) != 0,
-            )
-            .map_err(encoder_runtime_error)?;
-    }
     let camera_counter_raw = pre_extracted_counter.or_else(|| recording::avi1_counter(payload));
     let written = {
         let mut sink = recording.sink.lock().map_err(|_| {
@@ -1531,7 +1587,7 @@ fn write_split_sink_frame_with_drops(
         })?;
         writer.finish_frame(reserved, written)?;
     }
-    Ok(())
+    Ok(WriteFrameOutcome::Written)
 }
 
 fn encoder_runtime_error(error: EncoderProcessError) -> RuntimeError {
@@ -3054,6 +3110,211 @@ mod tests {
             runtime.imu_worker.lock().unwrap().is_none(),
             "stop_recording must join capture-imu before returning even when record_worker fails"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn decimated_corrupt_drops_keep_phase_and_recovered_drops_full_queue_reports_backpressure() {
+        let root = temp_root("decimated-corrupt-and-drop-full");
+        let callbacks = Arc::new(TestFailureSink::default());
+        let mut target = test_recording(&root, Arc::clone(&callbacks));
+        let helper = root.join("encoder-helper.sh");
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '{\"event\":\"ready\"}\\n'\ncat >/dev/null\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut encoder = stereo_encoder::EncoderProcess::with_transport(
+            stereo_encoder::EncoderConfig {
+                out_dir: &root.join("video"),
+                executable: &helper,
+                width: 3840,
+                height: 1080,
+                fps: 60,
+                bitrate_kbps: 8192,
+                segment_frames: 3,
+                path_prefix: "video/",
+            },
+            stereo_encoder::EncoderTransport::StdinPipe,
+        )
+        .unwrap();
+        encoder
+            .configure(&["--intra-period".to_owned(), "3".to_owned()])
+            .unwrap();
+        encoder.start().unwrap();
+        target.encoder_abort = encoder.abort_handle();
+        target.encoder = Arc::new(Mutex::new(encoder));
+        target.recording_start_monotonic_ns = 20_000_000;
+        let active_take = Arc::clone(&target.active_take);
+
+        let runtime = Runtime::new(
+            Arc::new(Stream::test_idle(1)),
+            Arc::new(LatestBuffer::new(30).unwrap()),
+            2,
+            Duration::from_millis(10),
+            None,
+        )
+        .unwrap();
+        {
+            let mut state = runtime.shared.state.lock().unwrap();
+            state.running = true;
+            state.fanout.start_recording(false).unwrap();
+            state.recording = Some(Arc::new(target));
+        }
+
+        // Observed 0 -> recorded.
+        process_frame(
+            &runtime.preview,
+            &runtime.shared,
+            evidence_frame(1, Some(1)),
+            None,
+        )
+        .unwrap();
+        // Frame 2 (odd, not recorded) corrupt, frame 3 (even, recorded) corrupt -> frame 4 (odd):
+        // gap [1, 3) contains recorded index 2 -> corrupt_recorded_drops = 1, observed_index = 3 (not recorded).
+        let mut frame4 = evidence_frame(4, Some(4));
+        frame4.corrupt_dropped_before = 2;
+        process_frame(&runtime.preview, &runtime.shared, frame4, None).unwrap();
+        // Frame 5 (even, index 4) must be in-phase and recorded!
+        process_frame(
+            &runtime.preview,
+            &runtime.shared,
+            evidence_frame(5, Some(5)),
+            None,
+        )
+        .unwrap();
+
+        let summary = active_take.lock().unwrap().finish().unwrap();
+        assert_eq!(summary.frames_written, 2);
+        assert_eq!(summary.dropped_frames, 1);
+
+        // Also verify RecoveredDrops queue Full reports encoder_backpressure_exhausted.
+        let full_root = temp_root("recovered-drops-queue-full");
+        let full_cb = Arc::new(TestFailureSink::default());
+        let full_target = test_recording(&full_root, Arc::clone(&full_cb));
+        let queue = RecordWorkQueue::new();
+        for i in 0..RECORD_QUEUE_MAX_FRAMES as u64 {
+            assert!(matches!(
+                queue
+                    .try_enqueue(RecordWork::RecoveredDrops {
+                        dropped: 1,
+                        host_monotonic_ns: i,
+                        corrupt: false,
+                    })
+                    .unwrap(),
+                EnqueueOutcome::Enqueued
+            ));
+        }
+        let shared = Arc::clone(&runtime.shared);
+        let ok = enqueue_recovered_drops(&queue, &shared, &full_target, 1, 99, true).unwrap();
+        assert!(!ok);
+        assert_eq!(
+            full_cb.calls.lock().unwrap()[0].0,
+            "encoder_backpressure_exhausted"
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(full_root);
+    }
+
+    #[test]
+    fn clean_stop_during_backpressure_capture_stopped_leaves_no_pending_frame() {
+        let root = temp_root("capture-stopped-rollback");
+        fs::create_dir_all(root.join("video")).unwrap();
+        let helper = root.join("stalled-shm.sh");
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '{\"event\":\"ready\"}\\n'\nsleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut encoder = stereo_encoder::EncoderProcess::with_transport(
+            stereo_encoder::EncoderConfig {
+                out_dir: &root.join("video"),
+                executable: &helper,
+                width: 64,
+                height: 32,
+                fps: 30,
+                bitrate_kbps: 8192,
+                segment_frames: 3,
+                path_prefix: "video/",
+            },
+            stereo_encoder::EncoderTransport::ShmRing(crate::session::shm_ring::ShmRingConfig {
+                slot_count: 1,
+                slot_capacity: 2 * 1024 * 1024,
+            }),
+        )
+        .unwrap();
+        encoder
+            .configure(&["--intra-period".to_owned(), "3".to_owned()])
+            .unwrap();
+        encoder.start().unwrap();
+        let encoder = Arc::new(Mutex::new(encoder));
+
+        let runtime = Runtime::new(
+            Arc::new(Stream::test_idle(4)),
+            Arc::new(LatestBuffer::new(120).unwrap()),
+            1,
+            Duration::from_millis(10),
+            None,
+        )
+        .unwrap();
+        runtime.shared.state.lock().unwrap().running = true;
+
+        let callbacks = Arc::new(TestFailureSink::default());
+        let active_take = Arc::new(Mutex::new(
+            active_take::ActiveTakeWriter::new("session").unwrap(),
+        ));
+        let sink = Arc::new(Mutex::new(
+            recording::RecordingSink::create(&root, "session").unwrap(),
+        ));
+        let planner = Arc::new(Mutex::new(
+            recording::RecordingSegmentPlanner::new(3).unwrap(),
+        ));
+        let stopped = Arc::new(AtomicU64::new(0));
+
+        runtime
+            .start_recording(RecordingTarget {
+                active_take: Arc::clone(&active_take),
+                sink: Arc::clone(&sink),
+                encoder: Arc::clone(&encoder),
+                segment_planner: Arc::clone(&planner),
+                recording_start_monotonic_ns: 1_000_000,
+                on_failure: Arc::clone(&callbacks) as Arc<dyn FailureSink>,
+                imu: None,
+                imu_timeout: Duration::from_millis(10),
+                audio: None,
+                capture_stopped_monotonic_ns: Arc::clone(&stopped),
+                recover_source_gaps: false,
+            })
+            .unwrap();
+
+        // Slot 0 fits; slot 1 blocks in submit_frame_with_stop_check until stop_recording().
+        for seq in 1..=2_u64 {
+            process_frame(
+                &runtime.preview,
+                &runtime.shared,
+                evidence_frame(seq, Some(seq as u32)),
+                None,
+            )
+            .unwrap();
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        let snap = runtime.stop_recording(Duration::from_secs(2)).unwrap();
+        assert!(!snap.failure_reported);
+        assert!(callbacks.calls.lock().unwrap().is_empty());
+
+        let summary = active_take.lock().unwrap().finish().unwrap();
+        assert_eq!(summary.pending_frames, 0);
+        assert_eq!(summary.frames_written, 1);
+        assert_eq!(summary.frame_domain, 1);
+        let sink_snap = sink.lock().unwrap().flush_and_close().unwrap();
+        assert_eq!(sink_snap.frames_written, 1);
+        assert_eq!(planner.lock().unwrap().snapshot().frames_written, 1);
+
+        encoder.lock().unwrap().abort();
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -645,6 +645,113 @@ class FirstbootAndCleanupTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0)
             self.assertFalse((flat / "__pycache__").exists())
 
+    def test_storage_firstboot_mount_and_initialize_passes_config_env_to_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            cfg = root / "miro-ego-data-volume.env"
+            cfg.write_text(
+                "MIRO_EGO_DATA_VOLUME_MODE=exfat\n"
+                "MIRO_EGO_DATA_VOLUME_PARTUUID=db2e7205-03\n"
+                "MIRO_EGO_DATA_VOLUME_UUID=ABCD-1234\n"
+                "MIRO_EGO_DATA_MOUNTPOINT=/data\n",
+                encoding="utf-8",
+            )
+            helper = root / "miro-ego-data-volume"
+            helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            helper.chmod(0o755)
+
+            seen: list[tuple[tuple[str, ...], dict[str, str] | None]] = []
+
+            def fake_run(*args: str, env: dict[str, str] | None = None, **_kw: object) -> str:
+                seen.append((args, env))
+                return ""
+
+            with (
+                patch.object(storage_firstboot, "CONFIG", cfg),
+                patch.object(storage_firstboot, "run", side_effect=fake_run),
+                patch.object(storage_firstboot, "ensure_data_layout", return_value=True),
+            ):
+                ok = storage_firstboot.mount_and_initialize(
+                    Path("/dev/mmcblk0p3"),
+                    mountpoint=root / "data",
+                    helper=helper,
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0][0], (str(helper), "ensure"))
+            helper_env = seen[0][1]
+            assert helper_env is not None
+            self.assertEqual(helper_env["MIRO_EGO_DATA_VOLUME_PARTUUID"], "db2e7205-03")
+            self.assertEqual(helper_env["MIRO_EGO_DATA_VOLUME_UUID"], "ABCD-1234")
+            self.assertEqual(helper_env["MIRO_EGO_DATA_MOUNTPOINT"], "/data")
+
+    def test_firstboot_uses_manifest_trusted_public_key_hex_for_custom_signed_bundle(self) -> None:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        custom_seed = hashlib.sha256(b"custom-ci-release-seed-030").digest()
+        custom_pub_hex = (
+            Ed25519PrivateKey.from_private_bytes(custom_seed)
+            .public_key()
+            .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            .hex()
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            state_root = base / "state"
+            config_p1 = base / "boot_config"
+            boot = config_p1 / "miro-ego"
+            hook_path = config_p1 / "hobot_config.sh"
+            unit_path = base / "miro-ego-firstboot.service"
+            voice_path = base / "voice.json"
+            state_root.mkdir()
+            boot.mkdir(parents=True)
+            hook_path.write_text(provision.HOOK, encoding="utf-8")
+            unit_path.write_text(firstboot.UNIT, encoding="utf-8")
+
+            _, layout = partition_layout.plan(vendor_mbr(), 64 * 1024**3)
+            profile = factory_profile(board="a" * 64, voice_volume=42, voice_enabled=False)
+            sealed = provision.seal_profile(profile)
+            (boot / "profile.bin").write_bytes(sealed)
+
+            archive = make_native_bundle(boot / "bundle.tar", signing_seed=custom_seed)
+            manifest = {
+                "schema": provision.AUTOINSTALL_SCHEMA,
+                "profile_sha256": hashlib.sha256(sealed).hexdigest(),
+                "bundle_sha256": disks.sha256_file(archive),
+                "bundle": {"trusted_public_key_hex": custom_pub_hex},
+                "storage": layout,
+            }
+            (boot / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            cleaned_env = dict(os.environ)
+            cleaned_env.pop("MIRO_EGO_RELEASE_PUBLIC_KEY_HEX", None)
+            with (
+                patch.dict(os.environ, cleaned_env, clear=True),
+                patch.object(firstboot, "ROOT", state_root),
+                patch.object(firstboot, "BOOT", boot),
+                patch.object(firstboot, "HOBOT_HOOK", hook_path),
+                patch.object(firstboot, "FIRSTBOOT_UNIT", unit_path),
+                patch.object(firstboot, "VOICE_STATE", voice_path),
+                patch.object(firstboot, "_resolve_service_owner", return_value=None),
+                patch.object(device, "hardware", return_value="a" * 64),
+                patch.object(device, "require_fresh"),
+                patch.object(device, "write_files"),
+                patch.object(device, "apply_service_permissions"),
+                patch.object(
+                    storage_firstboot,
+                    "prepare",
+                    return_value=(Path("/dev/mmcblk0p3"), "ABCD-1234"),
+                ),
+                patch.object(storage_firstboot, "mount_and_initialize", return_value=True),
+                patch.object(firstboot.shutil, "which", return_value="/usr/sbin/logrotate"),
+                patch.object(firstboot, "run"),
+                patch.object(os, "sync", create=True),
+            ):
+                firstboot.execute()
+                self.assertTrue(firstboot.complete())
+
 
 if __name__ == "__main__":
     unittest.main()

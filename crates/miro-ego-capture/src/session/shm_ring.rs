@@ -39,6 +39,8 @@ pub const DEFAULT_SLOT_COUNT: u32 = 16;
 pub const MAX_SLOT_COUNT: u32 = 256;
 pub const DEFAULT_SLOT_CAPACITY: u32 = 4 * 1024 * 1024;
 pub const MAX_SLOT_CAPACITY: u32 = 64 * 1024 * 1024;
+pub const MIN_MJPEG_SLOT_BYTES: u64 = 2 * 1024 * 1024;
+pub const MAX_DEFAULT_MJPEG_SLOT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Bit 0 of `ShmHeader::flags`: producer has reached EOF / shutdown.
 pub const SHM_FLAG_EOF: u32 = 1 << 0;
@@ -59,9 +61,31 @@ impl Default for ShmRingConfig {
 }
 
 impl ShmRingConfig {
+    pub fn for_dimensions(width: u32, height: u32) -> Self {
+        let slot_capacity = min_slot_capacity_for_dimensions(u64::from(width), u64::from(height))
+            .unwrap_or(DEFAULT_SLOT_CAPACITY)
+            .max(DEFAULT_SLOT_CAPACITY);
+        Self {
+            slot_count: DEFAULT_SLOT_COUNT,
+            slot_capacity,
+        }
+    }
+
     pub fn validate(self) -> Result<ShmLayout, ShmRingError> {
         ShmLayout::compute(self.slot_count, self.slot_capacity)
     }
+}
+
+/// Minimum SHM slot capacity (bytes) sized for compressed stereo MJPEG payloads:
+/// page-aligned `(width * height)` clamped to `2 MiB ..= 8 MiB`.
+pub fn min_slot_capacity_for_dimensions(width: u64, height: u64) -> Option<u32> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let pixels = width.checked_mul(height)?;
+    let page_aligned = pixels.checked_add(0xfff).map(|v| v & !0xfff)?;
+    let sized = page_aligned.clamp(MIN_MJPEG_SLOT_BYTES, MAX_DEFAULT_MJPEG_SLOT_BYTES);
+    u32::try_from(sized).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1306,5 +1330,19 @@ mod tests {
         assert!(producer.shm_raw_fd() >= 3);
         assert!(producer.kick_raw_fd() >= 3);
         assert!(producer.done_raw_fd() >= 3);
+    }
+
+    #[test]
+    fn shm_ring_config_for_dimensions_scales_for_4k_and_preserves_4mib_floor() {
+        let uhd = ShmRingConfig::for_dimensions(3840, 2160);
+        assert_eq!(uhd.slot_count, DEFAULT_SLOT_COUNT);
+        assert_eq!(uhd.slot_capacity, 8_294_400);
+        assert!(uhd.validate().is_ok());
+
+        let sbs = ShmRingConfig::for_dimensions(3840, 1080);
+        assert_eq!(sbs.slot_capacity, DEFAULT_SLOT_CAPACITY);
+
+        let small = ShmRingConfig::for_dimensions(640, 480);
+        assert_eq!(small.slot_capacity, DEFAULT_SLOT_CAPACITY);
     }
 }

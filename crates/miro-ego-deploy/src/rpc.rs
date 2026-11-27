@@ -524,12 +524,13 @@ impl DeployTaskCoordinator {
             finished_at: None,
         };
 
-        let started = self.spawn_worker(task, idem_meta, locks, move |mgr, held_locks| {
-            mgr.install_verified_with_locks(&verified, activate, held_locks)
-        })?;
+        let (started, replayed) =
+            self.spawn_worker(task, idem_meta, locks, move |mgr, held_locks| {
+                mgr.install_verified_with_locks(&verified, activate, held_locks)
+            })?;
         Ok(DeployMutationOutcome {
             task: started,
-            replayed: false,
+            replayed,
         })
     }
 
@@ -586,12 +587,13 @@ impl DeployTaskCoordinator {
             finished_at: None,
         };
 
-        let started = self.spawn_worker(task, idem_meta, locks, move |mgr, held_locks| {
-            mgr.rollback_with_locks(activate, held_locks)
-        })?;
+        let (started, replayed) =
+            self.spawn_worker(task, idem_meta, locks, move |mgr, held_locks| {
+                mgr.rollback_with_locks(activate, held_locks)
+            })?;
         Ok(DeployMutationOutcome {
             task: started,
-            replayed: false,
+            replayed,
         })
     }
 
@@ -601,7 +603,7 @@ impl DeployTaskCoordinator {
         idem_meta: Option<(String, String)>,
         locks: HeldDeployLocks,
         op: F,
-    ) -> DeployResult<FirmwareTaskSnapshot>
+    ) -> DeployResult<(FirmwareTaskSnapshot, bool)>
     where
         F: FnOnce(&ReleaseManager, &mut HeldDeployLocks) -> DeployResult<DeploymentStatus>
             + Send
@@ -618,7 +620,13 @@ impl DeployTaskCoordinator {
                                     .to_owned(),
                         });
                     }
-                    return Ok(existing.task.clone());
+                    let current = guard
+                        .latest_task
+                        .as_ref()
+                        .filter(|t| t.id == existing.task.id)
+                        .cloned()
+                        .unwrap_or_else(|| existing.task.clone());
+                    return Ok((current, true));
                 }
             }
             if guard.active {
@@ -758,7 +766,7 @@ impl DeployTaskCoordinator {
             Ok(handle) => {
                 let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 guard.worker_handle = Some(handle);
-                Ok(initial_task)
+                Ok((initial_task, false))
             }
             Err(err) => {
                 let persisted = {
@@ -1280,6 +1288,48 @@ impl Drop for DeployRpcServer {
     }
 }
 
+fn peer_uid_authorized(stream: &UnixStream) -> Result<(), String> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc != 0 || (len as usize) < std::mem::size_of::<libc::ucred>() {
+        return Err(format!(
+            "failed to inspect peer credentials: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        if cred.uid == euid {
+            return Ok(());
+        }
+        return Err(format!(
+            "peer uid {} unauthorized (expected {euid})",
+            cred.uid
+        ));
+    }
+    if cred.uid == 0
+        || crate::manager::lookup_miro_ego_uid_gid()
+            .0
+            .is_some_and(|uid| cred.uid == uid)
+    {
+        return Ok(());
+    }
+    Err(format!("peer uid {} is not authorized", cred.uid))
+}
+
 fn handle_connection(
     mut stream: UnixStream,
     coordinator: &Arc<DeployTaskCoordinator>,
@@ -1289,6 +1339,12 @@ fn handle_connection(
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(config.read_timeout));
     let _ = stream.set_write_timeout(Some(config.write_timeout));
+
+    if let Err(msg) = peer_uid_authorized(&stream) {
+        let denied = DeployRpcResponse::error("permission_denied", msg, None, false);
+        let _ = write_framed_response(stream, &denied, config.max_line_bytes, config.write_timeout);
+        return;
+    }
 
     let response = match read_ndjson_line(&mut stream, config.max_line_bytes, config.read_timeout) {
         Ok(None) => return,
@@ -1316,10 +1372,13 @@ fn handle_connection(
         config.max_line_bytes,
         config.write_timeout,
     );
-    if matches!(
-        response.operation.as_deref(),
-        Some("install" | "update" | "rollback")
-    ) {
+    if response.ok
+        && response.replayed == Some(false)
+        && matches!(
+            response.operation.as_deref(),
+            Some("install" | "update" | "rollback")
+        )
+    {
         coordinator.notify_response_flushed();
     }
 }
@@ -1999,24 +2058,20 @@ fn best_effort_chgrp_miro_ego(path: &Path) {
     if unsafe { libc::geteuid() } != 0 {
         return;
     }
-    let Ok(group_c) = CString::new("miro-ego") else {
+    let Some(gid) = crate::manager::lookup_miro_ego_uid_gid().1 else {
         return;
     };
     let Ok(path_c) = CString::new(path.as_os_str().as_bytes()) else {
         return;
     };
     unsafe {
-        let grp = libc::getgrnam(group_c.as_ptr());
-        if !grp.is_null() {
-            let gid = (*grp).gr_gid;
-            let _ = libc::fchownat(
-                libc::AT_FDCWD,
-                path_c.as_ptr(),
-                u32::MAX,
-                gid,
-                libc::AT_SYMLINK_NOFOLLOW,
-            );
-        }
+        let _ = libc::fchownat(
+            libc::AT_FDCWD,
+            path_c.as_ptr(),
+            u32::MAX,
+            gid,
+            libc::AT_SYMLINK_NOFOLLOW,
+        );
     }
 }
 
@@ -2055,13 +2110,7 @@ mod tests {
             "miro-ego-deploy-rpc-{tag}-{}-{unique}",
             std::process::id()
         ));
-        let paths = ReleaseManagerPaths {
-            install_root: root.join("opt/miro-ego"),
-            config_root: root.join("etc/miro-ego"),
-            state_root: root.join("var/lib/miro-ego"),
-            run_dir: root.join("run/miro-ego"),
-            system_root: root.clone(),
-        };
+        let paths = ReleaseManagerPaths::for_system_root(&root);
         fs::create_dir_all(&paths.run_dir).unwrap();
         (root, paths)
     }

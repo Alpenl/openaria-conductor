@@ -30,7 +30,6 @@ LAST_REBOOT_FILE=$STATE_DIRECTORY/last-automatic-reboot-epoch
 
 log()
 {
-    logger -t "$TAG" -- "$*"
     printf '%s: %s\n' "$TAG" "$*"
 }
 
@@ -161,7 +160,7 @@ resolve_gateway()
         return
     fi
     ip -4 route show default dev "$INTERFACE" 2>/dev/null \
-        | awk '/^default / {print $3; exit}'
+        | awk '/^default via / {print $3; exit}'
 }
 
 is_healthy()

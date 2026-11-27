@@ -743,6 +743,90 @@ class SpectacularTests(unittest.TestCase):
         with self.assertRaisesRegex(CaptureValidationError, "not a real directory"):
             load_capture(sym_root)
 
+    def test_effective_fps_within_rate_tolerance_passes_and_fits_against_expected_fps(
+        self,
+    ) -> None:
+        manifest = _read_manifest(self.session)
+        # 29.5 fps is ~16,667 ppm away from nominal 30.0 (within 20,000 ppm).
+        manifest["camera"]["effective_fps"] = 29.5
+        _write_manifest(self.session, manifest)
+        timing = analyze_capture(self.session)
+        self.assertEqual(timing.capture.fps, 30.0)
+        self.assertEqual(timing.frame_clock.expected_rate_hz, 30.0)
+
+        # 29.0 fps is ~33,333 ppm away from nominal 30.0 (exceeds 20,000 ppm).
+        manifest["camera"]["effective_fps"] = 29.0
+        _write_manifest(self.session, manifest)
+        with self.assertRaisesRegex(CaptureValidationError, "effective_fps"):
+            load_capture(self.session)
+
+    def test_zstd_stream_preserves_inner_capture_validation_error(self) -> None:
+        if _compress_zstd_or_none(b"probe\n") is None:
+            self.skipTest("No Zstandard compressor available in current Python runtime")
+
+        zstd_session = _make_calibration_session(
+            self.root,
+            name="session-zstd-inner-err",
+            zstd_metadata=True,
+        )
+        manifest = _read_manifest(zstd_session)
+        bad_payload = b'{"broken":NaN}\n'
+        bad_zst = _compress_zstd_or_none(bad_payload)
+        assert bad_zst is not None
+        frames_path = zstd_session / "frames/frames.ndjson.zst"
+        frames_path.write_bytes(bad_zst)
+        digest = hashlib.sha256(bad_zst).hexdigest()
+        manifest["frames"]["artifact"]["bytes"] = len(bad_zst)
+        manifest["frames"]["artifact"]["sha256"] = digest
+        manifest["frames"]["artifact"]["artifact_id"] = digest
+        manifest["frames"]["artifact"]["storage_encoding"]["uncompressed_bytes"] = len(bad_payload)
+        manifest["frames"]["artifact"]["storage_encoding"]["uncompressed_sha256"] = hashlib.sha256(
+            bad_payload
+        ).hexdigest()
+        _write_manifest(zstd_session, manifest)
+
+        with self.assertRaisesRegex(CaptureValidationError, "non-finite JSON number"):
+            load_capture(zstd_session)
+
+    def test_per_sample_imu_timestamps_with_2_5ms_sample0_offset_validate_and_interpolate(
+        self,
+    ) -> None:
+        session = _make_calibration_session(self.root, name="imu-per-sample-offsets")
+
+        def set_per_sample(rows: list[dict[str, Any]]) -> None:
+            for r in rows:
+                r["device_ticks"] = 1000
+                r["device_timestamp_raw"] = 1000
+                mid = 1_000_000_000 + int(r["packet_sequence"]) * 5_000_000
+                r["host_read_start_ns"] = mid - 2_000_000
+                r["host_read_end_ns"] = mid + 2_000_000
+                r["host_monotonic_ns"] = mid - 2_500_000 if int(r["sample_index"]) == 0 else mid
+
+        _rewrite_ndjson_artifact(session, "imu", set_per_sample)
+        timing = analyze_capture(session, imu_rate_hz=400.0)
+        for prev, curr in zip(timing.imu_times_ns, timing.imu_times_ns[1:], strict=False):
+            self.assertEqual(curr - prev, 2_500_000)
+
+        out_of_order = _make_calibration_session(self.root, name="imu-intra-packet-ooo")
+
+        def set_ooo(rows: list[dict[str, Any]]) -> None:
+            set_per_sample(rows)
+            rows[0]["host_monotonic_ns"] = int(rows[1]["host_monotonic_ns"]) + 100
+
+        _rewrite_ndjson_artifact(out_of_order, "imu", set_ooo)
+        with self.assertRaisesRegex(CaptureValidationError, "disagree"):
+            analyze_capture(out_of_order, imu_rate_hz=400.0)
+
+        bad_latest = _make_calibration_session(self.root, name="imu-latest-outside-interval")
+
+        def set_bad_latest(rows: list[dict[str, Any]]) -> None:
+            set_per_sample(rows)
+            rows[1]["host_monotonic_ns"] = int(rows[1]["host_read_start_ns"]) - 1
+
+        _rewrite_ndjson_artifact(bad_latest, "imu", set_bad_latest)
+        with self.assertRaisesRegex(CaptureValidationError, "host interval is invalid"):
+            analyze_capture(bad_latest, imu_rate_hz=400.0)
+
 
 if __name__ == "__main__":
     unittest.main()
