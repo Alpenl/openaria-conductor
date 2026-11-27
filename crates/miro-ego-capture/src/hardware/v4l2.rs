@@ -660,6 +660,10 @@ impl Capture {
         Ok(capture)
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.fd.is_none()
+    }
+
     fn fd(&self) -> Result<RawFd, CaptureError> {
         self.fd
             .ok_or_else(|| CaptureError::new("invalid_state", "V4L2 capture is closed"))

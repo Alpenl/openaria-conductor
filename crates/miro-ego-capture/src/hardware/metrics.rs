@@ -353,7 +353,7 @@ fn stage_bucket(elapsed_ns: u64) -> usize {
 }
 
 fn percentile(histogram: &[u64; 64], samples: u64, percentile: f64) -> u64 {
-    let threshold = ((samples as f64) * percentile + 0.999999).max(1.0) as u64;
+    let threshold = ((samples as f64) * percentile).ceil().max(1.0) as u64;
     let mut seen = 0_u64;
     for (bucket, count) in histogram.iter().enumerate() {
         seen += count;

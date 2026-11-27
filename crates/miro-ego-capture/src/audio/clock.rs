@@ -5,12 +5,13 @@
 
 pub type Anchor = [u64; 5];
 
-/// Retain one host observation for each ALSA sample/time pair. USB reads can
-/// observe the same hardware point again with a later, individually validated
-/// host bracket; it is not a new point and must not duplicate a final anchor.
+/// Retain one host observation for each ALSA hardware timestamp. USB reads can
+/// observe the same ALSA `htimestamp` again (with the same or a further-advanced
+/// sample count) under a later host bracket; keep `first` so repeated DMA clock
+/// snapshots do not create zero-delta timestamp pairs.
 pub fn retain_same_point(previous: Option<Anchor>, next: Anchor) -> Anchor {
     match previous {
-        Some(first) if first[..2] == next[..2] => first,
+        Some(first) if next[0] >= first[0] && next[1] == first[1] => first,
         _ => next,
     }
 }
@@ -80,8 +81,8 @@ fn sample_time(points: &[[u64; 2]], sample: u64) -> f64 {
     let first = points[index - 1];
     let last = points[index];
     first[1] as f64
-        + (sample as f64 - first[0] as f64) * (last[1] - first[1]) as f64
-            / (last[0] - first[0]) as f64
+        + (sample as f64 - first[0] as f64) * (last[1] as f64 - first[1] as f64)
+            / (last[0] as f64 - first[0] as f64)
 }
 
 pub fn evaluate(
@@ -91,13 +92,35 @@ pub fn evaluate(
     period: u64,
     buffer: u64,
 ) -> Result<Model, String> {
-    if anchors.len() < 2 || rate == 0 || samples == 0 || period == 0 || period > buffer {
+    if anchors.is_empty() || rate == 0 || samples == 0 || period == 0 || period > buffer {
         return Err("invalid raw audio clock domain".into());
     }
     let points = anchors
         .iter()
         .map(|anchor| mapped_ns(anchor).map(|mono| [anchor[0], mono]))
         .collect::<Result<Vec<_>, _>>()?;
+    if anchors.len() == 1 {
+        let only = anchors[0];
+        let mono = points[0][1];
+        if only[0] > buffer.saturating_add(period)
+            || only[0] < samples
+            || only[0] > samples.saturating_add(buffer)
+        {
+            return Err("raw audio anchors do not cover captured samples".into());
+        }
+        let nominal_slope = 1e9 / f64::from(rate);
+        let start_ns = mono as f64 - (only[0] as f64) * nominal_slope;
+        let end_ns = start_ns + (samples as f64) * nominal_slope;
+        let residual_ns = ((only[4] - only[3]) as f64) / 2.0;
+        if !start_ns.is_finite() || start_ns <= 0.0 || residual_ns > 20_000_000.0 {
+            return Err("invalid mapped audio clock".into());
+        }
+        return Ok(Model {
+            start_ns,
+            end_ns,
+            residual_ns,
+        });
+    }
     for (pair, mapped) in anchors.windows(2).zip(points.windows(2)) {
         let (first, last) = (pair[0], pair[1]);
         if last[0] <= first[0]
@@ -305,9 +328,17 @@ mod repeated_point_tests {
             1_000_100_050,
             1_000_100_150,
         ];
+        let later_advanced = [
+            4801,
+            1_000_000_000,
+            2_000_100_100,
+            1_000_100_050,
+            1_000_100_150,
+        ];
         assert!(super::mapped_ns(&first).is_ok());
         assert!(super::mapped_ns(&later).is_ok());
         assert_eq!(retain_same_point(Some(first), later), first);
+        assert_eq!(retain_same_point(Some(first), later_advanced), first);
         assert_eq!(retain_same_point(None, later), later);
     }
 
@@ -324,10 +355,24 @@ mod repeated_point_tests {
             (4801, 1_000_001_000),
             (4799, 999_999_000),
             (4800, 1_000_001_000),
-            (4801, 1_000_000_000),
+            (4799, 1_000_000_000),
         ] {
             let next = [sample, raw, 2_000_100_100, 1_000_100_050, 1_000_100_150];
             assert_eq!(retain_same_point(Some(first), next), next);
         }
+    }
+
+    #[test]
+    fn single_anchor_short_take_evaluates_cleanly() {
+        let single = [[
+            480,
+            2_010_000_000,
+            1_110_020_000,
+            2_010_010_000,
+            2_010_030_000,
+        ]];
+        let model = super::evaluate(&single, 48_000, 480, 1024, 48_000).unwrap();
+        assert!((model.end_ns - model.start_ns - 10_000_000.0).abs() < 1.0);
+        assert!(model.residual_ns <= 20_000.0);
     }
 }

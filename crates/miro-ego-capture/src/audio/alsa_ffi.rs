@@ -295,6 +295,7 @@ impl Pcm {
                 ),
             ));
         }
+        direction = 0;
         let mut period = SndPcmUframes::try_from(DEFAULT_PERIOD_FRAMES)
             .map_err(|_| AudioError::new("invalid_argument", "period is too large"))?;
         self.check(
@@ -335,6 +336,15 @@ impl Pcm {
         })?;
         self.period_frames = pcm_frames_u64(period);
         self.buffer_frames = pcm_frames_u64(buffer);
+        if self.period_frames == 0 || self.period_frames > self.buffer_frames {
+            return Err(AudioError::new(
+                "unsupported_audio_mode",
+                format!(
+                    "ALSA selected invalid geometry: period_frames={} buffer_frames={}",
+                    self.period_frames, self.buffer_frames
+                ),
+            ));
+        }
         self.bytes_per_frame = bytes_per_frame;
         let mut sw = std::ptr::null_mut();
         self.check("audio_failed", "sw_params_malloc", unsafe {

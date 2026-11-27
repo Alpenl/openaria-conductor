@@ -516,21 +516,33 @@ impl Stream {
         match joined {
             Ok(mut resources) => {
                 drain_pending_controls(&resources.controls);
-                let stop_result = resources.capture.stop().map_err(StreamError::from);
+                let stop_result = if resources.capture.is_closed() {
+                    Ok(())
+                } else {
+                    resources.capture.stop().map_err(StreamError::from)
+                };
+                let must_close = stop_result.is_err() || resources.capture.is_closed();
+                if must_close {
+                    resources.close();
+                }
                 let mut lifecycle = self.lifecycle.lock().map_err(|_| {
                     resources.close();
                     StreamError::new("native_camera_poisoned", "native camera mutex is poisoned")
                 })?;
                 drain_pending_controls(&resources.controls);
-                lifecycle.resources = Some(resources);
-                lifecycle.state = State::Stopped;
-                *self
-                    .terminal_error
+                if must_close {
+                    lifecycle.resources = None;
+                    lifecycle.state = State::Closed;
+                } else {
+                    lifecycle.resources = Some(resources);
+                    lifecycle.state = State::Stopped;
+                }
+                self.terminal_error
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(StreamError::new(
-                    "capture_stopped",
-                    "native camera capture stopped",
-                ));
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get_or_insert_with(|| {
+                        StreamError::new("capture_stopped", "native camera capture stopped")
+                    });
                 self.consumer.close_and_clear();
                 self.lifecycle_changed.notify_all();
                 stop_result
@@ -804,5 +816,31 @@ mod tests {
         );
         // Subsequent focus_status on Stopped returns directly from capture.
         assert!(stream.focus_status().unwrap().is_some());
+    }
+
+    #[test]
+    fn stop_preserves_causal_terminal_error_and_transitions_closed_capture_to_closed() {
+        let mut capture = crate::hardware::v4l2::Capture::test_fake(false).unwrap();
+        capture.close();
+        assert!(capture.is_closed());
+        let stream =
+            std::sync::Arc::new(super::Stream::from_parts(capture, None, 3840, 1080, 4).unwrap());
+        {
+            let mut lifecycle = stream.lifecycle.lock().unwrap();
+            let resources = lifecycle.resources.take().unwrap();
+            lifecycle.state = super::State::Running;
+            lifecycle.worker = Some(std::thread::spawn(move || Some(resources)));
+        }
+        *stream.terminal_error.lock().unwrap() = Some(super::StreamError::new(
+            "device_disconnected",
+            "usb camera unplugged",
+        ));
+        stream.stop().unwrap();
+        let lifecycle = stream.lifecycle.lock().unwrap();
+        assert_eq!(lifecycle.state, super::State::Closed);
+        assert!(lifecycle.resources.is_none());
+        let err_guard = stream.terminal_error.lock().unwrap();
+        assert_eq!(err_guard.as_ref().unwrap().code, "device_disconnected");
+        assert_eq!(err_guard.as_ref().unwrap().message, "usb camera unplugged");
     }
 }

@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static void set_error(char *error, size_t error_len, const char *fmt, ...)
@@ -76,10 +77,43 @@ static int wait_eventfd(int fd, int timeout_ms)
     pfd.events = POLLIN;
     pfd.revents = 0;
 
+    struct timespec deadline = {0};
+    if (timeout_ms > 0) {
+        if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+            return -1;
+        }
+        deadline.tv_sec += timeout_ms / 1000;
+        deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+    }
+
     int ret;
-    do {
-        ret = poll(&pfd, 1, timeout_ms);
-    } while (ret < 0 && errno == EINTR);
+    for (;;) {
+        int wait_ms = timeout_ms;
+        if (timeout_ms > 0) {
+            struct timespec now = {0};
+            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+                return -1;
+            }
+            long long rem_ns =
+                ((long long)deadline.tv_sec - (long long)now.tv_sec) * 1000000000LL +
+                ((long long)deadline.tv_nsec - (long long)now.tv_nsec);
+            if (rem_ns <= 0) {
+                ret = 0;
+                break;
+            }
+            long long rem_ms = (rem_ns + 999999LL) / 1000000LL;
+            wait_ms = rem_ms > (long long)INT32_MAX ? INT32_MAX : (int)rem_ms;
+        }
+        pfd.revents = 0;
+        ret = poll(&pfd, 1, wait_ms);
+        if (ret >= 0 || errno != EINTR) {
+            break;
+        }
+    }
 
     if (ret < 0) {
         return -1;
@@ -243,12 +277,14 @@ miro_ego_shm_status_t miro_ego_shm_ring_receive(miro_ego_shm_ring_t *ring,
         if (read_idx < write_idx) {
             const uint64_t slot_idx = read_idx & (uint64_t)ring->slot_mask;
             const miro_ego_shm_slot_t desc = ring->slots[slot_idx];
+            const uint64_t expected_offset =
+                ring->data_offset + slot_idx * (uint64_t)ring->slot_capacity;
 
             if (desc.payload_len == 0u ||
                 desc.payload_len > ring->slot_capacity ||
-                desc.data_offset < ring->data_offset ||
-                desc.data_offset > (uint64_t)ring->map_size ||
-                (uint64_t)desc.payload_len > (uint64_t)ring->map_size - desc.data_offset) {
+                desc.data_offset != expected_offset ||
+                expected_offset > (uint64_t)ring->map_size ||
+                (uint64_t)desc.payload_len > (uint64_t)ring->map_size - expected_offset) {
                 return MIRO_EGO_SHM_CORRUPT;
             }
 
@@ -381,6 +417,11 @@ miro_ego_shm_status_t miro_ego_shm_ring_push(miro_ego_shm_ring_t *ring,
     }
 
     for (;;) {
+        const uint32_t hdr_flags =
+            atomic_load_explicit(&ring->header->flags, memory_order_acquire);
+        if ((hdr_flags & MIRO_EGO_SHM_FLAG_EOF) != 0u) {
+            return MIRO_EGO_SHM_EOF;
+        }
         const uint64_t write_idx =
             atomic_load_explicit(&ring->header->write_idx, memory_order_relaxed);
         const uint64_t read_idx =

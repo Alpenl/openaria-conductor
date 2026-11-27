@@ -5,9 +5,9 @@ use std::fs;
 use std::io;
 use std::os::fd::RawFd;
 use std::os::raw::c_ulong;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 use std::time::Duration;
 
 const UVC_GET_CUR: u8 = 0x81;
@@ -238,8 +238,9 @@ impl Collector {
             }
             result
         };
-        // Symmetric SeqCst check so a concurrent close() that missed try_lock()
-        // while we held `io` never leaves the device descriptor open.
+        // Explicit SeqCst fence after releasing `io` so weak-memory architectures
+        // (AArch64) cannot reorder `Release` unlock past the `SeqCst` stop check.
+        fence(Ordering::SeqCst);
         if self.stop.load(Ordering::SeqCst) {
             if let Ok(mut io) = self.io.try_lock() {
                 io.close();
@@ -250,6 +251,7 @@ impl Collector {
 
     pub fn close(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         if let Ok(mut io) = self.io.try_lock() {
             io.close();
         }
@@ -520,7 +522,12 @@ fn open_device(device: &str) -> Result<RawFd, ImuError> {
     let device = CString::new(device)
         .map_err(|_| ImuError::new("invalid_argument", "device contains NUL"))?;
     let fd = loop {
-        let fd = unsafe { libc::open(device.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        let fd = unsafe {
+            libc::open(
+                device.as_ptr(),
+                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
         if fd >= 0 {
             break fd;
         }
@@ -547,15 +554,21 @@ fn uvc_ioctl_ctrl_query() -> c_ulong {
         | (0x21 << IOC_NRSHIFT)) as c_ulong
 }
 
-fn discover_uvc_xu_unit(device: &str) -> Result<u8, ImuError> {
-    let name = Path::new(device)
+fn resolve_video_node_name(device: &Path) -> Option<String> {
+    let canonical = fs::canonicalize(device).unwrap_or_else(|_| PathBuf::from(device));
+    canonical
         .file_name()
         .and_then(|value| value.to_str())
+        .map(str::to_owned)
+}
+
+fn discover_uvc_xu_unit(device: &str) -> Result<u8, ImuError> {
+    let name = resolve_video_node_name(Path::new(device))
         .ok_or_else(|| ImuError::new("xu_discovery_unavailable", "invalid video device path"))?;
     let class_entry = Path::new("/sys")
         .join("class")
         .join("video4linux")
-        .join(name)
+        .join(&name)
         .join("device");
     let resolved = fs::canonicalize(&class_entry).map_err(|error| {
         ImuError::io(
@@ -616,6 +629,12 @@ fn find_uvc_xu_unit(descriptors: &[u8]) -> Result<u8, ImuError> {
     let mut selected = None;
     for (unit, guid) in parse_uvc_extension_units(descriptors)? {
         if guid == XU_GUID_BYTES {
+            if unit == 0 {
+                return Err(ImuError::new(
+                    "xu_descriptor_invalid",
+                    "UVC XU unit ID must be non-zero",
+                ));
+            }
             if selected.is_some() {
                 return Err(ImuError::new(
                     "xu_ambiguous",
@@ -779,24 +798,31 @@ impl TimeSynchronizer {
                 quality: "insufficient",
             });
         }
+        let Some(origin) = self.points.front().copied() else {
+            return Ok(SyncEstimate {
+                offset_ns: None,
+                residual_ns: None,
+                quality: "insufficient",
+            });
+        };
         let count_f64 = count as f64;
-        let mean_x = self
+        let mean_dx = self
             .points
             .iter()
-            .map(|point| point.device_ticks as f64)
+            .map(|point| (point.device_ticks - origin.device_ticks) as f64)
             .sum::<f64>()
             / count_f64;
-        let mean_y = self
+        let mean_dy = self
             .points
             .iter()
-            .map(|point| point.host_ns as f64)
+            .map(|point| (point.host_ns - origin.host_ns) as f64)
             .sum::<f64>()
             / count_f64;
         let denominator = self
             .points
             .iter()
             .map(|point| {
-                let x = point.device_ticks as f64 - mean_x;
+                let x = (point.device_ticks - origin.device_ticks) as f64 - mean_dx;
                 x * x
             })
             .sum::<f64>();
@@ -810,7 +836,11 @@ impl TimeSynchronizer {
         let scale = self
             .points
             .iter()
-            .map(|point| (point.device_ticks as f64 - mean_x) * (point.host_ns as f64 - mean_y))
+            .map(|point| {
+                let x = (point.device_ticks - origin.device_ticks) as f64 - mean_dx;
+                let y = (point.host_ns - origin.host_ns) as f64 - mean_dy;
+                x * y
+            })
             .sum::<f64>()
             / denominator;
         if !scale.is_finite() || scale <= 0.0 {
@@ -819,13 +849,27 @@ impl TimeSynchronizer {
                 "device clock fit slope is invalid",
             ));
         }
-        let offset = mean_y - scale * mean_x;
+        let delta_from_origin = (mean_dy - scale * mean_dx) - scale * (origin.device_ticks as f64);
+        if !delta_from_origin.is_finite()
+            || delta_from_origin < (i64::MIN as f64)
+            || delta_from_origin > (i64::MAX as f64)
+        {
+            return Err(ImuError::new(
+                "invalid_clock_fit",
+                "device clock offset is out of range",
+            ));
+        }
+        let offset_i128 = i128::from(origin.host_ns) + (delta_from_origin.round() as i128);
+        let offset_ns = i64::try_from(offset_i128).map_err(|_| {
+            ImuError::new("invalid_clock_fit", "device clock offset overflowed i64")
+        })?;
         let fit_residual = self
             .points
             .iter()
             .map(|point| {
-                ((point.host_ns as f64 - mean_y) - scale * (point.device_ticks as f64 - mean_x))
-                    .abs()
+                let x = (point.device_ticks - origin.device_ticks) as f64 - mean_dx;
+                let y = (point.host_ns - origin.host_ns) as f64 - mean_dy;
+                (y - scale * x).abs()
             })
             .fold(0.0_f64, f64::max);
         let uncertainty = self
@@ -841,7 +885,7 @@ impl TimeSynchronizer {
             "good"
         };
         Ok(SyncEstimate {
-            offset_ns: Some(offset.round() as i64),
+            offset_ns: Some(offset_ns),
             residual_ns: Some(residual),
             quality,
         })
@@ -1001,6 +1045,31 @@ mod tests {
         );
         descriptors.extend_from_slice(&extension);
         assert_eq!(find_uvc_xu_unit(&descriptors).unwrap(), 7);
+
+        let mut zero_unit = vec![24, UVC_CS_INTERFACE, UVC_EXTENSION_UNIT, 0];
+        zero_unit.extend_from_slice(&XU_GUID_BYTES);
+        zero_unit.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(
+            find_uvc_xu_unit(&zero_unit).unwrap_err().code,
+            "xu_descriptor_invalid"
+        );
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("miro-ego-imu-sym-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(dir.join("by-id")).unwrap();
+        let fake_node = dir.join("video7");
+        std::fs::write(&fake_node, b"").unwrap();
+        let sym = dir.join("by-id/usb-Miro_Ego_Cam-video-index0");
+        std::os::unix::fs::symlink(&fake_node, &sym).unwrap();
+        assert_eq!(
+            super::resolve_video_node_name(&sym).as_deref(),
+            Some("video7")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1070,6 +1139,22 @@ mod tests {
         let degraded = jittered.add(3_000, 18_999_900, 19_000_100).unwrap();
         assert_eq!(degraded.quality, "degraded");
         assert!(degraded.residual_ns.unwrap() > 1_000_000);
+
+        // Verify sub-nanosecond OLS precision above 2^53 ns (>104 days uptime)
+        let mut long_uptime = TimeSynchronizer::default();
+        let base_host: u64 = (1_u64 << 55) + 123_456_789;
+        long_uptime
+            .add(1_000, base_host + 999_900, base_host + 1_000_100)
+            .unwrap();
+        long_uptime
+            .add(2_000, base_host + 1_999_900, base_host + 2_000_100)
+            .unwrap();
+        let high_est = long_uptime
+            .add(3_000, base_host + 2_999_900, base_host + 3_000_100)
+            .unwrap();
+        assert_eq!(high_est.quality, "good");
+        assert_eq!(high_est.residual_ns, Some(100));
+        assert_eq!(high_est.offset_ns, Some(base_host as i64));
     }
 
     #[test]

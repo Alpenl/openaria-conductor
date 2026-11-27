@@ -327,21 +327,6 @@ impl TransformHandle {
         width: i32,
         height: i32,
     ) -> Result<(Vec<u8>, Vec<u8>), TurboJpegError> {
-        let ranges = jpeg::ranges(payload);
-        if ranges.len() == 2 {
-            let (left_start, left_end) = ranges[0];
-            let (right_start, right_end) = ranges[1];
-            return Ok((
-                payload[left_start..left_end].to_vec(),
-                payload[right_start..right_end].to_vec(),
-            ));
-        }
-        if ranges.len() != 1 {
-            return Err(TurboJpegError {
-                code: "bad_frame",
-                message: "payload must contain one or two complete JPEG images".to_owned(),
-            });
-        }
         if width <= 0 || width % 2 != 0 || height <= 0 {
             return Err(TurboJpegError {
                 code: "bad_frame",
@@ -356,6 +341,35 @@ impl TransformHandle {
             code: "bad_frame",
             message: "SBS height exceeds JPEG 16-bit dimension limit".to_owned(),
         })?;
+        let expected_eye = (width_u16 / 2, height_u16);
+
+        let ranges = jpeg::ranges(payload);
+        if ranges.len() == 2 {
+            let (left_start, left_end) = ranges[0];
+            let (right_start, right_end) = ranges[1];
+            let left_slice = &payload[left_start..left_end];
+            let right_slice = &payload[right_start..right_end];
+            for (eye_name, slice) in [("left", left_slice), ("right", right_slice)] {
+                if let Some(actual) = jpeg::dimensions(slice) {
+                    if actual != expected_eye {
+                        return Err(TurboJpegError {
+                            code: "bad_frame",
+                            message: format!(
+                                "{eye_name} JPEG dimensions are {}x{}, expected {}x{}",
+                                actual.0, actual.1, expected_eye.0, expected_eye.1
+                            ),
+                        });
+                    }
+                }
+            }
+            return Ok((left_slice.to_vec(), right_slice.to_vec()));
+        }
+        if ranges.len() != 1 {
+            return Err(TurboJpegError {
+                code: "bad_frame",
+                message: "payload must contain one or two complete JPEG images".to_owned(),
+            });
+        }
         let (start, end) = ranges[0];
         let selected = &payload[start..end];
         if let Some(actual) = jpeg::dimensions(selected) {
@@ -370,8 +384,9 @@ impl TransformHandle {
             }
         }
         let (left, right) = self.split(selected, width, height)?;
-        let expected = (width_u16 / 2, height_u16);
-        if jpeg::dimensions(&left) != Some(expected) || jpeg::dimensions(&right) != Some(expected) {
+        if jpeg::dimensions(&left) != Some(expected_eye)
+            || jpeg::dimensions(&right) != Some(expected_eye)
+        {
             return Err(TurboJpegError::operation(
                 "output eye dimensions are invalid".to_owned(),
             ));
@@ -500,6 +515,17 @@ mod tests {
             )
         );
         assert_eq!(api.0.lock().unwrap().freed, 0);
+
+        // Dual JPEGs with mismatched SOF0 eye dimensions are rejected on the fast path
+        let wrong_eye =
+            b"\xff\xd8\xff\xc0\0\x11\x08\x01\x00\x02\x00\x03\x01\x11\0\x02\x11\0\x03\x11\0\xff\xd9";
+        let mut bad_dual = Vec::new();
+        bad_dual.extend_from_slice(wrong_eye);
+        bad_dual.extend_from_slice(wrong_eye);
+        assert_eq!(
+            handle.split_sbs(&bad_dual, 3840, 1080).unwrap_err().code,
+            "bad_frame"
+        );
     }
 
     #[test]

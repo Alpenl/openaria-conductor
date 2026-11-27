@@ -88,6 +88,7 @@ pub struct CaptureFanoutDecision {
     pub record: bool,
     pub dropped_before: u64,
     pub recovered_source_gap: u64,
+    pub recovered_recorded_drops: u64,
     pub observed_frames: u64,
     pub inflight_frames: u64,
     pub recording_active: bool,
@@ -189,6 +190,7 @@ impl CaptureFanoutState {
                 record: false,
                 dropped_before,
                 recovered_source_gap: 0,
+                recovered_recorded_drops: 0,
                 observed_frames: 0,
                 inflight_frames: 0,
                 recording_active: false,
@@ -196,6 +198,7 @@ impl CaptureFanoutState {
         };
         let mut record = false;
         let mut recovered_source_gap = 0;
+        let mut recovered_recorded_drops = 0;
         if !recording.stopping {
             if recording.observed_frames == 0 {
                 // Gaps before the first frame belong to preview, not this take.
@@ -203,15 +206,13 @@ impl CaptureFanoutState {
                 dropped_before = 0;
                 record = true;
             } else {
-                let observed_index = recording
-                    .observed_frames
-                    .checked_add(dropped_before)
-                    .ok_or_else(|| {
-                        RecordingError::new(
-                            "counter_overflow",
-                            "recording frame gate observed overflow",
-                        )
-                    })?;
+                let gap_start = recording.observed_frames;
+                let observed_index = gap_start.checked_add(dropped_before).ok_or_else(|| {
+                    RecordingError::new(
+                        "counter_overflow",
+                        "recording frame gate observed overflow",
+                    )
+                })?;
                 recording.observed_frames = observed_index.checked_add(1).ok_or_else(|| {
                     RecordingError::new(
                         "counter_overflow",
@@ -225,6 +226,11 @@ impl CaptureFanoutState {
                             .is_none_or(|last| now.saturating_sub(last) >= 1_000_000_000)
                     }) {
                         recovered_source_gap = dropped_before;
+                        recovered_recorded_drops = count_recorded_indices_in_range(
+                            gap_start,
+                            observed_index,
+                            self.frame_decimation,
+                        );
                         dropped_before = 0;
                         recording.last_recovered_gap_ns = Some(now);
                     }
@@ -246,6 +252,7 @@ impl CaptureFanoutState {
             record,
             dropped_before,
             recovered_source_gap,
+            recovered_recorded_drops,
             observed_frames: recording.observed_frames,
             inflight_frames: recording.inflight_frames,
             recording_active: !recording.stopping,
@@ -481,6 +488,22 @@ impl RecordingSegmentPlanner {
             covered_frames: self.covered_frames,
             boundary_count: u64::try_from(self.boundary_record_sequence.len()).unwrap_or(u64::MAX),
         }
+    }
+}
+
+fn multiples_below(limit: u64, step: u64) -> u64 {
+    if limit == 0 || step == 0 {
+        0
+    } else {
+        (limit - 1) / step + 1
+    }
+}
+
+fn count_recorded_indices_in_range(start: u64, end: u64, decimation: u64) -> u64 {
+    if end <= start || decimation == 0 {
+        0
+    } else {
+        multiples_below(end, decimation).saturating_sub(multiples_below(start, decimation))
     }
 }
 
@@ -1459,6 +1482,31 @@ mod tests {
         assert_eq!(fanout.finish_frame().unwrap(), 0);
         assert!(!fanout.snapshot().recording_present);
         assert_eq!(fanout.mark_failure(), (false, 0));
+    }
+
+    #[test]
+    fn capture_fanout_counts_recovered_recorded_phase_drops_under_decimation() {
+        let mut fanout = CaptureFanoutState::new(2).unwrap();
+        fanout.start_recording(true).unwrap();
+
+        // First frame -> index 0 (recorded)
+        let f0 = fanout.begin_frame(0, true, None).unwrap();
+        assert!(f0.record);
+        assert_eq!(f0.recovered_recorded_drops, 0);
+        fanout.finish_frame().unwrap();
+
+        // Missing index 1 (preview-only) before index 2 (recorded): 0 recorded-phase drops
+        let f2 = fanout.begin_frame(1, true, Some(1_000_000_000)).unwrap();
+        assert!(f2.record);
+        assert_eq!(f2.recovered_source_gap, 1);
+        assert_eq!(f2.recovered_recorded_drops, 0);
+        fanout.finish_frame().unwrap();
+
+        // Missing indices [3, 4] before index 5 (preview-only): index 4 was recorded-phase -> 1 drop!
+        let f5 = fanout.begin_frame(2, true, Some(2_500_000_000)).unwrap();
+        assert!(!f5.record);
+        assert_eq!(f5.recovered_source_gap, 2);
+        assert_eq!(f5.recovered_recorded_drops, 1);
     }
 
     #[test]

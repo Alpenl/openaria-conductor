@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -51,11 +52,23 @@ static FILE *event_output(void)
     return event_stream == NULL ? stdout : event_stream;
 }
 
+static int set_cloexec(int fd)
+{
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0) {
+        return -1;
+    }
+    if ((flags & FD_CLOEXEC) != 0) {
+        return 0;
+    }
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
 static int isolate_event_stream(void)
 {
     /* Vendor multimedia libraries may write logs to stdout; keep NDJSON on a private pipe. */
     fflush(stdout);
-    int event_fd = dup(STDOUT_FILENO);
+    int event_fd = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
     if (event_fd < 0) {
         return -1;
     }
@@ -68,7 +81,7 @@ static int isolate_event_stream(void)
     event_stream = stream;
 
     if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0) {
-        int null_fd = open("/dev/null", O_WRONLY);
+        int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
         if (null_fd < 0) {
             return -1;
         }
@@ -204,6 +217,8 @@ static void usage(const char *program)
 
 int main(int argc, char **argv)
 {
+    signal(SIGPIPE, SIG_IGN);
+
     miro_ego_pipeline_config_t config = {
         .sbs_width = 3840,
         .height = 1080,
@@ -306,6 +321,12 @@ int main(int argc, char **argv)
     miro_ego_shm_ring_t shm_ring;
     memset(&shm_ring, 0, sizeof(shm_ring));
     if (use_shm) {
+        if (set_cloexec(shm_fd) != 0 ||
+            set_cloexec(kick_fd) != 0 ||
+            set_cloexec(done_fd) != 0) {
+            emit_error_event("shm_attach_failed", "failed to mark shm descriptors FD_CLOEXEC");
+            return 3;
+        }
         if (miro_ego_shm_ring_attach(&shm_ring, shm_fd, kick_fd, done_fd,
                                      error, sizeof(error)) != 0) {
             emit_error_event("shm_attach_failed", error[0] != '\0' ? error : "shm_attach_failed");

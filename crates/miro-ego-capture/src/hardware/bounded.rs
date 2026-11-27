@@ -131,8 +131,10 @@ impl<T> Consumer<T> {
     pub fn reopen(&self) {
         let mut state = self.shared.lock_state();
         debug_assert!(state.queue.is_empty());
-        state.closed = false;
-        state.peak = 0;
+        if state.producers > 0 {
+            state.closed = false;
+        }
+        state.peak = state.queue.len();
     }
 }
 
@@ -277,6 +279,12 @@ mod tests {
         assert_eq!(producer.try_push(42), Ok(()));
         assert_eq!(consumer.receive(Duration::from_millis(10)), Ok(42));
         drop(producer);
+        assert_eq!(
+            consumer.receive(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Disconnected)
+        );
+        // Reopening with zero live producers keeps queue closed so receive() never blocks
+        consumer.reopen();
         assert_eq!(
             consumer.receive(Duration::from_millis(10)),
             Err(RecvTimeoutError::Disconnected)

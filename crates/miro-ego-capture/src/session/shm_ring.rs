@@ -6,7 +6,7 @@
 //!   - `0..8`: `magic: [u8; 8] = *b"MEGO_SHM"`
 //!   - `8..12`: `version: u32 = 1`
 //!   - `12..16`: `slot_count: u32` (power of 2, `1..=256`, default `16`)
-//!   - `16..20`: `slot_capacity: u32` (default `4 MiB`)
+//!   - `16..20`: `slot_capacity: u32` (default `8 MiB`)
 //!   - `20..24`: `flags: AtomicU32` (`bit 0` = EOF/shutdown)
 //!   - `64..72`: `write_idx: AtomicU64` (producer monotonic)
 //!   - `128..136`: `read_idx: AtomicU64` (consumer monotonic)
@@ -37,7 +37,7 @@ pub const SHM_PAGE_ALIGN: usize = 4096;
 
 pub const DEFAULT_SLOT_COUNT: u32 = 16;
 pub const MAX_SLOT_COUNT: u32 = 256;
-pub const DEFAULT_SLOT_CAPACITY: u32 = 4 * 1024 * 1024;
+pub const DEFAULT_SLOT_CAPACITY: u32 = 8 * 1024 * 1024;
 pub const MAX_SLOT_CAPACITY: u32 = 64 * 1024 * 1024;
 
 /// Bit 0 of `ShmHeader::flags`: producer has reached EOF / shutdown.
@@ -416,8 +416,14 @@ impl ShmRingProducer {
 
         let write_idx = header.write_idx.load(Ordering::Relaxed);
         let read_idx = header.read_idx.load(Ordering::Acquire);
-        let in_flight = write_idx.wrapping_sub(read_idx);
-        if in_flight >= u64::from(self.layout.slot_count) {
+        if write_idx < read_idx || (write_idx - read_idx) > u64::from(self.layout.slot_count) {
+            return Err(ShmRingError::new(
+                "shm_corrupt",
+                "SHM ring write_idx/read_idx out of bounds",
+            ));
+        }
+        let in_flight = write_idx - read_idx;
+        if in_flight == u64::from(self.layout.slot_count) {
             return Ok(PushStatus::Full);
         }
 
@@ -489,14 +495,40 @@ impl ShmRingProducer {
         E: From<ShmRingError>,
         F: FnMut() -> Result<(), E>,
     {
+        self.push_wait_with_backpressure_check(
+            frame_seq,
+            monotonic_ns,
+            flags,
+            payload,
+            timeout,
+            |_| check(),
+        )
+    }
+
+    /// Push a frame, running `check(false)` prior to each push attempt and `check(true)` when
+    /// all SHM slots are full so normal in-flight drain succeeds while backpressured
+    /// stops/aborts unblock immediately.
+    pub(crate) fn push_wait_with_backpressure_check<E, F>(
+        &mut self,
+        frame_seq: u64,
+        monotonic_ns: u64,
+        flags: u32,
+        payload: &[u8],
+        timeout: Duration,
+        mut check: F,
+    ) -> Result<u64, E>
+    where
+        E: From<ShmRingError>,
+        F: FnMut(bool) -> Result<(), E>,
+    {
         const POLL_SLICE: Duration = Duration::from_millis(100);
         let deadline = Instant::now() + timeout;
         loop {
-            check()?;
+            check(false)?;
             match self.try_push(frame_seq, monotonic_ns, flags, payload)? {
                 PushStatus::Pushed { write_idx, .. } => return Ok(write_idx),
                 PushStatus::Full => {
-                    check()?;
+                    check(true)?;
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(ShmRingError::new(
@@ -590,6 +622,15 @@ impl ShmRingConsumer {
         }
 
         let region = MmapRegion::map(shm_fd.as_raw_fd(), layout.total_bytes)?;
+        let hdr = region.header();
+        let read_idx = hdr.read_idx.load(Ordering::Acquire);
+        let write_idx = hdr.write_idx.load(Ordering::Acquire);
+        if write_idx < read_idx || (write_idx - read_idx) > u64::from(layout.slot_count) {
+            return Err(ShmRingError::new(
+                "shm_invalid",
+                "SHM ring initial write_idx/read_idx out of bounds",
+            ));
+        }
         Ok(Self {
             layout,
             _shm_fd: shm_fd,
@@ -607,12 +648,27 @@ impl ShmRingConsumer {
     pub fn try_pop(&mut self) -> Result<PopStatus, ShmRingError> {
         let header = self.region.header();
         let read_idx = header.read_idx.load(Ordering::Relaxed);
-        let write_idx = header.write_idx.load(Ordering::Acquire);
+        let mut write_idx = header.write_idx.load(Ordering::Acquire);
+        if write_idx < read_idx || (write_idx - read_idx) > u64::from(self.layout.slot_count) {
+            return Err(ShmRingError::new(
+                "shm_corrupt",
+                "SHM ring write_idx/read_idx out of bounds",
+            ));
+        }
         if read_idx == write_idx {
             if (header.flags.load(Ordering::Acquire) & SHM_FLAG_EOF) != 0 {
                 // Re-check write_idx after observing EOF so a final frame pushed right before
                 // signal_eof() is never lost.
-                if header.write_idx.load(Ordering::Acquire) == read_idx {
+                write_idx = header.write_idx.load(Ordering::Acquire);
+                if write_idx < read_idx
+                    || (write_idx - read_idx) > u64::from(self.layout.slot_count)
+                {
+                    return Err(ShmRingError::new(
+                        "shm_corrupt",
+                        "SHM ring write_idx/read_idx out of bounds",
+                    ));
+                }
+                if write_idx == read_idx {
                     return Ok(PopStatus::Eof);
                 }
             } else {
@@ -622,7 +678,7 @@ impl ShmRingConsumer {
 
         let mask = u64::from(self.layout.slot_count - 1);
         let slot_index = (read_idx & mask) as u32;
-        // SAFETY: `read_idx != write_idx` with Acquire fence guarantees producer finished writing.
+        // SAFETY: `read_idx < write_idx` with Acquire fence guarantees producer finished writing.
         let desc = unsafe { std::ptr::read(self.region.slot_ptr(slot_index)) };
         if desc.payload_len == 0 || desc.payload_len > self.layout.slot_capacity {
             return Err(ShmRingError::new(
@@ -630,16 +686,20 @@ impl ShmRingConsumer {
                 "slot payload_len is zero or exceeds slot_capacity",
             ));
         }
+        let expected_offset = self
+            .layout
+            .slot_data_offset(slot_index)
+            .ok_or_else(|| ShmRingError::new("shm_corrupt", "invalid slot index"))?;
         let data_offset = usize::try_from(desc.data_offset)
             .map_err(|_| ShmRingError::new("shm_corrupt", "slot data_offset overflow"))?;
         let payload_len = desc.payload_len as usize;
         let end_offset = data_offset
             .checked_add(payload_len)
             .ok_or_else(|| ShmRingError::new("shm_corrupt", "slot payload end overflow"))?;
-        if data_offset < self.layout.data_region_offset || end_offset > self.region.len {
+        if data_offset != expected_offset || end_offset > self.region.len {
             return Err(ShmRingError::new(
                 "shm_corrupt",
-                "slot data range lies outside SHM data region",
+                "slot data_offset does not match slot index or exceeds SHM data region",
             ));
         }
 
@@ -686,6 +746,29 @@ impl ShmRingConsumer {
     }
 }
 
+fn ensure_fd_ge_3(fd: OwnedFd) -> Result<OwnedFd, ShmRingError> {
+    if fd.as_raw_fd() >= 3 {
+        return Ok(fd);
+    }
+    loop {
+        // SAFETY: `F_DUPFD_CLOEXEC` duplicates `fd` onto the lowest available descriptor >= 3.
+        let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicated >= 0 {
+            drop(fd);
+            // SAFETY: `duplicated` is a newly created owned descriptor >= 3.
+            return Ok(unsafe { OwnedFd::from_raw_fd(duplicated) });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(ShmRingError::io(
+                "shm_dup_failed",
+                "fcntl(F_DUPFD_CLOEXEC, 3)",
+                error,
+            ));
+        }
+    }
+}
+
 fn create_memfd(name: &str) -> Result<OwnedFd, ShmRingError> {
     let c_name = CString::new(name)
         .map_err(|_| ShmRingError::new("invalid_shm_config", "memfd name contains NUL"))?;
@@ -699,10 +782,10 @@ fn create_memfd(name: &str) -> Result<OwnedFd, ShmRingError> {
         ));
     }
     // SAFETY: `fd` is a newly created owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    ensure_fd_ge_3(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn create_eventfd() -> Result<OwnedFd, ShmRingError> {
+pub(crate) fn create_eventfd() -> Result<OwnedFd, ShmRingError> {
     // SAFETY: `eventfd` takes an initial value and flags.
     let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if fd < 0 {
@@ -713,7 +796,7 @@ fn create_eventfd() -> Result<OwnedFd, ShmRingError> {
         ));
     }
     // SAFETY: `fd` is a newly created owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    ensure_fd_ge_3(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 fn ftruncate_retry(fd: RawFd, len: usize) -> Result<(), ShmRingError> {
@@ -801,7 +884,7 @@ fn wait_and_drain_eventfd(fd: RawFd, timeout: Duration) -> Result<bool, ShmRingE
         // SAFETY: `pollfd` points to a valid `libc::pollfd` of length 1.
         let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
         if rc > 0 {
-            if (pollfd.revents & (libc::POLLERR | libc::POLLNVAL)) != 0 {
+            if (pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
                 return Err(ShmRingError::new(
                     "eventfd_poll_failed",
                     format!("poll eventfd returned error revents={:#x}", pollfd.revents),
@@ -1026,6 +1109,26 @@ mod tests {
             .store(1, Ordering::Release);
         assert_eq!(consumer.try_pop().unwrap_err().code, "shm_corrupt");
 
+        // Corrupt descriptor data_offset to point to slot 1 instead of slot 0 (exact offset check)
+        unsafe {
+            let slot = consumer.region.slot_ptr(0);
+            (*slot).data_offset = consumer.layout.slot_data_offset(1).unwrap() as u64;
+            (*slot).payload_len = 8;
+        }
+        assert_eq!(consumer.try_pop().unwrap_err().code, "shm_corrupt");
+
+        // Corrupt write_idx > read_idx + slot_count is rejected as shm_corrupt (not treated as Full)
+        producer
+            .region
+            .header()
+            .write_idx
+            .store(99, Ordering::Release);
+        assert_eq!(consumer.try_pop().unwrap_err().code, "shm_corrupt");
+        assert_eq!(DEFAULT_SLOT_CAPACITY, 8 * 1024 * 1024);
+        assert!(producer.shm_raw_fd() >= 3);
+        assert!(producer.kick_raw_fd() >= 3);
+        assert!(producer.done_raw_fd() >= 3);
+
         // Corrupt magic and verify new attach fails
         unsafe {
             let hdr = producer.region.ptr.as_ptr().cast::<ShmHeader>();
@@ -1101,5 +1204,25 @@ mod tests {
             .write_idx
             .store(1, Ordering::Release);
         assert_eq!(consumer.try_pop().unwrap_err().code, "shm_corrupt");
+
+        // Corrupt descriptor data_offset to point to slot 1 instead of slot 0 (exact offset check)
+        unsafe {
+            let slot = consumer.region.slot_ptr(0);
+            (*slot).data_offset = consumer.layout.slot_data_offset(1).unwrap() as u64;
+            (*slot).payload_len = 8;
+        }
+        assert_eq!(consumer.try_pop().unwrap_err().code, "shm_corrupt");
+
+        // Corrupt write_idx > read_idx + slot_count is rejected as shm_corrupt (not treated as Full)
+        producer
+            .region
+            .header()
+            .write_idx
+            .store(99, Ordering::Release);
+        assert_eq!(consumer.try_pop().unwrap_err().code, "shm_corrupt");
+        assert_eq!(DEFAULT_SLOT_CAPACITY, 8 * 1024 * 1024);
+        assert!(producer.shm_raw_fd() >= 3);
+        assert!(producer.kick_raw_fd() >= 3);
+        assert!(producer.done_raw_fd() >= 3);
     }
 }

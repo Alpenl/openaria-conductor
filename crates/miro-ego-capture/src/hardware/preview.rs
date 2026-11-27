@@ -196,7 +196,7 @@ impl LatestBuffer {
                     && state
                         .latest
                         .as_ref()
-                        .is_none_or(|frame| frame.sequence == last_sequence)
+                        .is_none_or(|frame| frame.sequence <= last_sequence)
             })
             .map_err(|_| {
                 PreviewError::new(

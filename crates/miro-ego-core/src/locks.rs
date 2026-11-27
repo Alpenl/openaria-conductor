@@ -64,33 +64,8 @@ pub fn acquire_flock(
     }
 
     let common_flags = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-    let file = match mode {
-        LockMode::Shared => OpenOptions::new()
-            .read(true)
-            .custom_flags(common_flags)
-            .open(target)
-            .or_else(|err| {
-                if err.kind() == io::ErrorKind::NotFound {
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .mode(DEFAULT_LOCK_MODE)
-                        .custom_flags(common_flags)
-                        .open(target)
-                } else {
-                    Err(err)
-                }
-            }),
-        LockMode::Exclusive => OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .mode(DEFAULT_LOCK_MODE)
-            .custom_flags(common_flags)
-            .open(target),
-    }
-    .map_err(|err| CoreError::io("lock_open_failed", "open lock file", err))?;
+    let file = open_lock_file(target, common_flags)
+        .map_err(|err| CoreError::io("lock_open_failed", "open lock file", err))?;
 
     let stat = fstat(file.as_raw_fd())
         .map_err(|err| CoreError::io("lock_stat_failed", "fstat lock file", err))?;
@@ -131,6 +106,60 @@ pub fn acquire_flock(
             )));
         }
         return Err(CoreError::io("lock_failed", "acquire flock", error));
+    }
+}
+
+fn open_lock_file(target: &Path, common_flags: libc::c_int) -> io::Result<File> {
+    // POSIX/Linux `flock(LOCK_EX | LOCK_SH)` operates on `O_RDONLY` descriptors too,
+    // allowing unprivileged daemons to lock pre-existing root-created lockfiles without
+    // requiring write permission on the inode.
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(common_flags)
+        .open(target)
+    {
+        Ok(file) => return Ok(file),
+        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+        Err(_) => {}
+    }
+
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(DEFAULT_LOCK_MODE)
+        .custom_flags(common_flags)
+        .open(target)
+    {
+        Ok(file) => {
+            // Ensure group-writable 0660 mode regardless of the caller's process umask.
+            // SAFETY: `file.as_raw_fd()` is a newly created owned descriptor.
+            let _ = unsafe { libc::fchmod(file.as_raw_fd(), DEFAULT_LOCK_MODE as libc::mode_t) };
+            Ok(file)
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
+            .read(true)
+            .custom_flags(common_flags)
+            .open(target)
+            .or_else(|retry_err| {
+                if retry_err.kind() == io::ErrorKind::NotFound {
+                    let created = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .mode(DEFAULT_LOCK_MODE)
+                        .custom_flags(common_flags)
+                        .open(target)?;
+                    // SAFETY: `created.as_raw_fd()` is an open owned descriptor.
+                    let _ = unsafe {
+                        libc::fchmod(created.as_raw_fd(), DEFAULT_LOCK_MODE as libc::mode_t)
+                    };
+                    Ok(created)
+                } else {
+                    Err(retry_err)
+                }
+            }),
+        Err(err) => Err(err),
     }
 }
 
@@ -216,6 +245,32 @@ mod tests {
 
         let err = acquire_maintenance_lock(&dir, LockMode::Exclusive, true).unwrap_err();
         assert_eq!(err.code(), "lock_open_failed");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exclusive_flock_succeeds_on_readonly_lockfile_and_sets_0660_mode_on_create() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_run_dir("readonly-mode");
+        let created = acquire_maintenance_lock(&dir, LockMode::Exclusive, true).unwrap();
+        let created_mode = fs::metadata(created.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(created_mode, DEFAULT_LOCK_MODE);
+        drop(created);
+
+        let lock_path = dir.join(MAINTENANCE_LOCK_NAME);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let ex_guard = acquire_maintenance_lock(&dir, LockMode::Exclusive, true).unwrap();
+        assert_eq!(
+            acquire_maintenance_lock(&dir, LockMode::Exclusive, true)
+                .unwrap_err()
+                .code(),
+            "lock_busy"
+        );
+        drop(ex_guard);
+
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o660)).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
