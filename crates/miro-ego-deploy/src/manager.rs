@@ -213,8 +213,8 @@ pub const DEPLOYMENT_ASSETS: &[AssetSpec] = &[
         preserve_if_exists: false,
     },
     AssetSpec {
-        source_name: "90-miro-ego-wifi-powersave.conf",
-        dest_relative: "etc/NetworkManager/conf.d/90-miro-ego-wifi-powersave.conf",
+        source_name: "zz-miro-ego-wifi-powersave.conf",
+        dest_relative: "etc/NetworkManager/conf.d/zz-miro-ego-wifi-powersave.conf",
         mode: 0o644,
         preserve_if_exists: false,
     },
@@ -2007,6 +2007,16 @@ impl ReleaseManager {
                 .run_bootstrap_command("udevadm", &["trigger", "--subsystem-match=leds"]);
         }
 
+        let nm_powersave_conf = self
+            .paths
+            .system_root
+            .join("etc/NetworkManager/conf.d/zz-miro-ego-wifi-powersave.conf");
+        if nm_powersave_conf.is_file() {
+            let _ = self
+                .systemctl
+                .run_bootstrap_command("nmcli", &["general", "reload", "conf"]);
+        }
+
         let device_login = self
             .paths
             .system_root
@@ -3710,5 +3720,18 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nm_wifi_powersave_dropin_sorts_after_distro_default() {
+        let asset = DEPLOYMENT_ASSETS
+            .iter()
+            .find(|a| a.source_name == "zz-miro-ego-wifi-powersave.conf")
+            .expect("zz-miro-ego-wifi-powersave.conf missing from DEPLOYMENT_ASSETS");
+        assert_eq!(
+            asset.dest_relative,
+            "etc/NetworkManager/conf.d/zz-miro-ego-wifi-powersave.conf"
+        );
+        assert!(asset.source_name > "default-wifi-powersave-on.conf");
     }
 }

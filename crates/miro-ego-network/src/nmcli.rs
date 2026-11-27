@@ -670,6 +670,7 @@ fn render_nmconnection_with_autoconnect(
             lines.extend([
                 "[wifi]".to_owned(),
                 "mode=ap".to_owned(),
+                "powersave=2".to_owned(),
                 format!("ssid={}", format_nm_ssid_value(ssid)),
                 String::new(),
                 "[wifi-security]".to_owned(),
@@ -690,6 +691,7 @@ fn render_nmconnection_with_autoconnect(
             lines.extend([
                 "[wifi]".to_owned(),
                 "mode=infrastructure".to_owned(),
+                "powersave=2".to_owned(),
                 format!("ssid={}", format_nm_ssid_value(ssid)),
                 String::new(),
             ]);
@@ -2273,7 +2275,21 @@ mod tests {
         let after = fs::read_to_string(&path).unwrap();
         assert!(after.contains("psk=CustomOperatorSecret99!"));
         assert!(after.contains("autoconnect=false"));
+        assert!(after.contains("powersave=2"));
         assert!(!after.contains("psk=12345678"));
+
+        let wifi_rendered = render_nmconnection(
+            "miro-ego-wifi-client-powersave",
+            &ProfileSpec::WifiClient {
+                ssid: "Studio".to_owned(),
+                security: WifiSecurity::Wpa2Personal,
+                psk: Some("secret123".to_owned()),
+            },
+            "wlan0",
+            "eth0",
+        )
+        .unwrap();
+        assert!(wifi_rendered.contains("mode=infrastructure\npowersave=2\n"));
 
         fs::remove_dir_all(dir).unwrap();
     }
