@@ -22,15 +22,17 @@ use miro_ego_capture::session::recording::{
 };
 use miro_ego_capture::session::shm_ring::ShmRingConfig;
 use miro_ego_capture::session::stereo_encoder::{EncoderConfig, EncoderProcess, EncoderTransport};
+use miro_ego_core::CoreError;
 use miro_ego_core::config::{DeviceConfig, SecurityConfig};
-use miro_ego_core::ids::{hex_encode, is_valid_uuid_v7, new_uuid_v4, new_uuid_v7};
+use miro_ego_core::ids::{hex_encode, is_valid_uuid_v7, new_uuid_v4};
 use miro_ego_core::locks::{FlockGuard, LockMode, acquire_network_operation_lock};
 use miro_ego_core::paths::{DataVolumePaths, SYSTEM_ENCODER_BIN, SYSTEM_RUN_DIR};
 use miro_ego_core::sys::clock::monotonic_ns;
+use miro_ego_core::sys::fs::read_bounded_bytes;
 use miro_ego_deploy::{
     DEFAULT_DEPLOY_SOCKET_PATH, DefaultOfflinePackageHook, DeployError, DeployResult,
     DeployRpcClient, HealthChecker, OfflinePackageHook, ReleaseManager, ReleaseManagerPaths,
-    SystemctlRunner, validate_commit_sha, verify_bundle_dir,
+    SystemctlRunner, validate_commit_sha,
 };
 use miro_ego_hw::thermal::read_soc_temperature_c;
 use miro_ego_hw::{
@@ -38,8 +40,8 @@ use miro_ego_hw::{
     VoiceFeedback,
 };
 use miro_ego_network::{
-    ApplyDesiredState, ControllerStatus, NetworkError, NetworkRpcClient, ObservedDefaultRoute,
-    derive_rescue_identity,
+    ApplyDesiredState, ControllerStatus, MdnsScheme, NetworkError, NetworkRpcClient,
+    ObservedDefaultRoute, derive_rescue_identity,
 };
 use miro_ego_storage::coordinator::{
     CAMERA_FOCUS_SCHEMA, CAPTURE_TIMER_SET_SCHEMA, DropEventRecord,
@@ -69,6 +71,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RESERVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_TIMER_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const DEFAULT_NETWORK_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_NETWORK_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const DEFAULT_NETWORK_MUTATION_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_NETWORK_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_NETWORK_HEALTH_TIMEOUT: Duration = Duration::from_millis(800);
+const DEFAULT_DEPLOY_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const FIRMWARE_CHECK_CACHE_TTL: Duration = Duration::from_secs(30);
+const FIRMWARE_IDEMPOTENCY_TTL: Duration = Duration::from_secs(86_400);
+const MAX_FIRMWARE_IDEMPOTENCY_ENTRIES: usize = 256;
+const MAX_CLOCK_CHALLENGES: usize = 64;
 const ENCODER_FINISH_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_BEARER_TOKEN_FILE_BYTES: usize = 4096;
 const SYNTHETIC_JPEG_FRAME: &[u8] = &[
@@ -187,6 +199,13 @@ fn map_network_message_error(message: String, is_backend: bool) -> ApiError {
         let tx_id =
             extract_uuid_v7_from_text(&message).unwrap_or("00000000-0000-7000-8000-000000000000");
         ApiError::network_transaction_not_found(tx_id)
+    } else if message.contains("transaction_not_retryable") {
+        ApiError::unprocessable("invalid_network_desired_state", message)
+            .with_error_code_header()
+            .with_details(json!({
+                "field": "transaction_id",
+                "reason": "active_state",
+            }))
     } else if message.contains("credential_ref_expired") {
         ApiError::unprocessable("invalid_network_desired_state", message)
             .with_error_code_header()
@@ -194,12 +213,54 @@ fn map_network_message_error(message: String, is_backend: bool) -> ApiError {
                 "field": "desired.wifi_client.credential_ref",
                 "reason": "credential_ref_expired",
             }))
+    } else if message.contains("credential_ref_not_allowed") {
+        ApiError::unprocessable("invalid_network_desired_state", message)
+            .with_error_code_header()
+            .with_details(json!({
+                "field": "desired.wifi_client.credential_ref",
+                "reason": "credential_ref_not_allowed",
+            }))
+    } else if message.contains("missing_credential_ref") {
+        ApiError::unprocessable("invalid_network_desired_state", message)
+            .with_error_code_header()
+            .with_details(json!({
+                "field": "desired.wifi_client.credential_ref",
+                "reason": "missing_credential_ref",
+            }))
     } else if message.contains("credential_ref_") {
         ApiError::unprocessable("invalid_network_desired_state", message)
             .with_error_code_header()
             .with_details(json!({
                 "field": "desired.wifi_client.credential_ref",
                 "reason": "credential_ref_already_used",
+            }))
+    } else if message.contains("security_mismatch") {
+        ApiError::unprocessable("invalid_network_desired_state", message)
+            .with_error_code_header()
+            .with_details(json!({
+                "field": "desired.wifi_client.security",
+                "reason": "security_mismatch",
+            }))
+    } else if message.contains("ssid_too_long") {
+        ApiError::unprocessable("invalid_network_desired_state", message)
+            .with_error_code_header()
+            .with_details(json!({
+                "field": "desired.wifi_client.ssid",
+                "reason": "ssid_too_long",
+            }))
+    } else if message.contains("invalid_static_ipv4") {
+        ApiError::unprocessable("invalid_network_desired_state", message)
+            .with_error_code_header()
+            .with_details(json!({
+                "field": "desired.ethernet.static_ipv4",
+                "reason": "invalid_static_ipv4",
+            }))
+    } else if message.contains("unsupported_mode") {
+        ApiError::unprocessable("invalid_network_desired_state", message)
+            .with_error_code_header()
+            .with_details(json!({
+                "field": "desired.mode",
+                "reason": "unsupported_mode",
             }))
     } else if message.contains("capture_active") {
         ApiError::conflict("capture_active", message).with_error_code_header()
@@ -229,6 +290,85 @@ pub fn map_network_error(err: NetworkError) -> ApiError {
     }
 }
 
+fn network_mutation_unavailable(reason: &str, message: impl Into<String>) -> ApiError {
+    ApiError::service_unavailable("network_mutation_unavailable", message)
+        .with_header("Retry-After", "1")
+        .with_error_code_header()
+        .with_details(json!({ "reason": reason }))
+}
+
+fn infer_network_mutation_reason(message: &str) -> &'static str {
+    if message.contains("not_enabled") || message.contains("not configured") {
+        "not_enabled"
+    } else if message.contains("auth_profile_unavailable") {
+        "auth_profile_unavailable"
+    } else if message.contains("rescue_ap_not_validated") {
+        "rescue_ap_not_validated"
+    } else if message.contains("capture_active") {
+        "capture_active"
+    } else if message.contains("recovery_required") {
+        "recovery_required"
+    } else if message.contains("maintenance_window_closed") {
+        "maintenance_window_closed"
+    } else if message.contains("unsupported_concurrency") {
+        "unsupported_concurrency"
+    } else if message.contains("network_manager_unavailable")
+        && !message.contains("network_controller_unavailable")
+        && !message.contains("response_timeout")
+        && !message.contains("empty EOF")
+    {
+        "network_manager_unavailable"
+    } else {
+        "controller_unavailable"
+    }
+}
+
+/// Map a [`NetworkError`] returned from `/network/{credentials,apply,retry,forget}` into an
+/// OpenAPI-compliant error (`503` always uses `code: "network_mutation_unavailable"` with
+/// `details.reason` matching `NetworkMutationDisabledReason`).
+pub fn map_network_mutation_error(err: NetworkError) -> ApiError {
+    match err {
+        NetworkError::Busy { message } => {
+            if message.contains("capture_active") {
+                ApiError::conflict("capture_active", message).with_error_code_header()
+            } else {
+                let reason = infer_network_mutation_reason(&message);
+                network_mutation_unavailable(reason, message)
+            }
+        }
+        NetworkError::Backend { message } => {
+            if message.contains("capture_active") {
+                ApiError::conflict("capture_active", message).with_error_code_header()
+            } else {
+                let reason = infer_network_mutation_reason(&message);
+                network_mutation_unavailable(reason, message)
+            }
+        }
+        NetworkError::Core(CoreError::LockBusy { message }) => {
+            let reason = if message.contains("network") {
+                "capture_active"
+            } else {
+                "maintenance_window_closed"
+            };
+            network_mutation_unavailable(reason, message)
+        }
+        NetworkError::Core(CoreError::Io {
+            context, source, ..
+        }) => {
+            network_mutation_unavailable("controller_unavailable", format!("{context}: {source}"))
+        }
+        other => {
+            let mapped = map_network_error(other);
+            if mapped.status_code == 503 {
+                let reason = infer_network_mutation_reason(&mapped.message);
+                network_mutation_unavailable(reason, mapped.message)
+            } else {
+                mapped
+            }
+        }
+    }
+}
+
 pub fn map_hw_error(err: HwError) -> ApiError {
     match err {
         HwError::Unavailable { message } => {
@@ -247,12 +387,67 @@ pub fn map_deploy_error(err: DeployError) -> ApiError {
             ApiError::unprocessable("invalid_firmware_bundle", message).with_error_code_header()
         }
         DeployError::Blocked { message } => {
-            ApiError::conflict("firmware_blocked", message).with_error_code_header()
+            if message.contains("rollback_unavailable") {
+                ApiError::conflict("rollback_unavailable", message).with_error_code_header()
+            } else if message.contains("idempotency_conflict") {
+                ApiError::conflict("idempotency_conflict", message).with_error_code_header()
+            } else if message.contains("maintenance_busy")
+                || message.contains("server is busy")
+                || message.contains("controller_busy")
+            {
+                ApiError::service_unavailable("firmware_busy", message)
+                    .with_header("Retry-After", "1")
+                    .with_error_code_header()
+            } else {
+                ApiError::conflict("firmware_blocked", message).with_error_code_header()
+            }
         }
         DeployError::Failed { message } => {
-            ApiError::internal("firmware_failed", message).with_error_code_header()
+            if message.contains("deploy_controller_unavailable")
+                || message.contains("response_timeout")
+                || message.contains("request_timeout")
+                || message.contains("timed out")
+                || message.contains("failed writing deploy RPC")
+                || message.contains("failed configuring deploy RPC")
+                || message.contains("empty EOF")
+            {
+                ApiError::service_unavailable("firmware_unavailable", message)
+                    .with_header("Retry-After", "1")
+                    .with_error_code_header()
+            } else {
+                ApiError::internal("firmware_failed", message).with_error_code_header()
+            }
+        }
+        DeployError::Core(CoreError::LockBusy { message }) => {
+            ApiError::service_unavailable("firmware_busy", message)
+                .with_header("Retry-After", "1")
+                .with_error_code_header()
         }
         DeployError::Core(core_err) => ApiError::from(core_err),
+    }
+}
+
+/// Map low-level V4L2 / `NativeCameraStream` focus errors onto OpenAPI v1 status codes:
+/// - `404 camera_focus_unsupported` when `focus_absolute` is not exposed,
+/// - `422 invalid_camera_focus` when `value` is out of range/step or `focus_auto` is unsupported,
+/// - `503 camera_not_connected` when the camera stream is closed or device node is gone (`ENODEV`),
+/// - `503 camera_focus_failed` on control channel timeout or transient V4L2 `ioctl` error.
+pub fn map_camera_focus_error(code: &str, message: String) -> StorageError {
+    match code {
+        "camera_focus_unsupported" => StorageError::Unsupported {
+            code: "camera_focus_unsupported",
+            message,
+        },
+        "invalid_camera_focus" | "camera_focus_auto_unsupported" => {
+            StorageError::unprocessable("invalid_camera_focus", message)
+        }
+        "invalid_state" | "native_camera_closed" | "camera_not_connected" => {
+            StorageError::camera_not_connected(message)
+        }
+        _ if message.contains("No such device") || message.contains("os error 19") => {
+            StorageError::camera_not_connected(message)
+        }
+        _ => StorageError::service_unavailable("camera_focus_failed", message),
     }
 }
 
@@ -297,22 +492,16 @@ pub fn build_security_and_tls(
             principal_id,
             ..
         } => {
-            let meta = fs::metadata(bearer_token_file).map_err(|err| {
+            let raw_bytes = read_bounded_bytes(bearer_token_file, MAX_BEARER_TOKEN_FILE_BYTES)
+                .map_err(|err| {
+                    format!(
+                        "failed to read customer bearer token file {}: {err}",
+                        bearer_token_file.display()
+                    )
+                })?;
+            let raw_token = String::from_utf8(raw_bytes).map_err(|_| {
                 format!(
-                    "failed to stat customer bearer token file {}: {err}",
-                    bearer_token_file.display()
-                )
-            })?;
-            if meta.len() > MAX_BEARER_TOKEN_FILE_BYTES as u64 {
-                return Err(format!(
-                    "customer bearer token file {} exceeds {} bytes",
-                    bearer_token_file.display(),
-                    MAX_BEARER_TOKEN_FILE_BYTES
-                ));
-            }
-            let raw_token = fs::read_to_string(bearer_token_file).map_err(|err| {
-                format!(
-                    "failed to read customer bearer token file {}: {err}",
+                    "customer bearer token file {} is not valid UTF-8",
                     bearer_token_file.display()
                 )
             })?;
@@ -1045,7 +1234,7 @@ impl CaptureBackend for NativeCaptureBackend {
         };
         let status = stream
             .focus_status()
-            .map_err(|err| StorageError::service_unavailable("camera_focus_failed", err.message))?;
+            .map_err(|err| map_camera_focus_error(err.code, err.message))?;
         Ok(status.map(|f| CameraFocusStatus {
             schema: CAMERA_FOCUS_SCHEMA.to_owned(),
             value: u32::try_from(f.value).unwrap_or(0),
@@ -1074,7 +1263,7 @@ impl CaptureBackend for NativeCaptureBackend {
         })?;
         let updated = stream
             .set_focus(val, req.auto_enabled)
-            .map_err(|err| StorageError::unprocessable("invalid_camera_focus", err.message))?;
+            .map_err(|err| map_camera_focus_error(err.code, err.message))?;
         Ok(CameraFocusStatus {
             schema: CAMERA_FOCUS_SCHEMA.to_owned(),
             value: u32::try_from(updated.value).unwrap_or(0),
@@ -2044,6 +2233,26 @@ fn extract_sink_artifacts(
 // ProductionGatewayBackend
 // ---------------------------------------------------------------------------
 
+fn is_canonical_uuid(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    value.bytes().enumerate().all(|(idx, b)| match idx {
+        8 | 13 | 18 | 23 => b == b'-',
+        _ => b.is_ascii_hexdigit() && !b.is_ascii_uppercase(),
+    })
+}
+
+fn read_linux_boot_id() -> String {
+    if let Ok(raw) = fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+        let candidate = raw.trim().to_ascii_lowercase();
+        if is_canonical_uuid(&candidate) {
+            return candidate;
+        }
+    }
+    new_uuid_v4()
+}
+
 struct ClockChallenge {
     principal_id: String,
     from_check: bool,
@@ -2062,7 +2271,7 @@ struct ClockRuntimeState {
 impl ClockRuntimeState {
     fn new() -> Self {
         Self {
-            boot_id: new_uuid_v4(),
+            boot_id: read_linux_boot_id(),
             synced: false,
             offset_ms: 0,
             synchronized_at_ms: None,
@@ -2086,8 +2295,16 @@ impl ClockRuntimeState {
     fn issue_challenge(&mut self, principal_id: &str, from_check: bool) -> String {
         let now = Instant::now();
         self.challenges.retain(|_, v| v.expires_at > now);
-        if self.challenges.len() >= 64 {
-            self.challenges.clear();
+        while self.challenges.len() >= MAX_CLOCK_CHALLENGES {
+            let Some(earliest_key) = self
+                .challenges
+                .iter()
+                .min_by_key(|(_, v)| v.expires_at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.challenges.remove(&earliest_key);
         }
         let token = new_uuid_v4().replace('-', "");
         self.challenges.insert(
@@ -2102,12 +2319,77 @@ impl ClockRuntimeState {
     }
 }
 
+type FirmwareIdempotencyKey = (String, String, String);
+
+struct FirmwareIdempotencyRecord {
+    canonical_body: Vec<u8>,
+    outcome: CommandOutcome,
+    recorded_at: Instant,
+}
+
 #[derive(Default)]
 struct FirmwareRuntimeState {
     checked_at: Option<u64>,
+    checked_instant: Option<Instant>,
     available: Option<Value>,
     task: Option<Value>,
-    idempotency: HashMap<(String, String, String), (Vec<u8>, CommandOutcome)>,
+    idempotency: HashMap<FirmwareIdempotencyKey, FirmwareIdempotencyRecord>,
+}
+
+impl FirmwareRuntimeState {
+    fn prune_idempotency(&mut self) {
+        let now = Instant::now();
+        self.idempotency.retain(|_, rec| {
+            now.saturating_duration_since(rec.recorded_at) < FIRMWARE_IDEMPOTENCY_TTL
+        });
+    }
+
+    fn lookup_idempotency(
+        &mut self,
+        key: &FirmwareIdempotencyKey,
+        canonical_body: &[u8],
+        conflict_msg: &str,
+    ) -> ApiResult<Option<CommandOutcome>> {
+        self.prune_idempotency();
+        let Some(existing) = self.idempotency.get(key) else {
+            return Ok(None);
+        };
+        if existing.canonical_body == canonical_body {
+            let mut replayed = existing.outcome.clone();
+            replayed.replayed = true;
+            Ok(Some(replayed))
+        } else {
+            Err(ApiError::conflict("idempotency_conflict", conflict_msg).with_error_code_header())
+        }
+    }
+
+    fn insert_idempotency(
+        &mut self,
+        key: FirmwareIdempotencyKey,
+        canonical_body: Vec<u8>,
+        outcome: CommandOutcome,
+    ) {
+        self.prune_idempotency();
+        while self.idempotency.len() >= MAX_FIRMWARE_IDEMPOTENCY_ENTRIES {
+            let Some(oldest_key) = self
+                .idempotency
+                .iter()
+                .min_by_key(|(_, rec)| rec.recorded_at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.idempotency.remove(&oldest_key);
+        }
+        self.idempotency.insert(
+            key,
+            FirmwareIdempotencyRecord {
+                canonical_body,
+                outcome,
+                recorded_at: Instant::now(),
+            },
+        );
+    }
 }
 
 /// Configuration knobs for constructing a [`ProductionGatewayBackend`].
@@ -2119,6 +2401,7 @@ pub struct ProductionBackendConfig {
     pub deploy_socket: Option<PathBuf>,
     pub release_paths: ReleaseManagerPaths,
     pub enable_h264_preview: bool,
+    pub mock_mode: bool,
     pub voice_controller: Option<Arc<VoiceController>>,
     pub indicator: Option<Arc<SysfsLedController>>,
 }
@@ -2129,14 +2412,24 @@ impl ProductionBackendConfig {
             device_config,
             software_commit: option_env!("MIRO_EGO_GIT_COMMIT")
                 .map(str::to_owned)
-                .filter(|s| s.len() == 40)
+                .filter(|s| {
+                    (40..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
+                })
                 .unwrap_or_else(|| "0".repeat(40)),
             network_socket: Some(PathBuf::from(miro_ego_network::DEFAULT_CONTROL_SOCKET_PATH)),
             deploy_socket: std::env::var_os("MIRO_EGO_DEPLOY_SOCKET").map(PathBuf::from),
             release_paths: ReleaseManagerPaths::canonical(),
             enable_h264_preview: false,
+            mock_mode: false,
             voice_controller: None,
             indicator: None,
+        }
+    }
+
+    fn mdns_scheme(&self) -> MdnsScheme {
+        match self.device_config.security {
+            SecurityConfig::Customer { .. } => MdnsScheme::Https,
+            SecurityConfig::Lab { .. } => MdnsScheme::Http,
         }
     }
 }
@@ -2151,7 +2444,10 @@ pub struct ProductionGatewayBackend {
     audit: Arc<AuditLogger>,
     logs: Arc<LogStore>,
     network_client: Option<NetworkRpcClient>,
+    network_probe_client: Option<NetworkRpcClient>,
+    network_health_client: Option<NetworkRpcClient>,
     deploy_client: Option<DeployRpcClient>,
+    deploy_status_client: Option<DeployRpcClient>,
     release_manager: Arc<ReleaseManager>,
     mjpeg_hub: Arc<MjpegPreviewHub>,
     h264_hub: Option<Arc<H264PreviewHub>>,
@@ -2178,12 +2474,24 @@ impl ProductionGatewayBackend {
         let network_client = config
             .network_socket
             .as_ref()
-            .map(|sock| NetworkRpcClient::new(sock).with_timeout(Duration::from_secs(5)));
+            .map(|sock| NetworkRpcClient::new(sock).with_timeout(DEFAULT_NETWORK_MUTATION_TIMEOUT));
+        let network_probe_client = config
+            .network_socket
+            .as_ref()
+            .map(|sock| NetworkRpcClient::new(sock).with_timeout(DEFAULT_NETWORK_PROBE_TIMEOUT));
+        let network_health_client = config
+            .network_socket
+            .as_ref()
+            .map(|sock| NetworkRpcClient::new(sock).with_timeout(DEFAULT_NETWORK_HEALTH_TIMEOUT));
 
         let deploy_client = config
             .deploy_socket
             .as_ref()
             .map(|sock| DeployRpcClient::new(sock).with_timeout(Duration::from_secs(30)));
+        let deploy_status_client = config
+            .deploy_socket
+            .as_ref()
+            .map(|sock| DeployRpcClient::new(sock).with_timeout(DEFAULT_DEPLOY_STATUS_TIMEOUT));
 
         let release_manager = Arc::new(ReleaseManager::new(
             config.release_paths.clone(),
@@ -2218,7 +2526,10 @@ impl ProductionGatewayBackend {
             audit,
             logs,
             network_client,
+            network_probe_client,
+            network_health_client,
             deploy_client,
+            deploy_status_client,
             release_manager,
             mjpeg_hub,
             h264_hub,
@@ -2260,7 +2571,11 @@ impl ProductionGatewayBackend {
         self.config.voice_controller.as_ref()
     }
 
-    fn require_network_client(&self) -> ApiResult<NetworkRpcClient> {
+    fn network_probe_client(&self) -> Option<NetworkRpcClient> {
+        self.network_probe_client.clone()
+    }
+
+    fn require_network_scan_client(&self) -> ApiResult<NetworkRpcClient> {
         self.network_client.clone().ok_or_else(|| {
             ApiError::service_unavailable(
                 "network_controller_unavailable",
@@ -2270,12 +2585,19 @@ impl ProductionGatewayBackend {
             .with_error_code_header()
         })
     }
+
+    fn require_network_mutation_client(&self) -> ApiResult<NetworkRpcClient> {
+        self.network_client.clone().ok_or_else(|| {
+            network_mutation_unavailable("not_enabled", "network control socket is not configured")
+        })
+    }
 }
 
 fn controller_status_to_openapi(
     status: &ControllerStatus,
     device_id: &str,
     listen_port: u16,
+    mdns_scheme: MdnsScheme,
 ) -> Value {
     let mut observed = serde_json::to_value(&status.observed).unwrap_or_else(|_| {
         json!({
@@ -2301,8 +2623,8 @@ fn controller_status_to_openapi(
             "mdns": {
                 "hostname": "miro-ego.local",
                 "service": miro_ego_network::MDNS_SERVICE_TYPE,
-                "aliases": ["miro-ego.local"],
-                "port": listen_port,
+                "aliases": [mdns_scheme.alias_service_type()],
+                "port": listen_port.max(1),
             },
             "devices": [],
         })
@@ -2323,7 +2645,7 @@ fn controller_status_to_openapi(
         }
         if let Some(mdns_obj) = obs_obj.get_mut("mdns").and_then(Value::as_object_mut) {
             if mdns_obj.get("port").and_then(Value::as_u64).unwrap_or(0) == 0 {
-                mdns_obj.insert("port".to_owned(), json!(listen_port));
+                mdns_obj.insert("port".to_owned(), json!(listen_port.max(1)));
             }
         }
     }
@@ -2350,6 +2672,15 @@ fn controller_status_to_openapi(
 }
 
 pub fn degraded_network_status(device_id: &str, listen_port: u16, disabled_reason: &str) -> Value {
+    degraded_network_status_with_scheme(device_id, listen_port, MdnsScheme::Http, disabled_reason)
+}
+
+pub fn degraded_network_status_with_scheme(
+    device_id: &str,
+    listen_port: u16,
+    mdns_scheme: MdnsScheme,
+    disabled_reason: &str,
+) -> Value {
     let rescue_ssid = derive_rescue_identity(device_id)
         .ok()
         .map(|(ssid, _)| Value::String(ssid))
@@ -2402,7 +2733,7 @@ pub fn degraded_network_status(device_id: &str, listen_port: u16, disabled_reaso
             "mdns": {
                 "hostname": "miro-ego.local",
                 "service": miro_ego_network::MDNS_SERVICE_TYPE,
-                "aliases": ["miro-ego.local"],
+                "aliases": [mdns_scheme.alias_service_type()],
                 "port": listen_port.max(1),
             },
             "devices": [],
@@ -2446,10 +2777,9 @@ impl GatewayBackend for ProductionGatewayBackend {
         let volume = Arc::clone(&self.volume);
         let coordinator = Arc::clone(&self.coordinator);
         let release_manager = Arc::clone(&self.release_manager);
-        let deploy_client = self.deploy_client.clone();
         let fallback_commit = self.config.software_commit.clone();
         let preview_h264 = self.h264_hub.is_some();
-        let net_client = self.network_client.clone();
+        let net_health_client = self.network_health_client.clone();
 
         run_blocking(move || {
             let vol_info = volume.inspect_volume().ok();
@@ -2459,10 +2789,14 @@ impl GatewayBackend for ProductionGatewayBackend {
                 .map(|m| m.volume_id)
                 .unwrap_or_else(|| "00000000-0000-4000-8000-000000000000".to_owned());
             let status = coordinator.capture_status().map_err(map_storage_error)?;
-            let deploy = deploy_client
-                .as_ref()
-                .and_then(|c| c.status().ok().map(|s| s.deployment))
-                .or_else(|| release_manager.status().ok());
+            let phase_busy = coordinator.phase().map(|p| p.is_busy()).unwrap_or(false);
+            let storage_ready = writable
+                && coordinator
+                    .capture_readiness()
+                    .map(|r| r.allowed)
+                    .unwrap_or(false);
+
+            let deploy = release_manager.status().ok();
             let commit = deploy
                 .as_ref()
                 .and_then(|d| d.current.clone())
@@ -2471,9 +2805,33 @@ impl GatewayBackend for ProductionGatewayBackend {
                 .as_ref()
                 .and_then(|d| d.current_version.clone())
                 .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
-            let network_mutation = net_client
+            let network_mutation = net_health_client
                 .as_ref()
                 .is_some_and(|client| client.health().is_ok());
+
+            let camera_connected = status
+                .snapshot
+                .runtime
+                .get("camera")
+                .and_then(|c| c.get("state"))
+                .and_then(Value::as_str)
+                != Some("disconnected");
+            let active_state = matches!(
+                status.snapshot.device_state.as_str(),
+                "recording" | "finalizing" | "encoding" | "verifying"
+            );
+            let (cal_enabled, cal_disabled_reason) = if !camera_connected {
+                (false, Value::String("hardware_unavailable".to_owned()))
+            } else if phase_busy || active_state {
+                (
+                    false,
+                    Value::String("maintenance_or_capture_busy".to_owned()),
+                )
+            } else if !storage_ready {
+                (false, Value::String("storage_unavailable".to_owned()))
+            } else {
+                (true, Value::Null)
+            };
 
             Ok(json!({
                 "schema": "miro-ego.device.v1",
@@ -2503,8 +2861,8 @@ impl GatewayBackend for ProductionGatewayBackend {
                     "session_deletion": true,
                     "calibration_capture": {
                         "supported": true,
-                        "enabled": true,
-                        "disabled_reason": Value::Null,
+                        "enabled": cal_enabled,
+                        "disabled_reason": cal_disabled_reason,
                         "required_video_layout": "split-eyes",
                     },
                 },
@@ -3059,6 +3417,18 @@ impl GatewayBackend for ProductionGatewayBackend {
             )
             .with_error_code_header());
         }
+        if self
+            .coordinator
+            .phase()
+            .map_err(map_storage_error)?
+            .is_busy()
+        {
+            return Err(ApiError::conflict(
+                "capture_active",
+                "clock sync is prohibited while capture is active",
+            )
+            .with_error_code_header());
+        }
         let applied = if !guard.synced || replace {
             let sys_now = now_unix_ms() as i128;
             guard.offset_ms = (i128::from(unix_time_ms) - sys_now)
@@ -3071,6 +3441,11 @@ impl GatewayBackend for ProductionGatewayBackend {
         } else {
             false
         };
+        let age_seconds = if applied {
+            Some(0)
+        } else {
+            guard.age_seconds()
+        };
         Ok(json!({
             "schema": "miro-ego.clock-status.v1",
             "source": "client",
@@ -3080,22 +3455,32 @@ impl GatewayBackend for ProductionGatewayBackend {
             "applied": applied,
             "boot_id": guard.boot_id,
             "synchronized_at_ms": guard.synchronized_at_ms,
-            "age_seconds": 0,
+            "age_seconds": age_seconds,
         }))
     }
 
     async fn voice_status(&self) -> ApiResult<Value> {
-        if let Some(voice) = &self.config.voice_controller {
-            let status = voice.status().map_err(map_hw_error)?;
-            return serde_json::to_value(status).map_err(|err| {
-                ApiError::internal("serialize_failed", format!("serialize voice status: {err}"))
-            });
+        if let Some(voice) = self.config.voice_controller.clone() {
+            return run_blocking(move || {
+                let status = voice.status().map_err(map_hw_error)?;
+                serde_json::to_value(status).map_err(|err| {
+                    ApiError::internal("serialize_failed", format!("serialize voice status: {err}"))
+                })
+            })
+            .await;
         }
-        let volume = self.voice_fallback_volume.lock().map(|g| *g).unwrap_or(80);
+        if self.config.mock_mode {
+            let volume = self.voice_fallback_volume.lock().map(|g| *g).unwrap_or(80);
+            return Ok(json!({
+                "schema": miro_ego_hw::VOICE_STATUS_SCHEMA,
+                "enabled": volume > 0,
+                "volume": volume,
+            }));
+        }
         Ok(json!({
             "schema": miro_ego_hw::VOICE_STATUS_SCHEMA,
             "enabled": false,
-            "volume": volume,
+            "volume": 0,
         }))
     }
 
@@ -3112,33 +3497,52 @@ impl GatewayBackend for ProductionGatewayBackend {
             )
             .with_error_code_header());
         }
-        if let Some(voice) = &self.config.voice_controller {
-            let status = voice.set_volume(volume).map_err(map_hw_error)?;
-            return serde_json::to_value(status).map_err(|err| {
-                ApiError::internal("serialize_failed", format!("serialize voice status: {err}"))
-            });
+        if let Some(voice) = self.config.voice_controller.clone() {
+            return run_blocking(move || {
+                let status = voice.set_volume(volume).map_err(map_hw_error)?;
+                serde_json::to_value(status).map_err(|err| {
+                    ApiError::internal("serialize_failed", format!("serialize voice status: {err}"))
+                })
+            })
+            .await;
+        }
+        if !self.config.mock_mode {
+            return Err(ApiError::service_unavailable(
+                "voice_unavailable",
+                "voice prompt controller is unavailable; volume cannot be persisted",
+            )
+            .with_header("Retry-After", "1")
+            .with_error_code_header());
         }
         if let Ok(mut guard) = self.voice_fallback_volume.lock() {
             *guard = volume;
         }
         Ok(json!({
             "schema": miro_ego_hw::VOICE_STATUS_SCHEMA,
-            "enabled": false,
+            "enabled": volume > 0,
             "volume": volume,
         }))
     }
 
     async fn network_status(&self) -> ApiResult<Value> {
-        let client = self.network_client.clone();
+        let client = self.network_probe_client.clone();
         let device_id = self.config.device_config.device.device_id.clone();
         let port = self.config.device_config.listen.port;
+        let scheme = self.config.mdns_scheme();
         let status_json = run_blocking(move || {
             let val = match client {
                 Some(ref c) => match c.status() {
-                    Ok(st) => controller_status_to_openapi(&st, &device_id, port),
-                    Err(_) => degraded_network_status(&device_id, port, "controller_unavailable"),
+                    Ok(st) => controller_status_to_openapi(&st, &device_id, port, scheme),
+                    Err(_) => degraded_network_status_with_scheme(
+                        &device_id,
+                        port,
+                        scheme,
+                        "controller_unavailable",
+                    ),
                 },
-                None => degraded_network_status(&device_id, port, "not_enabled"),
+                None => {
+                    degraded_network_status_with_scheme(&device_id, port, scheme, "not_enabled")
+                }
             };
             Ok(val)
         })
@@ -3161,7 +3565,7 @@ impl GatewayBackend for ProductionGatewayBackend {
             .with_header("Retry-After", "1")
             .with_error_code_header());
         }
-        let client = self.require_network_client()?;
+        let client = self.require_network_scan_client()?;
         run_blocking(move || {
             let scan = client.scan().map_err(|err| match err {
                 NetworkError::Busy { ref message } | NetworkError::Backend { ref message }
@@ -3185,13 +3589,13 @@ impl GatewayBackend for ProductionGatewayBackend {
         principal_id: &str,
         passphrase: &str,
     ) -> ApiResult<Value> {
-        let client = self.require_network_client()?;
+        let client = self.require_network_mutation_client()?;
         let principal = principal_id.to_owned();
         let pass = passphrase.to_owned();
         run_blocking(move || {
             let receipt = client
                 .create_credential(&principal, &pass)
-                .map_err(map_network_error)?;
+                .map_err(map_network_mutation_error)?;
             serde_json::to_value(receipt).map_err(|err| {
                 ApiError::internal(
                     "serialize_failed",
@@ -3226,34 +3630,23 @@ impl GatewayBackend for ProductionGatewayBackend {
         let desired: ApplyDesiredState = serde_json::from_value(desired_val).map_err(|err| {
             ApiError::bad_request(format!("invalid desired network state: {err}"))
         })?;
-        let client = self.require_network_client()?;
+        let client = self.require_network_mutation_client()?;
         let principal = cmd.principal_id;
         let key = cmd.idempotency_key;
-        let device_id = self.config.device_config.device.device_id.clone();
-        let port = self.config.device_config.listen.port;
 
-        let (outcome, updated_status) = run_blocking(move || {
+        run_blocking(move || {
             let res = client
                 .apply(&principal, &key, &desired)
-                .map_err(map_network_error)?;
+                .map_err(map_network_mutation_error)?;
             let body = serde_json::to_value(&res.receipt).map_err(|err| {
                 ApiError::internal(
                     "serialize_failed",
                     format!("serialize network receipt: {err}"),
                 )
             })?;
-            let status_json = client
-                .status()
-                .ok()
-                .map(|st| controller_status_to_openapi(&st, &device_id, port));
-            Ok((CommandOutcome::accepted(body, res.replayed), status_json))
+            Ok(CommandOutcome::accepted(body, res.replayed))
         })
-        .await?;
-
-        if let Some(st) = updated_status {
-            let _ = self.network_events.observe(st);
-        }
-        Ok(outcome)
+        .await
     }
 
     async fn retry_network_transaction(&self, cmd: IdempotentCommand) -> ApiResult<CommandOutcome> {
@@ -3275,18 +3668,16 @@ impl GatewayBackend for ProductionGatewayBackend {
             .and_then(Value::as_str)
             .ok_or_else(|| ApiError::bad_request("missing transaction_id"))?
             .to_owned();
-        let client = self.require_network_client()?;
+        let client = self.require_network_mutation_client()?;
         let principal = cmd.principal_id;
         let key = cmd.idempotency_key;
-        let device_id = self.config.device_config.device.device_id.clone();
-        let port = self.config.device_config.listen.port;
 
-        let (outcome, updated_status) = run_blocking(move || {
+        run_blocking(move || {
             let res = client.retry(&principal, &key, &tx_id).map_err(|err| {
                 if err.to_string().contains("transaction_not_found") {
                     ApiError::network_transaction_not_found(&tx_id)
                 } else {
-                    map_network_error(err)
+                    map_network_mutation_error(err)
                 }
             })?;
             let body = serde_json::to_value(&res.receipt).map_err(|err| {
@@ -3295,18 +3686,9 @@ impl GatewayBackend for ProductionGatewayBackend {
                     format!("serialize retry receipt: {err}"),
                 )
             })?;
-            let status_json = client
-                .status()
-                .ok()
-                .map(|st| controller_status_to_openapi(&st, &device_id, port));
-            Ok((CommandOutcome::accepted(body, res.replayed), status_json))
+            Ok(CommandOutcome::accepted(body, res.replayed))
         })
-        .await?;
-
-        if let Some(st) = updated_status {
-            let _ = self.network_events.observe(st);
-        }
-        Ok(outcome)
+        .await
     }
 
     async fn forget_network_client_profile(
@@ -3325,32 +3707,23 @@ impl GatewayBackend for ProductionGatewayBackend {
             )
             .with_error_code_header());
         }
-        let client = self.require_network_client()?;
+        let client = self.require_network_mutation_client()?;
         let principal = cmd.principal_id;
         let key = cmd.idempotency_key;
-        let device_id = self.config.device_config.device.device_id.clone();
-        let port = self.config.device_config.listen.port;
 
-        let (outcome, updated_status) = run_blocking(move || {
-            let res = client.forget(&principal, &key).map_err(map_network_error)?;
+        run_blocking(move || {
+            let res = client
+                .forget(&principal, &key)
+                .map_err(map_network_mutation_error)?;
             let body = serde_json::to_value(&res.receipt).map_err(|err| {
                 ApiError::internal(
                     "serialize_failed",
                     format!("serialize forget receipt: {err}"),
                 )
             })?;
-            let status_json = client
-                .status()
-                .ok()
-                .map(|st| controller_status_to_openapi(&st, &device_id, port));
-            Ok((CommandOutcome::accepted(body, res.replayed), status_json))
+            Ok(CommandOutcome::accepted(body, res.replayed))
         })
-        .await?;
-
-        if let Some(st) = updated_status {
-            let _ = self.network_events.observe(st);
-        }
-        Ok(outcome)
+        .await
     }
 
     async fn firmware_status(&self) -> ApiResult<Value> {
@@ -3359,7 +3732,7 @@ impl GatewayBackend for ProductionGatewayBackend {
             .lock()
             .map(|g| (g.checked_at, g.available.clone(), g.task.clone()))
             .map_err(|_| ApiError::internal("firmware_poisoned", "firmware state poisoned"))?;
-        let deploy_client = self.deploy_client.clone();
+        let deploy_client = self.deploy_status_client.clone();
         let release_manager = Arc::clone(&self.release_manager);
         let fallback_commit = self.config.software_commit.clone();
         run_blocking(move || {
@@ -3375,10 +3748,43 @@ impl GatewayBackend for ProductionGatewayBackend {
         .await
     }
 
-    async fn firmware_check(&self, _force: bool) -> ApiResult<Value> {
+    async fn firmware_check(&self, force: bool) -> ApiResult<Value> {
+        if !force {
+            let cached = self
+                .firmware
+                .lock()
+                .map_err(|_| ApiError::internal("firmware_poisoned", "firmware state poisoned"))
+                .map(|g| {
+                    if g.checked_at.is_some()
+                        && g.checked_instant
+                            .is_some_and(|ts| ts.elapsed() < FIRMWARE_CHECK_CACHE_TTL)
+                    {
+                        Some((g.checked_at, g.available.clone(), g.task.clone()))
+                    } else {
+                        None
+                    }
+                })?;
+            if let Some((checked_at, available, task)) = cached {
+                let deploy_client = self.deploy_status_client.clone();
+                let release_manager = Arc::clone(&self.release_manager);
+                let fallback_commit = self.config.software_commit.clone();
+                return run_blocking(move || {
+                    Ok(build_firmware_status_payload(
+                        deploy_client.as_ref(),
+                        &release_manager,
+                        &fallback_commit,
+                        checked_at,
+                        available,
+                        task,
+                    ))
+                })
+                .await;
+            }
+        }
+
         let now = now_unix_secs();
         let updates_dir = self.volume.paths().updates_dir();
-        let deploy_client = self.deploy_client.clone();
+        let deploy_client = self.deploy_status_client.clone();
         let release_manager = Arc::clone(&self.release_manager);
         let fallback_commit = self.config.software_commit.clone();
 
@@ -3419,6 +3825,7 @@ impl GatewayBackend for ProductionGatewayBackend {
                 .lock()
                 .map_err(|_| ApiError::internal("firmware_poisoned", "firmware state poisoned"))?;
             guard.checked_at = Some(now);
+            guard.checked_instant = Some(Instant::now());
             guard.available = discovered_available.clone();
             if let Some(ref t) = rpc_task {
                 guard.task = Some(t.clone());
@@ -3462,56 +3869,56 @@ impl GatewayBackend for ProductionGatewayBackend {
             cmd.idempotency_key.clone(),
         );
         {
-            let guard = self
+            let mut guard = self
                 .firmware
                 .lock()
                 .map_err(|_| ApiError::internal("firmware_poisoned", "firmware state poisoned"))?;
-            if let Some((prev_body, prev_outcome)) = guard.idempotency.get(&idem_key) {
-                if prev_body == &cmd.canonical_body {
-                    let mut replayed = prev_outcome.clone();
-                    replayed.replayed = true;
-                    return Ok(replayed);
-                }
-                return Err(ApiError::conflict(
-                    "idempotency_conflict",
-                    "Idempotency-Key reused with different firmware update payload",
-                )
-                .with_error_code_header());
+            if let Some(replayed) = guard.lookup_idempotency(
+                &idem_key,
+                &cmd.canonical_body,
+                "Idempotency-Key reused with different firmware update payload",
+            )? {
+                return Ok(replayed);
             }
         }
 
+        let Some(rpc) = self.deploy_client.clone() else {
+            return Err(ApiError::service_unavailable(
+                "firmware_unavailable",
+                "privileged firmware deploy controller is unavailable",
+            )
+            .with_header("Retry-After", "1")
+            .with_error_code_header());
+        };
+
         let staged_bundle = self.volume.paths().updates_dir().join(&commit);
-        let deploy_client = self.deploy_client.clone();
         let commit_for_task = commit.clone();
         let task = run_blocking(move || {
-            if !staged_bundle.is_dir() {
-                return Err(ApiError::conflict(
-                    "update_not_staged",
-                    format!(
-                        "offline firmware bundle for commit {commit_for_task} is not staged under /data/updates/"
-                    ),
+            let meta = match fs::symlink_metadata(&staged_bundle) {
+                Ok(m) => m,
+                Err(_) => {
+                    return Err(ApiError::conflict(
+                        "update_not_staged",
+                        format!(
+                            "offline firmware bundle for commit {commit_for_task} is not staged under /data/updates/"
+                        ),
+                    )
+                    .with_error_code_header());
+                }
+            };
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(ApiError::unprocessable(
+                    "invalid_firmware_bundle",
+                    "staged firmware bundle path must be a non-symlink directory",
                 )
                 .with_error_code_header());
             }
-            let _verified = verify_bundle_dir(&staged_bundle).map_err(map_deploy_error)?;
-            if let Some(rpc) = deploy_client {
-                let snap = rpc
-                    .install(&staged_bundle, &commit_for_task, true)
-                    .map_err(map_deploy_error)?;
-                serde_json::to_value(snap).map_err(|err| {
-                    ApiError::internal("serialize_failed", format!("serialize firmware task: {err}"))
-                })
-            } else {
-                Ok(json!({
-                    "id": new_uuid_v7(),
-                    "action": "update",
-                    "target_commit": commit_for_task,
-                    "status": "accepted",
-                    "message": "staged offline firmware bundle accepted for activation",
-                    "started_at": now_unix_secs(),
-                    "finished_at": Value::Null,
-                }))
-            }
+            let snap = rpc
+                .install(&staged_bundle, &commit_for_task, true)
+                .map_err(map_deploy_error)?;
+            serde_json::to_value(snap).map_err(|err| {
+                ApiError::internal("serialize_failed", format!("serialize firmware task: {err}"))
+            })
         })
         .await?;
 
@@ -3519,23 +3926,17 @@ impl GatewayBackend for ProductionGatewayBackend {
             .firmware
             .lock()
             .map_err(|_| ApiError::internal("firmware_poisoned", "firmware state poisoned"))?;
-        if let Some((prev_body, prev_outcome)) = guard.idempotency.get(&idem_key) {
-            if prev_body == &cmd.canonical_body {
-                let mut replayed = prev_outcome.clone();
-                replayed.replayed = true;
-                return Ok(replayed);
-            }
-            return Err(ApiError::conflict(
-                "idempotency_conflict",
-                "Idempotency-Key reused with different firmware update payload",
-            )
-            .with_error_code_header());
+        if let Some(replayed) = guard.lookup_idempotency(
+            &idem_key,
+            &cmd.canonical_body,
+            "Idempotency-Key reused with different firmware update payload",
+        )? {
+            return Ok(replayed);
         }
+        guard.checked_instant = None;
         guard.task = Some(task.clone());
         let outcome = CommandOutcome::accepted(task, false);
-        guard
-            .idempotency
-            .insert(idem_key, (cmd.canonical_body, outcome.clone()));
+        guard.insert_idempotency(idem_key, cmd.canonical_body, outcome.clone());
         Ok(outcome)
     }
 
@@ -3566,65 +3967,47 @@ impl GatewayBackend for ProductionGatewayBackend {
             cmd.idempotency_key.clone(),
         );
         {
-            let guard = self
+            let mut guard = self
                 .firmware
                 .lock()
                 .map_err(|_| ApiError::internal("firmware_poisoned", "firmware state poisoned"))?;
-            if let Some((prev_body, prev_outcome)) = guard.idempotency.get(&idem_key) {
-                if prev_body == &cmd.canonical_body {
-                    let mut replayed = prev_outcome.clone();
-                    replayed.replayed = true;
-                    return Ok(replayed);
-                }
-                return Err(ApiError::conflict(
-                    "idempotency_conflict",
-                    "Idempotency-Key reused with different firmware rollback payload",
-                )
-                .with_error_code_header());
+            if let Some(replayed) = guard.lookup_idempotency(
+                &idem_key,
+                &cmd.canonical_body,
+                "Idempotency-Key reused with different firmware rollback payload",
+            )? {
+                return Ok(replayed);
             }
         }
 
-        let deploy_client = self.deploy_client.clone();
-        let release_manager = Arc::clone(&self.release_manager);
+        let Some(rpc) = self.deploy_client.clone() else {
+            return Err(ApiError::service_unavailable(
+                "firmware_unavailable",
+                "privileged firmware deploy controller is unavailable",
+            )
+            .with_header("Retry-After", "1")
+            .with_error_code_header());
+        };
+
         let commit_for_task = commit.clone();
         let task = run_blocking(move || {
-            if let Some(rpc) = deploy_client {
-                let ctrl = rpc.status().map_err(map_deploy_error)?;
-                if ctrl.deployment.previous.as_deref() != Some(commit_for_task.as_str()) {
-                    return Err(ApiError::conflict(
-                        "rollback_unavailable",
-                        "requested commit does not match installed previous release",
-                    )
-                    .with_error_code_header());
-                }
-                let snap = rpc
-                    .rollback(&commit_for_task, true)
-                    .map_err(map_deploy_error)?;
-                serde_json::to_value(snap).map_err(|err| {
-                    ApiError::internal(
-                        "serialize_failed",
-                        format!("serialize firmware task: {err}"),
-                    )
-                })
-            } else {
-                let deploy = release_manager.status().map_err(map_deploy_error)?;
-                if deploy.previous.as_deref() != Some(commit_for_task.as_str()) {
-                    return Err(ApiError::conflict(
-                        "rollback_unavailable",
-                        "requested commit does not match installed previous release",
-                    )
-                    .with_error_code_header());
-                }
-                Ok(json!({
-                    "id": new_uuid_v7(),
-                    "action": "rollback",
-                    "target_commit": commit_for_task,
-                    "status": "accepted",
-                    "message": "firmware rollback accepted",
-                    "started_at": now_unix_secs(),
-                    "finished_at": Value::Null,
-                }))
+            let ctrl = rpc.status().map_err(map_deploy_error)?;
+            if ctrl.deployment.previous.as_deref() != Some(commit_for_task.as_str()) {
+                return Err(ApiError::conflict(
+                    "rollback_unavailable",
+                    "requested commit does not match installed previous release",
+                )
+                .with_error_code_header());
             }
+            let snap = rpc
+                .rollback(&commit_for_task, true)
+                .map_err(map_deploy_error)?;
+            serde_json::to_value(snap).map_err(|err| {
+                ApiError::internal(
+                    "serialize_failed",
+                    format!("serialize firmware task: {err}"),
+                )
+            })
         })
         .await?;
 
@@ -3632,23 +4015,17 @@ impl GatewayBackend for ProductionGatewayBackend {
             .firmware
             .lock()
             .map_err(|_| ApiError::internal("firmware_poisoned", "firmware state poisoned"))?;
-        if let Some((prev_body, prev_outcome)) = guard.idempotency.get(&idem_key) {
-            if prev_body == &cmd.canonical_body {
-                let mut replayed = prev_outcome.clone();
-                replayed.replayed = true;
-                return Ok(replayed);
-            }
-            return Err(ApiError::conflict(
-                "idempotency_conflict",
-                "Idempotency-Key reused with different firmware rollback payload",
-            )
-            .with_error_code_header());
+        if let Some(replayed) = guard.lookup_idempotency(
+            &idem_key,
+            &cmd.canonical_body,
+            "Idempotency-Key reused with different firmware rollback payload",
+        )? {
+            return Ok(replayed);
         }
+        guard.checked_instant = None;
         guard.task = Some(task.clone());
         let outcome = CommandOutcome::accepted(task, false);
-        guard
-            .idempotency
-            .insert(idem_key, (cmd.canonical_body, outcome.clone()));
+        guard.insert_idempotency(idem_key, cmd.canonical_body, outcome.clone());
         Ok(outcome)
     }
 
@@ -3663,10 +4040,13 @@ impl GatewayBackend for ProductionGatewayBackend {
             resource_id: event.resource_id,
             outcome: event.outcome,
         };
-        let target = self
-            .audit
-            .record(&storage_event)
-            .map_err(map_storage_error)?;
+        let target = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| self.audit.record(&storage_event))
+            }
+            _ => self.audit.record(&storage_event),
+        }
+        .map_err(map_storage_error)?;
         match target {
             AuditWriteTarget::Disk | AuditWriteTarget::MemoryFallback => Ok(()),
             AuditWriteTarget::Unavailable => Err(ApiError::audit_unavailable()),
@@ -3781,6 +4161,7 @@ fn format_firmware_status_from_parts(
 pub struct DaemonServeOptions {
     pub device_config: DeviceConfig,
     pub capture_mode: CaptureModeKind,
+    pub mock_mode: bool,
     pub listen_override: Option<SocketAddr>,
     pub network_socket: Option<PathBuf>,
     pub deploy_socket: Option<PathBuf>,
@@ -3824,6 +4205,7 @@ impl DaemonServeOptions {
         Self {
             device_config,
             capture_mode,
+            mock_mode: mock,
             listen_override: None,
             network_socket,
             deploy_socket,
@@ -3993,17 +4375,36 @@ pub async fn bind_daemon(options: DaemonServeOptions) -> Result<BoundDaemon, Str
         None => raw_capture_backend,
     };
 
+    let installed_release = ReleaseManager::new(
+        options.release_paths.clone(),
+        Arc::new(NoopSystemctlRunner),
+        Arc::new(NoopHealthChecker),
+    )
+    .status()
+    .ok();
+    let compiled_commit = option_env!("MIRO_EGO_GIT_COMMIT")
+        .map(str::to_owned)
+        .filter(|s| (40..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| "0".repeat(40));
+    let resolved_software_version = installed_release
+        .as_ref()
+        .and_then(|st| st.current_version.clone())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+    let resolved_commit = installed_release
+        .as_ref()
+        .and_then(|st| st.current.clone())
+        .filter(|c| (40..=64).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or(compiled_commit);
+
     let timer_settings_path = options.device_config.state_root.join("capture-timer.json");
     let coord_cfg = CoordinatorConfig {
         device_id: options.device_config.device.device_id.clone(),
         device_label: options.device_config.device.device_label.clone(),
         hardware_fingerprint: options.device_config.device.hardware_fingerprint.clone(),
         platform: "rdk-x5".to_owned(),
-        software_version: env!("CARGO_PKG_VERSION").to_owned(),
-        commit: option_env!("MIRO_EGO_GIT_COMMIT")
-            .map(str::to_owned)
-            .filter(|s| s.len() == 40)
-            .unwrap_or_else(|| "0".repeat(40)),
+        software_version: resolved_software_version,
+        commit: resolved_commit.clone(),
         timezone: "Etc/UTC".to_owned(),
         camera_width: options.device_config.camera.width,
         camera_height: options.device_config.camera.height,
@@ -4030,10 +4431,12 @@ pub async fn bind_daemon(options: DaemonServeOptions) -> Result<BoundDaemon, Str
 
     let mut backend_cfg =
         ProductionBackendConfig::from_device_config(options.device_config.clone());
+    backend_cfg.software_commit = resolved_commit;
     backend_cfg.network_socket = options.network_socket;
     backend_cfg.deploy_socket = options.deploy_socket;
     backend_cfg.release_paths = options.release_paths;
     backend_cfg.enable_h264_preview = options.enable_h264_preview;
+    backend_cfg.mock_mode = options.mock_mode;
     backend_cfg.voice_controller = options.voice_controller;
     backend_cfg.indicator = options.indicator;
 
@@ -4111,6 +4514,7 @@ where
     let bg_stop = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, mut reserve_rx) = tokio::sync::watch::channel(false);
     let mut timer_rx = shutdown_tx.subscribe();
+    let mut net_poll_rx = shutdown_tx.subscribe();
 
     // Task 1: Capture event bridge -> SSE replay buffer + LED + voice feedback.
     let event_sub = backend.coordinator().subscribe_events();
@@ -4121,15 +4525,13 @@ where
     let event_thread = thread::Builder::new()
         .name("miro-ego-event-bridge".to_owned())
         .spawn(move || {
+            let mut tracker = EventFeedbackTracker::default();
             while !event_stop.load(Ordering::Acquire) {
                 match event_sub.recv_timeout(Duration::from_millis(200)) {
                     Ok(ev) => {
-                        forward_capture_event(
-                            &ev,
-                            &event_buf,
-                            event_led.as_deref(),
-                            event_voice.as_deref(),
-                        );
+                        let led_ref = event_led.as_deref().map(|l| l as &dyn IndicatorController);
+                        let voice_ref = event_voice.as_deref().map(|v| v as &dyn VoiceFeedback);
+                        forward_capture_event(&mut tracker, &ev, &event_buf, led_ref, voice_ref);
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -4158,7 +4560,11 @@ where
                     .await;
                     if let Ok(Ok(ReserveEnforcementOutcome::StoppedForReserve { .. })) = outcome {
                         if let Some(ref voice) = reserve_voice {
-                            let _ = voice.play_cue(VoiceCue::StorageLow);
+                            let v = Arc::clone(voice);
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let _ = v.play_cue(VoiceCue::StorageLow);
+                            })
+                            .await;
                         }
                     }
                 }
@@ -4195,6 +4601,63 @@ where
         }
     });
 
+    // Task 4: Background network status poller feeding live `/api/v1/network/events` SSE subscribers.
+    let net_poll_task = backend.network_probe_client().map(|probe_client| {
+        let net_buf = backend.network_event_buffer();
+        let dev_id = backend.config.device_config.device.device_id.clone();
+        let listen_port = backend.config.device_config.listen.port;
+        let mdns_scheme = backend.config.mdns_scheme();
+        tokio::spawn(async move {
+            let mut next_delay = DEFAULT_NETWORK_IDLE_POLL_INTERVAL;
+            let mut had_live_status = false;
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(next_delay) => {
+                        let c = probe_client.clone();
+                        let did = dev_id.clone();
+                        let polled = tokio::task::spawn_blocking(move || c.status()).await;
+                        match polled {
+                            Ok(Ok(st)) => {
+                                had_live_status = true;
+                                let tx_active = st.transaction.current.is_some();
+                                let val = controller_status_to_openapi(
+                                    &st,
+                                    &did,
+                                    listen_port,
+                                    mdns_scheme,
+                                );
+                                let _ = net_buf.observe(val);
+                                next_delay = if tx_active {
+                                    DEFAULT_NETWORK_ACTIVE_POLL_INTERVAL
+                                } else {
+                                    DEFAULT_NETWORK_IDLE_POLL_INTERVAL
+                                };
+                            }
+                            _ => {
+                                if had_live_status {
+                                    had_live_status = false;
+                                    let val = degraded_network_status_with_scheme(
+                                        &dev_id,
+                                        listen_port,
+                                        mdns_scheme,
+                                        "controller_unavailable",
+                                    );
+                                    let _ = net_buf.observe(val);
+                                }
+                                next_delay = DEFAULT_NETWORK_IDLE_POLL_INTERVAL;
+                            }
+                        }
+                    }
+                    _ = net_poll_rx.changed() => {
+                        if *net_poll_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    });
+
     // Run HTTP/HTTPS gateway until shutdown signal resolves.
     let serve_result = server.serve_with_graceful_shutdown(shutdown).await;
 
@@ -4203,6 +4666,9 @@ where
     let _ = shutdown_tx.send(true);
     let _ = reserve_task.await;
     let _ = timer_task.await;
+    if let Some(task) = net_poll_task {
+        let _ = task.await;
+    }
 
     // 2. Cleanly settle `Starting`/`Recording`/`Stopping`, seal any active capture, close coordinator, & flush audit log.
     let shutdown_coord = Arc::clone(backend.coordinator());
@@ -4243,11 +4709,159 @@ where
     serve_result.map_err(|err| format!("gateway server exited with error: {err}"))
 }
 
+/// Stateful LED & voice cue transition tracker for `miro-ego-event-bridge`.
+///
+/// Handles both `CaptureEventType::State` (`recording`, `failed`, `recoverable`, `abandoned`),
+/// `CaptureEventType::Snapshot` (`device_state == "idle"` after active capture, `"blocked"`),
+/// and start-attempt failure `CaptureEventType::Diagnostic` events without duplicate cues.
+#[derive(Debug, Default)]
+pub struct EventFeedbackTracker {
+    capture_active: bool,
+    blocked_latched: bool,
+    error_latched_session: Option<String>,
+}
+
+impl EventFeedbackTracker {
+    pub fn observe(
+        &mut self,
+        ev: &CaptureEvent,
+        led: Option<&dyn IndicatorController>,
+        voice: Option<&dyn VoiceFeedback>,
+    ) {
+        match ev.event_type {
+            CaptureEventType::State => {
+                let Some(state_str) = ev.data.get("state").and_then(Value::as_str) else {
+                    return;
+                };
+                match state_str {
+                    "recording" => {
+                        self.blocked_latched = false;
+                        self.error_latched_session = None;
+                        if !self.capture_active {
+                            self.capture_active = true;
+                            if let Some(l) = led {
+                                let _ = l.set_state(IndicatorState::Recording);
+                            }
+                            if let Some(v) = voice {
+                                let _ = v.play_cue(VoiceCue::RecordingStarted);
+                            }
+                        }
+                    }
+                    "finalizing" | "encoding" | "verifying" => {
+                        self.capture_active = true;
+                    }
+                    "failed" | "recoverable" | "abandoned" => {
+                        self.capture_active = false;
+                        let already_latched = ev.session_id.is_some()
+                            && self.error_latched_session.as_deref() == ev.session_id.as_deref();
+                        if !already_latched {
+                            self.error_latched_session = ev.session_id.clone();
+                            if let Some(l) = led {
+                                let _ = l.set_state(IndicatorState::Error);
+                            }
+                            if let Some(v) = voice {
+                                let _ = v.play_cue(VoiceCue::ErrorAlert);
+                            }
+                        }
+                    }
+                    "idle" => {
+                        self.blocked_latched = false;
+                        if self.capture_active {
+                            self.capture_active = false;
+                            if let Some(l) = led {
+                                let _ = l.set_state(IndicatorState::Ready);
+                            }
+                            if let Some(v) = voice {
+                                let _ = v.play_cue(VoiceCue::RecordingStopped);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            CaptureEventType::Diagnostic => {
+                let is_error = ev
+                    .data
+                    .get("diagnostic")
+                    .and_then(|d| d.get("severity"))
+                    .and_then(Value::as_str)
+                    == Some("error");
+                if is_error && !self.capture_active {
+                    let already_latched = ev.session_id.is_some()
+                        && self.error_latched_session.as_deref() == ev.session_id.as_deref();
+                    if !already_latched {
+                        self.error_latched_session = ev.session_id.clone();
+                        if let Some(l) = led {
+                            let _ = l.set_state(IndicatorState::Error);
+                        }
+                        if let Some(v) = voice {
+                            let _ = v.play_cue(VoiceCue::ErrorAlert);
+                        }
+                    }
+                }
+            }
+            CaptureEventType::Snapshot => {
+                let Some(device_state) = ev.data.get("device_state").and_then(Value::as_str) else {
+                    return;
+                };
+                match device_state {
+                    "recording" => {
+                        self.blocked_latched = false;
+                        self.error_latched_session = None;
+                        if !self.capture_active {
+                            self.capture_active = true;
+                            if let Some(l) = led {
+                                let _ = l.set_state(IndicatorState::Recording);
+                            }
+                            if let Some(v) = voice {
+                                let _ = v.play_cue(VoiceCue::RecordingStarted);
+                            }
+                        }
+                    }
+                    "finalizing" | "encoding" | "verifying" => {
+                        self.blocked_latched = false;
+                        self.capture_active = true;
+                    }
+                    "idle" => {
+                        self.blocked_latched = false;
+                        if self.capture_active {
+                            self.capture_active = false;
+                            if let Some(l) = led {
+                                let _ = l.set_state(IndicatorState::Ready);
+                            }
+                            if let Some(v) = voice {
+                                let _ = v.play_cue(VoiceCue::RecordingStopped);
+                            }
+                        }
+                    }
+                    "blocked" => {
+                        self.capture_active = false;
+                        if let Some(l) = led {
+                            let _ = l.set_state(IndicatorState::Error);
+                        }
+                        if !self.blocked_latched && self.error_latched_session.is_none() {
+                            self.blocked_latched = true;
+                            if let Some(v) = voice {
+                                let _ = v.play_cue(VoiceCue::ErrorAlert);
+                            }
+                        } else {
+                            self.blocked_latched = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            CaptureEventType::Progress | CaptureEventType::SafeSwap => {}
+        }
+    }
+}
+
 fn forward_capture_event(
+    tracker: &mut EventFeedbackTracker,
     ev: &CaptureEvent,
     event_buf: &EventReplayBuffer,
-    led: Option<&SysfsLedController>,
-    voice: Option<&VoiceController>,
+    led: Option<&dyn IndicatorController>,
+    voice: Option<&dyn VoiceFeedback>,
 ) {
     let ev_type = match ev.event_type {
         CaptureEventType::Snapshot => "snapshot",
@@ -4265,38 +4879,7 @@ fn forward_capture_event(
         "data": ev.data,
     });
     let _ = event_buf.publish(payload);
-
-    if ev.event_type == CaptureEventType::State {
-        if let Some(state_str) = ev.data.get("state").and_then(Value::as_str) {
-            match state_str {
-                "recording" => {
-                    if let Some(l) = led {
-                        let _ = l.set_state(IndicatorState::Recording);
-                    }
-                    if let Some(v) = voice {
-                        let _ = v.play_cue(VoiceCue::RecordingStarted);
-                    }
-                }
-                "idle" => {
-                    if let Some(l) = led {
-                        let _ = l.set_state(IndicatorState::Ready);
-                    }
-                    if let Some(v) = voice {
-                        let _ = v.play_cue(VoiceCue::RecordingStopped);
-                    }
-                }
-                "failed" => {
-                    if let Some(l) = led {
-                        let _ = l.set_state(IndicatorState::Error);
-                    }
-                    if let Some(v) = voice {
-                        let _ = v.play_cue(VoiceCue::ErrorAlert);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    tracker.observe(ev, led, voice);
 }
 
 /// Wait for `SIGINT` or `SIGTERM` on Unix systems.

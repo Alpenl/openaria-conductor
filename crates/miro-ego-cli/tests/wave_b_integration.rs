@@ -35,9 +35,11 @@ use miro_ego_cli::commands::{
     load_and_apply_settings_for_device, resolve_serve_led_config, validate_session_dir,
 };
 use miro_ego_cli::runtime::{
-    CaptureModeKind, DaemonServeOptions, NetworkLockCaptureBackend, NoopHealthChecker,
-    NoopSystemctlRunner, ProductionBackendConfig, ProductionGatewayBackend, bind_daemon,
-    degraded_network_status, map_network_error, map_storage_error, run_bound_daemon_with_shutdown,
+    CaptureModeKind, DaemonServeOptions, EventFeedbackTracker, NetworkLockCaptureBackend,
+    NoopHealthChecker, NoopSystemctlRunner, ProductionBackendConfig, ProductionGatewayBackend,
+    bind_daemon, degraded_network_status, degraded_network_status_with_scheme,
+    map_camera_focus_error, map_deploy_error, map_network_error, map_network_mutation_error,
+    map_storage_error, run_bound_daemon_with_shutdown,
 };
 use miro_ego_core::CoreError;
 use miro_ego_core::config::{
@@ -2225,5 +2227,652 @@ async fn openapi_error_and_degraded_schema_parity_for_sessions_network_and_unmou
 
     let _ = shutdown_tx.send(());
     daemon_task.await.unwrap().unwrap();
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// 8. LED/voice feedback state machine, focus/deploy/network error parity,
+//    dynamic calibration_capture, clock challenge eviction, firmware fail-closed,
+//    network SSE background poller, and `deploy serve-rpc --idle-timeout`
+// ---------------------------------------------------------------------------
+
+struct RecordingIndicator {
+    states: Mutex<Vec<miro_ego_hw::IndicatorState>>,
+}
+
+impl RecordingIndicator {
+    fn new() -> Self {
+        Self {
+            states: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take(&self) -> Vec<miro_ego_hw::IndicatorState> {
+        std::mem::take(&mut *self.states.lock().unwrap())
+    }
+}
+
+impl miro_ego_hw::IndicatorController for RecordingIndicator {
+    fn set_state(&self, state: miro_ego_hw::IndicatorState) -> miro_ego_hw::HwResult<()> {
+        self.states.lock().unwrap().push(state);
+        Ok(())
+    }
+}
+
+struct RecordingVoice {
+    cues: Mutex<Vec<miro_ego_hw::VoiceCue>>,
+}
+
+impl RecordingVoice {
+    fn new() -> Self {
+        Self {
+            cues: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take(&self) -> Vec<miro_ego_hw::VoiceCue> {
+        std::mem::take(&mut *self.cues.lock().unwrap())
+    }
+}
+
+impl miro_ego_hw::VoiceFeedback for RecordingVoice {
+    fn play_cue(&self, cue: miro_ego_hw::VoiceCue) -> miro_ego_hw::HwResult<()> {
+        self.cues.lock().unwrap().push(cue);
+        Ok(())
+    }
+}
+
+#[test]
+fn event_feedback_tracker_and_error_translators_cover_stop_failure_focus_deploy_and_network() {
+    use miro_ego_hw::{IndicatorState, VoiceCue};
+    use miro_ego_storage::{CaptureEvent, CaptureEventType};
+
+    let led = RecordingIndicator::new();
+    let voice = RecordingVoice::new();
+    let mut tracker = EventFeedbackTracker::default();
+    let epoch = new_uuid_v4();
+    let sid1 = new_uuid_v7();
+
+    let mk_ev = |ty: CaptureEventType, sid: Option<&str>, data: Value| -> CaptureEvent {
+        CaptureEvent {
+            schema: "miro-ego.capture-event.v1".to_owned(),
+            sse_delivery_id: "1".to_owned(),
+            authority_epoch: epoch.clone(),
+            source_revision: 1,
+            event_type: ty,
+            occurred_at: "2026-11-26T10:00:00Z".to_owned(),
+            session_id: sid.map(str::to_owned),
+            data,
+        }
+    };
+
+    // 1. Start -> State("recording") + Snapshot("recording") -> single Recording LED & voice cue
+    tracker.observe(
+        &mk_ev(
+            CaptureEventType::State,
+            Some(&sid1),
+            json!({ "state": "recording" }),
+        ),
+        Some(&led),
+        Some(&voice),
+    );
+    tracker.observe(
+        &mk_ev(
+            CaptureEventType::Snapshot,
+            Some(&sid1),
+            json!({ "device_state": "recording" }),
+        ),
+        Some(&led),
+        Some(&voice),
+    );
+    assert_eq!(led.take(), vec![IndicatorState::Recording]);
+    assert_eq!(voice.take(), vec![VoiceCue::RecordingStarted]);
+
+    // 2. Normal stop -> State("finalizing") -> State("verifying") -> Snapshot("idle") -> Ready + RecordingStopped!
+    tracker.observe(
+        &mk_ev(
+            CaptureEventType::State,
+            Some(&sid1),
+            json!({ "state": "finalizing" }),
+        ),
+        Some(&led),
+        Some(&voice),
+    );
+    tracker.observe(
+        &mk_ev(
+            CaptureEventType::State,
+            Some(&sid1),
+            json!({ "state": "verifying" }),
+        ),
+        Some(&led),
+        Some(&voice),
+    );
+    tracker.observe(
+        &mk_ev(
+            CaptureEventType::Snapshot,
+            None,
+            json!({ "device_state": "idle" }),
+        ),
+        Some(&led),
+        Some(&voice),
+    );
+    assert_eq!(led.take(), vec![IndicatorState::Ready]);
+    assert_eq!(voice.take(), vec![VoiceCue::RecordingStopped]);
+
+    // 3. Mid-recording failure -> State("recording") -> Diagnostic(error) -> State("failed") -> Snapshot("idle")
+    //    Must emit Error + ErrorAlert once and NOT overwrite Error with Ready on trailing Snapshot("idle")!
+    let sid2 = new_uuid_v7();
+    tracker.observe(
+        &mk_ev(
+            CaptureEventType::State,
+            Some(&sid2),
+            json!({ "state": "recording" }),
+        ),
+        Some(&led),
+        Some(&voice),
+    );
+    let _ = led.take();
+    let _ = voice.take();
+
+    tracker.observe(
+        &mk_ev(
+            CaptureEventType::Diagnostic,
+            Some(&sid2),
+            json!({ "diagnostic": { "severity": "error", "code": "enc_crash" } }),
+        ),
+        Some(&led),
+        Some(&voice),
+    );
+    tracker.observe(
+        &mk_ev(
+            CaptureEventType::State,
+            Some(&sid2),
+            json!({ "state": "failed" }),
+        ),
+        Some(&led),
+        Some(&voice),
+    );
+    tracker.observe(
+        &mk_ev(
+            CaptureEventType::Snapshot,
+            None,
+            json!({ "device_state": "idle" }),
+        ),
+        Some(&led),
+        Some(&voice),
+    );
+    assert_eq!(led.take(), vec![IndicatorState::Error]);
+    assert_eq!(voice.take(), vec![VoiceCue::ErrorAlert]);
+
+    // 4. Start-attempt failure -> Diagnostic(error) while idle -> Error + ErrorAlert!
+    let sid3 = new_uuid_v7();
+    tracker.observe(
+        &mk_ev(
+            CaptureEventType::Diagnostic,
+            Some(&sid3),
+            json!({ "diagnostic": { "severity": "error", "code": "staging_failed" } }),
+        ),
+        Some(&led),
+        Some(&voice),
+    );
+    assert_eq!(led.take(), vec![IndicatorState::Error]);
+    assert_eq!(voice.take(), vec![VoiceCue::ErrorAlert]);
+
+    // 5. Camera focus error mapping:
+    let f_unsup = map_storage_error(map_camera_focus_error(
+        "camera_focus_unsupported",
+        "no focus".to_owned(),
+    ));
+    assert_eq!(f_unsup.status_code, 404);
+    assert_eq!(f_unsup.code, "camera_focus_unsupported");
+
+    let f_range = map_storage_error(map_camera_focus_error(
+        "invalid_camera_focus",
+        "out of range".to_owned(),
+    ));
+    assert_eq!(f_range.status_code, 422);
+    assert_eq!(f_range.code, "invalid_camera_focus");
+
+    let f_auto = map_storage_error(map_camera_focus_error(
+        "camera_focus_auto_unsupported",
+        "no focus_auto".to_owned(),
+    ));
+    assert_eq!(f_auto.status_code, 422);
+    assert_eq!(f_auto.code, "invalid_camera_focus");
+
+    let f_disc = map_storage_error(map_camera_focus_error(
+        "invalid_state",
+        "camera closed".to_owned(),
+    ));
+    assert_eq!(f_disc.status_code, 503);
+    assert_eq!(f_disc.code, "camera_not_connected");
+
+    let f_timeout = map_storage_error(map_camera_focus_error(
+        "native_camera_control_timeout",
+        "timed out".to_owned(),
+    ));
+    assert_eq!(f_timeout.status_code, 503);
+    assert_eq!(f_timeout.code, "camera_focus_failed");
+
+    // 6. Network mutation 503 + 422 transaction_not_retryable + mDNS aliases:
+    let net_503 = map_network_mutation_error(NetworkError::Backend {
+        message: "network_controller_unavailable: connect ENOENT".to_owned(),
+    });
+    let net_503_json = net_503.to_problem_json(&new_uuid_v4());
+    assert_eq!(net_503.status_code, 503);
+    assert_eq!(
+        net_503_json["error"]["code"],
+        "network_mutation_unavailable"
+    );
+    assert_eq!(
+        net_503_json["error"]["details"]["reason"],
+        "controller_unavailable"
+    );
+
+    let net_retry_422 = map_network_mutation_error(NetworkError::Invalid {
+        message: "transaction_not_retryable: transaction is already committed".to_owned(),
+    });
+    let net_retry_json = net_retry_422.to_problem_json(&new_uuid_v4());
+    assert_eq!(net_retry_422.status_code, 422);
+    assert_eq!(
+        net_retry_json["error"]["code"],
+        "invalid_network_desired_state"
+    );
+    assert_eq!(
+        net_retry_json["error"]["details"]["field"],
+        "transaction_id"
+    );
+    assert_eq!(net_retry_json["error"]["details"]["reason"], "active_state");
+
+    let deg_http = degraded_network_status(&new_uuid_v4(), 8080, "not_enabled");
+    assert_eq!(
+        deg_http["observed"]["mdns"]["aliases"],
+        json!(["_http._tcp"])
+    );
+    let deg_https = degraded_network_status_with_scheme(
+        &new_uuid_v4(),
+        8443,
+        MdnsScheme::Https,
+        "controller_unavailable",
+    );
+    assert_eq!(
+        deg_https["observed"]["mdns"]["aliases"],
+        json!(["_https._tcp"])
+    );
+
+    // 7. Deploy error mapping (503 Retry-After on unreachable/timeout/maintenance_busy):
+    for deploy_err in [
+        miro_ego_deploy::DeployError::Failed {
+            message: "deploy_controller_unavailable: ENOENT".to_owned(),
+        },
+        miro_ego_deploy::DeployError::Failed {
+            message: "response_timeout: timed out".to_owned(),
+        },
+        miro_ego_deploy::DeployError::Blocked {
+            message: "maintenance_busy: lock held".to_owned(),
+        },
+    ] {
+        let mapped = map_deploy_error(deploy_err);
+        assert_eq!(mapped.status_code, 503);
+        assert!(mapped.retryable);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_calibration_capability_clock_eviction_firmware_fail_closed_voice_and_network_sse()
+{
+    let root = temp_test_dir("phase1-runtime-hardening");
+    let data_dir = root.join("data");
+    let state_dir = root.join("state");
+    let net_dir = root.join("net");
+    let run_dir = root.join("run");
+    for d in [&data_dir, &state_dir, &net_dir, &run_dir] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let _ = init_test_volume(&data_dir);
+
+    let cfg = make_lab_device_config(&data_dir, &state_dir);
+    let net_sock = net_dir.join("network-control.sock");
+    let profiles_dir = net_dir.join("profiles");
+    fs::create_dir_all(&profiles_dir).unwrap();
+    struct HotspotCommitNmcliRunner {
+        active_conn: std::sync::Mutex<String>,
+    }
+    impl CommandRunner for HotspotCommitNmcliRunner {
+        fn run(
+            &self,
+            _program: &str,
+            args: &[&str],
+            _timeout: Duration,
+        ) -> NetworkResult<CommandOutput> {
+            if let Some(pos) = args.iter().position(|&a| a == "id") {
+                if args.contains(&"up") {
+                    if let Some(name) = args.get(pos + 1) {
+                        *self.active_conn.lock().unwrap() = (*name).to_owned();
+                    }
+                }
+            }
+            let conn = self.active_conn.lock().unwrap().clone();
+            let joined = args.join(" ");
+            let stdout = if joined.contains("device show wlan0") {
+                format!(
+                    "GENERAL.DEVICE:wlan0\nGENERAL.TYPE:wifi\nGENERAL.STATE:100 (connected)\nGENERAL.CONNECTION:{conn}\nIP4.ADDRESS[1]:10.42.0.1/24\n"
+                )
+            } else if joined.contains("connection show") {
+                format!("{conn}:11111111-2222-4333-8444-555555555555:802-11-wireless:wlan0\n")
+            } else if joined.contains("device status") {
+                format!("wlan0:wifi:connected:{conn}\neth0:ethernet:disconnected:--\n")
+            } else {
+                String::new()
+            };
+            Ok(CommandOutput {
+                exit_code: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    let state_store = NetworkStateStore::open_or_init(net_dir.join("state.json")).unwrap();
+    let nmcli = NmcliBackend::new(
+        Arc::new(HotspotCommitNmcliRunner {
+            active_conn: std::sync::Mutex::new("miro-ego-hotspot-rescue".to_owned()),
+        }),
+        profiles_dir,
+        "wlan0",
+        "eth0",
+    );
+    let controller = Arc::new(
+        AuthoritativeNetworkController::new(
+            nmcli,
+            state_store,
+            ControllerConfig::new(cfg.device.device_id.clone(), run_dir.clone()),
+        )
+        .unwrap(),
+    );
+    let net_server =
+        NetworkRpcServer::bind(&net_sock, controller, RpcServerConfig::default()).unwrap();
+
+    let mut options = DaemonServeOptions::from_device_config(cfg.clone(), true);
+    options.listen_override = Some("127.0.0.1:0".parse().unwrap());
+    options.network_socket = Some(net_sock);
+    options.deploy_socket = None;
+    options.run_dir = Some(run_dir.clone());
+
+    let bound = bind_daemon(options).await.unwrap();
+    let net_events = bound.backend.network_event_buffer();
+    let addr = bound.server.local_addr();
+    let origin = format!("http://{addr}");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let daemon_task = tokio::spawn(async move {
+        run_bound_daemon_with_shutdown(bound, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    // 1. Real git commit from build.rs + dynamic `calibration_capture.enabled == true` while idle:
+    let (d_code, _, d_body) = http_request(addr, Method::GET, "/api/v1/device", &[], None).await;
+    assert_eq!(d_code, 200);
+    let dev_idle: Value = serde_json::from_slice(&d_body).unwrap();
+    assert_ne!(
+        dev_idle["build"]["commit"],
+        "0".repeat(40),
+        "build.rs must stamp real git HEAD SHA into MIRO_EGO_GIT_COMMIT"
+    );
+    assert_eq!(
+        dev_idle["capabilities"]["calibration_capture"]["enabled"],
+        true
+    );
+    assert!(dev_idle["capabilities"]["calibration_capture"]["disabled_reason"].is_null());
+
+    // 2. Mock voice volume reports `enabled: volume > 0`:
+    let (v_code, _, v_body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/voice",
+        &[("Content-Type", "application/json"), ("Origin", &origin)],
+        Some(
+            serde_json::to_vec(&json!({ "schema": "miro-ego.voice-set.v1", "volume": 55 }))
+                .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(v_code, 200);
+    let v_json: Value = serde_json::from_slice(&v_body).unwrap();
+    assert_eq!(v_json["enabled"], true);
+    assert_eq!(v_json["volume"], 55);
+
+    // 3. Firmware update/rollback with `deploy_socket = None` fails closed with `503` (never stuck 202!):
+    let (fw_up_code, fw_up_hdrs, fw_up_body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/firmware/update",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(serde_json::to_vec(&json!({ "commit": "a".repeat(40) })).unwrap()),
+    )
+    .await;
+    assert_eq!(fw_up_code, 503);
+    assert_eq!(
+        fw_up_hdrs.get("Retry-After").and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    let fw_up_err: Value = serde_json::from_slice(&fw_up_body).unwrap();
+    assert_eq!(fw_up_err["error"]["code"], "firmware_unavailable");
+
+    // 4. Clock challenge bounded eviction (65 challenges issued: 1st evicted, 2nd..65th preserved!)
+    //    AND `applied: false` returns non-null `age_seconds`!
+    let mut challenges = Vec::with_capacity(65);
+    for _ in 0..65 {
+        let (c, _, b) = http_request(addr, Method::GET, "/api/v1/clock/check", &[], None).await;
+        assert_eq!(c, 200);
+        let doc: Value = serde_json::from_slice(&b).unwrap();
+        challenges.push(doc["challenge"].as_str().unwrap().to_owned());
+    }
+    // Challenge #0 was the earliest-expiring and must have been evicted at 65:
+    let (evicted_code, _, _) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/clock/sync",
+        &[("Content-Type", "application/json"), ("Origin", &origin)],
+        Some(
+            serde_json::to_vec(&json!({
+                "schema": "miro-ego.clock-sync-request.v1",
+                "challenge": challenges[0],
+                "unix_time_ms": 1_764_152_400_000_u64
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        evicted_code, 409,
+        "earliest challenge must be evicted at cap 64"
+    );
+
+    // Challenge #1 MUST still be valid (proving challenges.clear() was NOT called!):
+    let (ok_sync_code, _, ok_sync_body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/clock/sync",
+        &[("Content-Type", "application/json"), ("Origin", &origin)],
+        Some(
+            serde_json::to_vec(&json!({
+                "schema": "miro-ego.clock-sync-request.v1",
+                "challenge": challenges[1],
+                "unix_time_ms": 1_764_152_400_000_u64
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(ok_sync_code, 200);
+    let ok_sync_doc: Value = serde_json::from_slice(&ok_sync_body).unwrap();
+    assert_eq!(ok_sync_doc["applied"], true);
+
+    // Challenge #2 with `replace: false` must return `applied: false` with numeric `age_seconds`:
+    let (second_code, _, second_body) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/clock/sync",
+        &[("Content-Type", "application/json"), ("Origin", &origin)],
+        Some(
+            serde_json::to_vec(&json!({
+                "schema": "miro-ego.clock-sync-request.v1",
+                "challenge": challenges[2],
+                "unix_time_ms": 1_764_152_405_000_u64,
+                "replace": false
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(second_code, 200);
+    let second_doc: Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(second_doc["applied"], false);
+    assert!(second_doc["age_seconds"].is_u64());
+
+    // 5. Background network SSE poller automatically feeds async `/network/apply` settlement into `net_events`!
+    let (_, _, init_net_body) = http_request(addr, Method::GET, "/api/v1/network", &[], None).await;
+    let init_snap = net_events
+        .issue_resync_snapshot(serde_json::from_slice(&init_net_body).unwrap(), None)
+        .unwrap();
+    let (ap_code, _, _) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/network/apply",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(
+            serde_json::to_vec(&json!({
+                "schema": "miro-ego.network-apply-request.v1",
+                "desired": {
+                    "mode": "hotspot",
+                    "wifi_client": null,
+                    "ethernet": null
+                }
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(ap_code, 202);
+
+    // Without calling `GET /api/v1/network`, wait for the background poller to publish a `transaction` SSE event!
+    let poll_deadline = Instant::now() + Duration::from_secs(4);
+    let mut saw_committed_tx = false;
+    while Instant::now() < poll_deadline {
+        let evs = net_events
+            .try_events_after(init_snap.delivery_id)
+            .unwrap()
+            .unwrap_or_default();
+        if evs.iter().any(|e| {
+            (e.event_type == "transaction" && e.source_event["data"]["status"] == "committed")
+                || (e.event_type == "snapshot"
+                    && e.source_event["data"]["transaction"]["latest"]["status"] == "committed")
+        }) {
+            saw_committed_tx = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        saw_committed_tx,
+        "background network SSE poller must observe async transaction settlement without manual GET /network"
+    );
+
+    // 6. Start capture -> `device_info` reports `calibration_capture.disabled_reason == "maintenance_or_capture_busy"`:
+    let (s_code, _, _) = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/capture/start",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(
+            serde_json::to_vec(&json!({
+                "schema": "miro-ego.capture-start.v1",
+                "mode": "production",
+                "take": { "kind": "new" }
+            }))
+            .unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(s_code, 202);
+
+    let (_, _, busy_dev_body) = http_request(addr, Method::GET, "/api/v1/device", &[], None).await;
+    let busy_dev: Value = serde_json::from_slice(&busy_dev_body).unwrap();
+    assert_eq!(
+        busy_dev["capabilities"]["calibration_capture"]["enabled"],
+        false
+    );
+    assert_eq!(
+        busy_dev["capabilities"]["calibration_capture"]["disabled_reason"],
+        "maintenance_or_capture_busy"
+    );
+
+    let _ = http_request(
+        addr,
+        Method::POST,
+        "/api/v1/capture/stop",
+        &[
+            ("Content-Type", "application/json"),
+            ("Origin", &origin),
+            ("Idempotency-Key", &new_uuid_v4()),
+        ],
+        Some(
+            serde_json::to_vec(&json!({ "schema": "miro-ego.capture-stop.v1", "reason": "user" }))
+                .unwrap(),
+        ),
+    )
+    .await;
+
+    let _ = shutdown_tx.send(());
+    daemon_task.await.unwrap().unwrap();
+    net_server.shutdown();
+
+    // 7. Verify `miro-ego deploy serve-rpc --idle-timeout 1` exits cleanly on idle!
+    let bin = env!("CARGO_BIN_EXE_miro-ego");
+    let idle_sock = root.join("idle-deploy.sock");
+    let start_idle = Instant::now();
+    let out = Command::new(bin)
+        .args([
+            "deploy",
+            "serve-rpc",
+            "--no-systemctl",
+            "--idle-timeout",
+            "1",
+            "--socket",
+            idle_sock.to_str().unwrap(),
+            "--install-root",
+            root.join("opt").to_str().unwrap(),
+            "--config-root",
+            root.join("etc").to_str().unwrap(),
+            "--state-root",
+            state_dir.to_str().unwrap(),
+            "--run-dir",
+            run_dir.to_str().unwrap(),
+            "--system-root",
+            root.join("sysroot").to_str().unwrap(),
+        ])
+        .output()
+        .expect("run deploy serve-rpc --idle-timeout 1");
+    assert!(
+        out.status.success(),
+        "deploy serve-rpc --idle-timeout 1 must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(start_idle.elapsed() < Duration::from_secs(5));
+
     let _ = fs::remove_dir_all(&root);
 }

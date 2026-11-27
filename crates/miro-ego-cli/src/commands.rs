@@ -32,9 +32,9 @@ use miro_ego_core::paths::{
 };
 use miro_ego_core::sys::fs::{read_bounded_bytes, set_exfat_hidden, write_bytes_atomic};
 use miro_ego_deploy::{
-    DEFAULT_DEPLOY_SOCKET_PATH, DeployRpcServer, DeployRpcServerConfig, FIRMWARE_STATUS_SCHEMA,
-    HealthChecker, LocalHttpHealthChecker, RealSystemctlRunner, ReleaseManager,
-    ReleaseManagerPaths, SystemctlRunner,
+    DEFAULT_DEPLOY_SOCKET_PATH, DeployRpcClient, DeployRpcServer, DeployRpcServerConfig,
+    FIRMWARE_STATUS_SCHEMA, HealthChecker, LocalHttpHealthChecker, RealSystemctlRunner,
+    ReleaseManager, ReleaseManagerPaths, SystemctlRunner,
 };
 use miro_ego_hw::thermal::{
     DEFAULT_THERMAL_ROOT, is_rdk_x5_model, read_board_model, read_soc_temperature_c,
@@ -120,11 +120,21 @@ pub struct ButtonArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeployAction {
     Status,
-    Install { bundle_dir: PathBuf, activate: bool },
-    Rollback { activate: bool },
-    Recover { service_start: bool },
+    Install {
+        bundle_dir: PathBuf,
+        activate: bool,
+    },
+    Rollback {
+        activate: bool,
+    },
+    Recover {
+        service_start: bool,
+    },
     Uninstall,
-    ServeRpc { socket: PathBuf },
+    ServeRpc {
+        socket: PathBuf,
+        idle_timeout_secs: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +160,7 @@ pub enum Command {
     Deploy(DeployArgs),
     VolumeInit {
         mountpoint: PathBuf,
+        relaxed_volume: bool,
     },
     VolumeHide {
         path: PathBuf,
@@ -160,6 +171,7 @@ pub enum Command {
     Status {
         config: PathBuf,
         network_socket: PathBuf,
+        deploy_socket: PathBuf,
         install_root: PathBuf,
         state_root: PathBuf,
     },
@@ -169,52 +181,90 @@ pub enum Command {
     },
 }
 
+fn is_help_flag(arg: &str) -> bool {
+    matches!(arg, "-h" | "--help")
+}
+
 pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let Some(first) = args.first().map(String::as_str) else {
         return Ok(Command::Help);
     };
     let rest = &args[1..];
     match first {
-        "-V" | "--version" | "version" => Ok(Command::Version),
-        "-h" | "--help" | "help" => Ok(Command::Help),
-        "serve" => parse_serve_args(rest).map(Command::Serve),
-        "network-control" => parse_network_control_args(rest).map(Command::NetworkControl),
-        "button" => parse_button_args(rest).map(Command::Button),
-        "deploy" => parse_deploy_args(rest).map(Command::Deploy),
-        "volume" => parse_volume_args(rest),
-        "status" => parse_status_args(rest),
-        "probe" => {
+        "-V" | "--version" | "version" => {
+            if rest.iter().any(|a| is_help_flag(a)) {
+                return Ok(Command::Help);
+            }
             if !rest.is_empty() {
                 return Err(format!(
-                    "probe does not accept arguments: {}",
+                    "version does not accept arguments: {}",
                     rest.join(" ")
                 ));
             }
-            Ok(Command::Probe)
+            Ok(Command::Version)
         }
-        "validate" => {
-            let Some(dir) = rest.first() else {
-                return Err("usage: miro-ego validate <session-dir>".to_owned());
-            };
-            if rest.len() > 1 {
-                return Err("usage: miro-ego validate <session-dir>".to_owned());
-            }
-            Ok(Command::Validate {
-                session_dir: PathBuf::from(dir),
-            })
-        }
+        "-h" | "--help" | "help" => Ok(Command::Help),
+        "serve" => parse_serve_args(rest),
+        "network-control" => parse_network_control_args(rest),
+        "button" => parse_button_args(rest),
+        "deploy" => parse_deploy_args(rest),
+        "volume" => parse_volume_args(rest),
+        "status" => parse_status_args(rest),
+        "probe" => parse_probe_args(rest),
+        "validate" => parse_validate_args(rest),
         other => Err(format!("unknown subcommand: {other}")),
     }
 }
 
-fn next_flag_value<'a>(args: &'a [String], idx: &mut usize, flag: &str) -> Result<&'a str, String> {
-    *idx += 1;
-    args.get(*idx)
-        .map(String::as_str)
-        .ok_or_else(|| format!("{flag} requires a value"))
+fn parse_probe_args(args: &[String]) -> Result<Command, String> {
+    if args.iter().any(|a| is_help_flag(a)) {
+        return Ok(Command::Help);
+    }
+    if !args.is_empty() {
+        return Err(format!(
+            "probe does not accept arguments: {}",
+            args.join(" ")
+        ));
+    }
+    Ok(Command::Probe)
 }
 
-fn parse_serve_args(args: &[String]) -> Result<ServeArgs, String> {
+fn parse_validate_args(args: &[String]) -> Result<Command, String> {
+    if args.iter().any(|a| is_help_flag(a)) {
+        return Ok(Command::Help);
+    }
+    let mut session_dir: Option<PathBuf> = None;
+    for arg in args {
+        if arg.starts_with('-') {
+            return Err(format!("unknown validate option: {arg}"));
+        }
+        if session_dir.is_some() {
+            return Err("usage: miro-ego validate <session-dir>".to_owned());
+        }
+        session_dir = Some(PathBuf::from(arg));
+    }
+    let Some(dir) = session_dir else {
+        return Err("usage: miro-ego validate <session-dir>".to_owned());
+    };
+    Ok(Command::Validate { session_dir: dir })
+}
+
+fn next_flag_value<'a>(args: &'a [String], idx: &mut usize, flag: &str) -> Result<&'a str, String> {
+    *idx += 1;
+    let val = args
+        .get(*idx)
+        .map(String::as_str)
+        .ok_or_else(|| format!("{flag} requires a value"))?;
+    if is_help_flag(val) {
+        return Err(format!("{flag} requires a value"));
+    }
+    Ok(val)
+}
+
+fn parse_serve_args(args: &[String]) -> Result<Command, String> {
+    if args.iter().any(|a| is_help_flag(a)) {
+        return Ok(Command::Help);
+    }
     let mut parsed = ServeArgs {
         config: None,
         mock: false,
@@ -273,7 +323,7 @@ fn parse_serve_args(args: &[String]) -> Result<ServeArgs, String> {
         }
         i += 1;
     }
-    Ok(parsed)
+    Ok(Command::Serve(parsed))
 }
 
 fn default_network_state_path() -> PathBuf {
@@ -283,9 +333,13 @@ fn default_network_state_path() -> PathBuf {
     PathBuf::from(DEFAULT_NETWORK_STATE_FILE)
 }
 
-fn parse_network_control_args(args: &[String]) -> Result<NetworkControlSubcommand, String> {
+fn parse_network_control_args(args: &[String]) -> Result<Command, String> {
+    if args.iter().any(|a| is_help_flag(a)) {
+        return Ok(Command::Help);
+    }
     let (sub, rest) = match args.first().map(String::as_str) {
         None => ("serve", args),
+        Some("help") => return Ok(Command::Help),
         Some(s) if s.starts_with('-') => ("serve", args),
         Some(s) => (s, &args[1..]),
     };
@@ -341,7 +395,7 @@ fn parse_network_control_args(args: &[String]) -> Result<NetworkControlSubcomman
                 }
                 i += 1;
             }
-            Ok(NetworkControlSubcommand::Serve {
+            Ok(Command::NetworkControl(NetworkControlSubcommand::Serve {
                 socket,
                 state,
                 profiles_dir,
@@ -351,15 +405,19 @@ fn parse_network_control_args(args: &[String]) -> Result<NetworkControlSubcomman
                 device_id,
                 wifi_iface,
                 eth_iface,
-            })
+            }))
         }
         "watchdog-mode" => {
             let socket = parse_single_socket_flag(rest, default_sock, "watchdog-mode")?;
-            Ok(NetworkControlSubcommand::WatchdogMode { socket })
+            Ok(Command::NetworkControl(
+                NetworkControlSubcommand::WatchdogMode { socket },
+            ))
         }
         "status" => {
             let socket = parse_single_socket_flag(rest, default_sock, "status")?;
-            Ok(NetworkControlSubcommand::Status { socket })
+            Ok(Command::NetworkControl(NetworkControlSubcommand::Status {
+                socket,
+            }))
         }
         other => Err(format!(
             "unknown network-control subcommand '{other}'; expected serve, watchdog-mode, or status"
@@ -390,7 +448,10 @@ fn parse_single_socket_flag(
     Ok(socket)
 }
 
-fn parse_button_args(args: &[String]) -> Result<ButtonArgs, String> {
+fn parse_button_args(args: &[String]) -> Result<Command, String> {
+    if args.iter().any(|a| is_help_flag(a)) {
+        return Ok(Command::Help);
+    }
     let mut parsed = ButtonArgs {
         config: PathBuf::from(DEFAULT_BUTTON_CONFIG_PATH),
         device_config: None,
@@ -436,16 +497,22 @@ fn parse_button_args(args: &[String]) -> Result<ButtonArgs, String> {
         }
         i += 1;
     }
-    Ok(parsed)
+    Ok(Command::Button(parsed))
 }
 
-fn parse_deploy_args(args: &[String]) -> Result<DeployArgs, String> {
+fn parse_deploy_args(args: &[String]) -> Result<Command, String> {
+    if args.iter().any(|a| is_help_flag(a)) {
+        return Ok(Command::Help);
+    }
     let Some(sub) = args.first().map(String::as_str) else {
         return Err(
             "usage: miro-ego deploy <status | install <bundle-dir> | rollback | recover | uninstall | serve-rpc> [options]"
                 .to_owned(),
         );
     };
+    if sub == "help" {
+        return Ok(Command::Help);
+    }
 
     let mut install_root = PathBuf::from(SYSTEM_INSTALL_ROOT);
     let mut config_root = PathBuf::from(SYSTEM_CONFIG_DIR);
@@ -458,6 +525,9 @@ fn parse_deploy_args(args: &[String]) -> Result<DeployArgs, String> {
     let mut health_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
     let mut health_timeout_secs = 20_u64;
     let mut rpc_socket: Option<PathBuf> = env::var_os("MIRO_EGO_DEPLOY_SOCKET").map(PathBuf::from);
+    let mut idle_timeout_secs: Option<u64> = env::var("MIRO_EGO_DEPLOY_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok());
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 1;
@@ -480,6 +550,13 @@ fn parse_deploy_args(args: &[String]) -> Result<DeployArgs, String> {
             }
             "--socket" => {
                 rpc_socket = Some(PathBuf::from(next_flag_value(args, &mut i, "--socket")?));
+            }
+            "--idle-timeout" => {
+                let raw = next_flag_value(args, &mut i, "--idle-timeout")?;
+                let secs: u64 = raw
+                    .parse()
+                    .map_err(|err| format!("invalid --idle-timeout '{raw}': {err}"))?;
+                idle_timeout_secs = Some(secs);
             }
             "--no-systemctl" => {
                 no_systemctl = true;
@@ -558,7 +635,10 @@ fn parse_deploy_args(args: &[String]) -> Result<DeployArgs, String> {
                     PathBuf::from(DEFAULT_DEPLOY_SOCKET_PATH)
                 }
             });
-            DeployAction::ServeRpc { socket }
+            DeployAction::ServeRpc {
+                socket,
+                idle_timeout_secs,
+            }
         }
         other => {
             return Err(format!(
@@ -567,7 +647,7 @@ fn parse_deploy_args(args: &[String]) -> Result<DeployArgs, String> {
         }
     };
 
-    Ok(DeployArgs {
+    Ok(Command::Deploy(DeployArgs {
         action,
         install_root,
         config_root,
@@ -577,45 +657,90 @@ fn parse_deploy_args(args: &[String]) -> Result<DeployArgs, String> {
         no_systemctl,
         health_addr,
         health_timeout_secs,
-    })
+    }))
 }
 
 fn parse_volume_args(args: &[String]) -> Result<Command, String> {
+    if args.iter().any(|a| is_help_flag(a)) {
+        return Ok(Command::Help);
+    }
     let sub = args.first().map(String::as_str);
     match sub {
+        Some("help") => Ok(Command::Help),
         Some("init") => {
-            let mountpoint = args
-                .get(1)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(RECORDING_MOUNTPOINT));
-            Ok(Command::VolumeInit { mountpoint })
+            let mut relaxed_volume = false;
+            let mut mountpoint: Option<PathBuf> = None;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--relaxed-volume" => {
+                        relaxed_volume = true;
+                    }
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown volume init option: {other}"));
+                    }
+                    pos => {
+                        if mountpoint.is_some() {
+                            return Err(
+                                "usage: miro-ego volume init [--relaxed-volume] [mountpoint]"
+                                    .to_owned(),
+                            );
+                        }
+                        mountpoint = Some(PathBuf::from(pos));
+                    }
+                }
+            }
+            Ok(Command::VolumeInit {
+                mountpoint: mountpoint.unwrap_or_else(|| PathBuf::from(RECORDING_MOUNTPOINT)),
+                relaxed_volume,
+            })
         }
         Some("hide") => {
-            let path = args
-                .get(1)
-                .map(PathBuf::from)
-                .ok_or_else(|| "volume hide requires <path>".to_owned())?;
+            let mut target_path: Option<PathBuf> = None;
+            for arg in &args[1..] {
+                if arg.starts_with('-') {
+                    return Err(format!("unknown volume hide option: {arg}"));
+                }
+                if target_path.is_some() {
+                    return Err("usage: miro-ego volume hide <path>".to_owned());
+                }
+                target_path = Some(PathBuf::from(arg));
+            }
+            let path = target_path.ok_or_else(|| "volume hide requires <path>".to_owned())?;
             Ok(Command::VolumeHide { path })
         }
         Some("inspect") => {
-            let mountpoint = args
-                .get(1)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(RECORDING_MOUNTPOINT));
-            Ok(Command::VolumeInspect { mountpoint })
+            let mut mountpoint: Option<PathBuf> = None;
+            for arg in &args[1..] {
+                if arg.starts_with('-') {
+                    return Err(format!("unknown volume inspect option: {arg}"));
+                }
+                if mountpoint.is_some() {
+                    return Err("usage: miro-ego volume inspect [mountpoint]".to_owned());
+                }
+                mountpoint = Some(PathBuf::from(arg));
+            }
+            Ok(Command::VolumeInspect {
+                mountpoint: mountpoint.unwrap_or_else(|| PathBuf::from(RECORDING_MOUNTPOINT)),
+            })
         }
         _ => Err(
-            "usage: miro-ego volume <init [mountpoint] | hide <path> | inspect [mountpoint]>"
+            "usage: miro-ego volume <init [--relaxed-volume] [mountpoint] | hide <path> | inspect [mountpoint]>"
                 .to_owned(),
         ),
     }
 }
 
 fn parse_status_args(args: &[String]) -> Result<Command, String> {
+    if args.iter().any(|a| is_help_flag(a)) {
+        return Ok(Command::Help);
+    }
     let mut config = PathBuf::from(DEFAULT_DEVICE_CONFIG_PATH);
     let mut network_socket = env::var_os("MIRO_EGO_NETWORK_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTROL_SOCKET_PATH));
+    let mut deploy_socket = env::var_os("MIRO_EGO_DEPLOY_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DEPLOY_SOCKET_PATH));
     let mut install_root = PathBuf::from(SYSTEM_INSTALL_ROOT);
     let mut state_root = PathBuf::from(SYSTEM_STATE_DIR);
 
@@ -627,6 +752,9 @@ fn parse_status_args(args: &[String]) -> Result<Command, String> {
             }
             "--network-socket" => {
                 network_socket = PathBuf::from(next_flag_value(args, &mut i, "--network-socket")?);
+            }
+            "--deploy-socket" => {
+                deploy_socket = PathBuf::from(next_flag_value(args, &mut i, "--deploy-socket")?);
             }
             "--install-root" => {
                 install_root = PathBuf::from(next_flag_value(args, &mut i, "--install-root")?);
@@ -641,6 +769,7 @@ fn parse_status_args(args: &[String]) -> Result<Command, String> {
     Ok(Command::Status {
         config,
         network_socket,
+        deploy_socket,
         install_root,
         state_root,
     })
@@ -649,9 +778,11 @@ fn parse_status_args(args: &[String]) -> Result<Command, String> {
 pub fn run(command: Command) -> Result<(), String> {
     match command {
         Command::Version => {
+            let commit = option_env!("MIRO_EGO_GIT_COMMIT").unwrap_or("unknown");
             println!(
-                "miro-ego {} (api={} shm=v{} catalog=v{} mdns={} fw={} indicator={:?})",
+                "miro-ego {} (commit={} api={} shm=v{} catalog=v{} mdns={} fw={} indicator={:?})",
                 env!("CARGO_PKG_VERSION"),
+                commit,
                 API_V1_PREFIX,
                 SHM_VERSION,
                 CATALOG_FORMAT_VERSION,
@@ -672,9 +803,9 @@ pub fn run(command: Command) -> Result<(), String> {
                  \tserve [--config <path>] [--mock] [--listen <host:port>]\n\
                  \tnetwork-control [serve | watchdog-mode | status] [--socket <path>]\n\
                  \tbutton [--config <path>] [--device-config <path>]\n\
-                 \tdeploy <status | install <bundle-dir> | rollback | recover | uninstall>\n\
-                 \tvolume <init [mountpoint] | hide <path> | inspect [mountpoint]>\n\
-                 \tstatus [--config <path>]\n\
+                 \tdeploy <status | install <bundle-dir> | rollback | recover | uninstall | serve-rpc>\n\
+                 \tvolume <init [--relaxed-volume] [mountpoint] | hide <path> | inspect [mountpoint]>\n\
+                 \tstatus [--config <path>] [--network-socket <path>] [--deploy-socket <path>]\n\
                  \tprobe\n\
                  \tvalidate <session-dir>\n\
                  \tversion",
@@ -686,15 +817,25 @@ pub fn run(command: Command) -> Result<(), String> {
         Command::NetworkControl(sub) => run_network_control(sub),
         Command::Button(args) => run_button(args),
         Command::Deploy(args) => run_deploy(args),
-        Command::VolumeInit { mountpoint } => run_volume_init(mountpoint),
+        Command::VolumeInit {
+            mountpoint,
+            relaxed_volume,
+        } => run_volume_init(mountpoint, relaxed_volume),
         Command::VolumeHide { path } => run_volume_hide(path),
         Command::VolumeInspect { mountpoint } => run_volume_inspect(mountpoint),
         Command::Status {
             config,
             network_socket,
+            deploy_socket,
             install_root,
             state_root,
-        } => run_status(config, network_socket, install_root, state_root),
+        } => run_status(
+            config,
+            network_socket,
+            deploy_socket,
+            install_root,
+            state_root,
+        ),
         Command::Probe => run_probe(),
         Command::Validate { session_dir } => run_validate(&session_dir),
     }
@@ -750,13 +891,21 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
             }
         }
         let voice_settings_path = device_config.state_root.join("voice.json");
-        if let Ok(voice) = VoiceController::open(
+        match VoiceController::open(
             DEFAULT_VOICE_DEVICE,
             DEFAULT_VOICE_ASSETS_DIR,
-            voice_settings_path,
+            &voice_settings_path,
             Arc::new(AplayAudioPlayer::default()),
         ) {
-            options.voice_controller = Some(Arc::new(voice));
+            Ok(voice) => {
+                options.voice_controller = Some(Arc::new(voice));
+            }
+            Err(err) => {
+                eprintln!(
+                    "miro-ego: warning: failed to load voice settings {}: {err}",
+                    voice_settings_path.display()
+                );
+            }
         }
     }
 
@@ -779,11 +928,30 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
 }
 
 /// Resolve `(status_led, status_led_inverted)` for `miro-ego serve` from `button.json` when readable,
-/// falling back to `("ACT", false)` when `button.json` is absent or unreadable.
+/// logging a warning when an existing `button.json` is malformed and falling back to `("ACT", false)`.
 pub fn resolve_serve_led_config(button_config_path: &Path) -> Option<(String, bool)> {
+    match fs::symlink_metadata(button_config_path) {
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Some(("ACT".to_owned(), false));
+        }
+        Err(err) => {
+            eprintln!(
+                "miro-ego: warning: failed to inspect button config {}: {err}; falling back to ACT LED",
+                button_config_path.display()
+            );
+            return Some(("ACT".to_owned(), false));
+        }
+        Ok(_) => {}
+    }
     match ButtonConfig::load(button_config_path) {
         Ok(cfg) => cfg.status_led.map(|name| (name, cfg.status_led_inverted)),
-        Err(_) => Some(("ACT".to_owned(), false)),
+        Err(err) => {
+            eprintln!(
+                "miro-ego: warning: invalid button config {}: {err}; falling back to ACT LED",
+                button_config_path.display()
+            );
+            Some(("ACT".to_owned(), false))
+        }
     }
 }
 
@@ -1424,7 +1592,10 @@ fn run_deploy(args: DeployArgs) -> Result<(), String> {
                 .map_err(|err| format!("deploy uninstall failed: {err}"))?;
             print_json(&report)
         }
-        DeployAction::ServeRpc { socket } => {
+        DeployAction::ServeRpc {
+            socket,
+            idle_timeout_secs,
+        } => {
             let server = if let Some(listener) = take_systemd_socket_fd() {
                 DeployRpcServer::from_listener(
                     listener,
@@ -1446,11 +1617,35 @@ fn run_deploy(args: DeployArgs) -> Result<(), String> {
 
             notify_systemd("READY=1");
 
+            let idle_secs = idle_timeout_secs.unwrap_or(30);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|err| format!("failed to build deploy signal runtime: {err}"))?;
-            rt.block_on(wait_for_termination_signal());
+            rt.block_on(async {
+                if idle_secs == 0 {
+                    wait_for_termination_signal().await;
+                } else {
+                    let idle_limit = Duration::from_secs(idle_secs);
+                    let mut idle_since = std::time::Instant::now();
+                    let mut interval = tokio::time::interval(Duration::from_millis(250));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            () = wait_for_termination_signal() => break,
+                            _ = interval.tick() => {
+                                if server.active_workers() > 0 {
+                                    idle_since = std::time::Instant::now();
+                                } else if idle_since.elapsed() >= idle_limit
+                                    && server.wait_for_idle(Duration::from_millis(1)).is_ok()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
 
             notify_systemd("STOPPING=1");
             let _ = server.wait_for_idle(Duration::from_secs(60));
@@ -1460,12 +1655,22 @@ fn run_deploy(args: DeployArgs) -> Result<(), String> {
     }
 }
 
-fn run_volume_init(mountpoint: PathBuf) -> Result<(), String> {
+fn run_volume_init(mountpoint: PathBuf, relaxed_volume: bool) -> Result<(), String> {
     let paths = DataVolumePaths::new(mountpoint);
-    let hidden_applied = paths
+    let policy = if relaxed_volume {
+        VolumePolicy::relaxed_for_tests(0)
+    } else {
+        let mut prod = VolumePolicy::production(0, 0);
+        prod.system_state_root = None;
+        prod
+    };
+    let manager = ExfatVolumeManager::new(paths.clone(), policy);
+    let hidden_applied = manager
         .ensure_layout()
         .map_err(|err| format!("failed to initialize MIRO-EGO volume layout: {err}"))?;
-    let created_metadata = ensure_volume_metadata(&paths)?;
+    let (_, created_metadata) = manager
+        .ensure_metadata()
+        .map_err(|err| format!("failed to initialize MIRO-EGO volume metadata: {err}"))?;
     println!(
         "initialized {} (exfat_hidden_applied={hidden_applied}, volume_metadata_created={created_metadata})",
         paths.mountpoint().display()
@@ -1503,6 +1708,7 @@ fn run_volume_inspect(mountpoint: PathBuf) -> Result<(), String> {
 fn run_status(
     config_path: PathBuf,
     network_socket: PathBuf,
+    deploy_socket: PathBuf,
     install_root: PathBuf,
     state_root: PathBuf,
 ) -> Result<(), String> {
@@ -1528,19 +1734,37 @@ fn run_status(
     let mut release_paths = ReleaseManagerPaths::canonical();
     release_paths.install_root = install_root;
     release_paths.state_root = state_root;
-    let deploy_status = ReleaseManager::new(
-        release_paths,
-        Arc::new(NoopSystemctlRunner),
-        Arc::new(NoopHealthChecker),
-    )
-    .status()
-    .ok();
+    let rpc_deploy = DeployRpcClient::new(&deploy_socket)
+        .with_timeout(Duration::from_secs(2))
+        .status()
+        .ok();
+    let deploy_status: Option<Value> = match rpc_deploy {
+        Some(ctrl) => {
+            let mut val = serde_json::to_value(&ctrl.deployment).unwrap_or(Value::Null);
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert(
+                    "task".to_owned(),
+                    serde_json::to_value(ctrl.task).unwrap_or(Value::Null),
+                );
+            }
+            Some(val)
+        }
+        None => ReleaseManager::new(
+            release_paths,
+            Arc::new(NoopSystemctlRunner),
+            Arc::new(NoopHealthChecker),
+        )
+        .status()
+        .ok()
+        .and_then(|st| serde_json::to_value(st).ok()),
+    };
 
     let board_model = read_board_model().ok();
     let soc_temp_c = read_soc_temperature_c();
 
     let report = json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "commit": option_env!("MIRO_EGO_GIT_COMMIT").unwrap_or("unknown"),
         "config_path": config_path,
         "config_loaded": cfg.is_some(),
         "device": cfg.as_ref().map(|c| &c.device),
@@ -1846,6 +2070,14 @@ mod tests {
             parse_args(&args(&["volume", "init", "/mnt/test"])).unwrap(),
             Command::VolumeInit {
                 mountpoint: PathBuf::from("/mnt/test"),
+                relaxed_volume: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["volume", "init", "--relaxed-volume", "/mnt/test"])).unwrap(),
+            Command::VolumeInit {
+                mountpoint: PathBuf::from("/mnt/test"),
+                relaxed_volume: true,
             }
         );
         assert_eq!(
@@ -1866,6 +2098,40 @@ mod tests {
                 session_dir: PathBuf::from("/data/recordings/2026-11-26/10-00-00"),
             }
         );
+
+        // Every subcommand handles `-h`/`--help` cleanly (never treated as paths).
+        for help_args in [
+            &["serve", "--help"][..],
+            &["serve", "-h"],
+            &["network-control", "--help"],
+            &["network-control", "serve", "--help"],
+            &["network-control", "watchdog-mode", "-h"],
+            &["button", "--help"],
+            &["deploy", "--help"],
+            &["deploy", "install", "--help"],
+            &["deploy", "serve-rpc", "-h"],
+            &["volume", "--help"],
+            &["volume", "init", "--help"],
+            &["volume", "hide", "-h"],
+            &["volume", "inspect", "--help"],
+            &["status", "--help"],
+            &["probe", "--help"],
+            &["validate", "--help"],
+        ] {
+            assert_eq!(
+                parse_args(&args(help_args)).unwrap(),
+                Command::Help,
+                "expected Help for {help_args:?}"
+            );
+        }
+
+        // Unknown flags and extra positional arguments fail closed.
+        assert!(parse_args(&args(&["volume", "init", "--unknown-flag"])).is_err());
+        assert!(parse_args(&args(&["volume", "init", "/a", "/b"])).is_err());
+        assert!(parse_args(&args(&["volume", "hide", "--bad"])).is_err());
+        assert!(parse_args(&args(&["volume", "inspect", "--bad"])).is_err());
+        assert!(parse_args(&args(&["validate", "--bad"])).is_err());
+        assert!(parse_args(&args(&["validate", "/a", "/b"])).is_err());
         assert!(parse_args(&args(&["volume", "hide"])).is_err());
         assert!(parse_args(&args(&["deploy"])).is_err());
         assert!(parse_args(&args(&["unknown"])).is_err());
@@ -1881,8 +2147,19 @@ mod tests {
             std::env::temp_dir().join(format!("miro-ego-cli-vol-{}-{unique}", std::process::id()));
         fs::create_dir(&dir).unwrap();
 
+        // Strict default refuses non-exFAT unmounted temp directories.
+        assert!(
+            run(Command::VolumeInit {
+                mountpoint: dir.clone(),
+                relaxed_volume: false,
+            })
+            .is_err(),
+            "strict volume init must refuse non-exFAT unmounted directory"
+        );
+
         run(Command::VolumeInit {
             mountpoint: dir.clone(),
+            relaxed_volume: true,
         })
         .unwrap();
         assert!(dir.join("recordings").is_dir());
@@ -1901,6 +2178,7 @@ mod tests {
 
         run(Command::VolumeInit {
             mountpoint: dir.clone(),
+            relaxed_volume: true,
         })
         .unwrap();
         assert_eq!(fs::read(&meta_path).unwrap(), first_raw);

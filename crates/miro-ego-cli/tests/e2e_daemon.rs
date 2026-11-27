@@ -859,11 +859,33 @@ fn cli_binary_subcommands_e2e() {
     assert!(ver_str.contains("shm=v1"), "got: {ver_str}");
     assert!(ver_str.contains("catalog=v1"), "got: {ver_str}");
 
-    // 2. volume init / hide / inspect
+    // 2. volume init / hide / inspect (+ `--help` safety and strict exFAT enforcement)
     let vol_dir = root.join("vol");
     fs::create_dir_all(&vol_dir).unwrap();
-    let out = Command::new(bin)
+
+    let help_out = Command::new(bin)
+        .current_dir(&root)
+        .args(["volume", "init", "--help"])
+        .output()
+        .unwrap();
+    assert!(help_out.status.success(), "volume init --help must exit 0");
+    assert!(
+        !root.join("--help").exists(),
+        "volume init --help must never create ./--help directory"
+    );
+
+    let strict_out = Command::new(bin)
         .args(["volume", "init"])
+        .arg(&vol_dir)
+        .output()
+        .unwrap();
+    assert!(
+        !strict_out.status.success(),
+        "strict volume init must refuse non-exFAT temp directory"
+    );
+
+    let out = Command::new(bin)
+        .args(["volume", "init", "--relaxed-volume"])
         .arg(&vol_dir)
         .output()
         .unwrap();
