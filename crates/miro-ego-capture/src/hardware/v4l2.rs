@@ -120,6 +120,9 @@ trait V4l2Io: Send + Sync {
     fn mmap(&self, fd: RawFd, length: usize, offset: i64) -> io::Result<Box<dyn CaptureBuffer>>;
     fn wait_readable(&self, fd: RawFd, timeout: Duration) -> io::Result<bool>;
     fn monotonic_ns(&self) -> io::Result<u64>;
+    fn monotonic_raw_ns(&self) -> io::Result<u64> {
+        self.monotonic_ns()
+    }
 }
 
 struct MmapBuffer {
@@ -260,6 +263,10 @@ impl V4l2Io for SystemIo {
 
     fn monotonic_ns(&self) -> io::Result<u64> {
         clock::monotonic_ns()
+    }
+
+    fn monotonic_raw_ns(&self) -> io::Result<u64> {
+        clock::monotonic_raw_ns()
     }
 }
 
@@ -739,10 +746,13 @@ pub struct Capture {
     last_raw_sequence: Option<u32>,
     sequence_epoch: u64,
     last_timestamp_ns: Option<u64>,
+    last_raw_timestamp_ns: Option<u64>,
     consecutive_bad_frames: u32,
     corrupt_frames_dropped: u64,
     pub last_buffer_flags: u32,
     pub last_dequeue_monotonic_ns: u64,
+    pub last_dequeue_monotonic_raw_ns: u64,
+    pub last_host_monotonic_raw_ns: u64,
 }
 
 impl Capture {
@@ -803,10 +813,13 @@ impl Capture {
             last_raw_sequence: None,
             sequence_epoch: 0,
             last_timestamp_ns: None,
+            last_raw_timestamp_ns: None,
             consecutive_bad_frames: 0,
             corrupt_frames_dropped: 0,
             last_buffer_flags: 0,
             last_dequeue_monotonic_ns: 0,
+            last_dequeue_monotonic_raw_ns: 0,
+            last_host_monotonic_raw_ns: 0,
         };
         if let Err(error) = capture.configure(width, height, fps, format, buffer_count) {
             capture.close();
@@ -1132,9 +1145,10 @@ impl Capture {
             return Err(error);
         }
         self.last_buffer_flags = flags;
-        let dequeue_mono = match self.io.monotonic_ns() {
-            Ok(ns) => ns,
-            Err(error) => {
+        let (dequeue_mono, dequeue_raw) = match (self.io.monotonic_ns(), self.io.monotonic_raw_ns())
+        {
+            (Ok(mono), Ok(raw)) => (mono, raw),
+            (Err(error), _) | (_, Err(error)) => {
                 let mut queue = queue_payload(index as u32);
                 let _ = self.call(QUEUE_BUFFER, &mut queue, "VIDIOC_QBUF");
                 self.close();
@@ -1142,6 +1156,7 @@ impl Capture {
             }
         };
         self.last_dequeue_monotonic_ns = dequeue_mono;
+        self.last_dequeue_monotonic_raw_ns = dequeue_raw;
         if flags & BUF_FLAG_ERROR != 0 || bytes_used == 0 || bytes_used > self.buffers[index].len()
         {
             let reason = if flags & BUF_FLAG_ERROR != 0 {
@@ -1172,6 +1187,20 @@ impl Capture {
         let result = (|| {
             let source_sequence = self.source_sequence(raw_sequence)?;
             let host_monotonic_ns = self.timestamp(&dequeue, flags)?;
+            let raw_offset = i128::from(host_monotonic_ns) - i128::from(dequeue_mono);
+            let mut raw_ts = if (-10_000_000..=1_000_000_000).contains(&raw_offset) {
+                let shifted = i128::from(dequeue_raw) + raw_offset;
+                u64::try_from(shifted.max(1)).unwrap_or(dequeue_raw)
+            } else {
+                dequeue_raw
+            };
+            if let Some(prev_raw) = self.last_raw_timestamp_ns {
+                if raw_ts <= prev_raw {
+                    raw_ts = prev_raw.saturating_add(1);
+                }
+            }
+            self.last_raw_timestamp_ns = Some(raw_ts);
+            self.last_host_monotonic_raw_ns = raw_ts;
             let payload = self.buffers[index].bytes(bytes_used)?;
             process(source_sequence, host_monotonic_ns, payload)
         })();

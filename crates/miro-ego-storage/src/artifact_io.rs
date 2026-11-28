@@ -728,112 +728,125 @@ fn extract_manifest_artifacts_impl(
     let obj = root.as_object().ok_or_else(|| {
         StorageError::integrity("manifest_invalid", "manifest root must be object")
     })?;
+    let is_v2 = obj.get("schema").and_then(Value::as_str) == Some("miro-ego.device-session.v2");
 
     let mut raw_descriptors: Vec<&Value> = Vec::new();
 
-    let video = obj
-        .get("video")
-        .and_then(Value::as_object)
-        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing video section"))?;
-    if video.get("layout").and_then(Value::as_str) != Some("split-eyes") {
-        return Err(StorageError::integrity(
-            "manifest_invalid",
-            "video.layout must be 'split-eyes'",
-        ));
-    }
-    let segments = video
-        .get("segments")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            StorageError::integrity("manifest_invalid", "missing video.segments array")
-        })?;
-    if segments.is_empty() {
-        return Err(StorageError::integrity(
-            "manifest_invalid",
-            "video.segments must contain at least one segment",
-        ));
-    }
-    for seg in segments {
-        let seg_obj = seg.as_object().ok_or_else(|| {
-            StorageError::integrity("manifest_invalid", "video segment must be object")
-        })?;
-        let arts = seg_obj
-            .get("artifacts")
+    if is_v2 {
+        let media = obj
+            .get("media")
             .and_then(Value::as_object)
+            .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing media section"))?;
+        let media_art = media
+            .get("artifact")
+            .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing media.artifact"))?;
+        raw_descriptors.push(media_art);
+    } else {
+        let video = obj
+            .get("video")
+            .and_then(Value::as_object)
+            .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing video section"))?;
+        if video.get("layout").and_then(Value::as_str) != Some("split-eyes") {
+            return Err(StorageError::integrity(
+                "manifest_invalid",
+                "video.layout must be 'split-eyes'",
+            ));
+        }
+        let segments = video
+            .get("segments")
+            .and_then(Value::as_array)
             .ok_or_else(|| {
-                StorageError::integrity(
-                    "manifest_invalid",
-                    "video segment missing artifacts object",
-                )
+                StorageError::integrity("manifest_invalid", "missing video.segments array")
             })?;
-        if let Some(left) = arts.get("left") {
-            raw_descriptors.push(left);
-        } else {
+        if segments.is_empty() {
             return Err(StorageError::integrity(
                 "manifest_invalid",
-                "video segment missing left artifact",
+                "video.segments must contain at least one segment",
             ));
         }
-        if let Some(right) = arts.get("right") {
-            raw_descriptors.push(right);
-        } else {
-            return Err(StorageError::integrity(
-                "manifest_invalid",
-                "video segment missing right artifact",
-            ));
-        }
-    }
-
-    for section in ["frames", "imu"] {
-        let sec_obj = obj.get(section).and_then(Value::as_object).ok_or_else(|| {
-            StorageError::integrity("manifest_invalid", format!("missing {section} section"))
-        })?;
-        let art = sec_obj.get("artifact").ok_or_else(|| {
-            StorageError::integrity("manifest_invalid", format!("missing {section}.artifact"))
-        })?;
-        raw_descriptors.push(art);
-    }
-
-    let audio = obj
-        .get("audio")
-        .and_then(Value::as_object)
-        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing audio section"))?;
-    match audio.get("state").and_then(Value::as_str) {
-        Some("recorded") => {
-            let segments = audio
-                .get("segments")
-                .and_then(Value::as_array)
+        for seg in segments {
+            let seg_obj = seg.as_object().ok_or_else(|| {
+                StorageError::integrity("manifest_invalid", "video segment must be object")
+            })?;
+            let arts = seg_obj
+                .get("artifacts")
+                .and_then(Value::as_object)
                 .ok_or_else(|| {
                     StorageError::integrity(
                         "manifest_invalid",
-                        "recorded audio missing segments array",
+                        "video segment missing artifacts object",
                     )
                 })?;
-            if segments.is_empty() {
+            if let Some(left) = arts.get("left") {
+                raw_descriptors.push(left);
+            } else {
                 return Err(StorageError::integrity(
                     "manifest_invalid",
-                    "recorded audio must contain at least one segment",
+                    "video segment missing left artifact",
                 ));
             }
-            for seg in segments {
-                let art = seg
-                    .as_object()
-                    .and_then(|s| s.get("artifact"))
-                    .ok_or_else(|| {
-                        StorageError::integrity(
-                            "manifest_invalid",
-                            "audio segment missing artifact",
-                        )
-                    })?;
-                raw_descriptors.push(art);
+            if let Some(right) = arts.get("right") {
+                raw_descriptors.push(right);
+            } else {
+                return Err(StorageError::integrity(
+                    "manifest_invalid",
+                    "video segment missing right artifact",
+                ));
             }
         }
-        Some("not_recorded") => {}
-        _ => {
-            return Err(StorageError::integrity(
-                "manifest_invalid",
-                "audio.state must be 'recorded' or 'not_recorded'",
-            ));
+
+        for section in ["frames", "imu"] {
+            let sec_obj = obj.get(section).and_then(Value::as_object).ok_or_else(|| {
+                StorageError::integrity("manifest_invalid", format!("missing {section} section"))
+            })?;
+            let art = sec_obj.get("artifact").ok_or_else(|| {
+                StorageError::integrity("manifest_invalid", format!("missing {section}.artifact"))
+            })?;
+            raw_descriptors.push(art);
+        }
+
+        let audio = obj
+            .get("audio")
+            .and_then(Value::as_object)
+            .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing audio section"))?;
+        match audio.get("state").and_then(Value::as_str) {
+            Some("recorded") => {
+                let segments =
+                    audio
+                        .get("segments")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            StorageError::integrity(
+                                "manifest_invalid",
+                                "recorded audio missing segments array",
+                            )
+                        })?;
+                if segments.is_empty() {
+                    return Err(StorageError::integrity(
+                        "manifest_invalid",
+                        "recorded audio must contain at least one segment",
+                    ));
+                }
+                for seg in segments {
+                    let art = seg
+                        .as_object()
+                        .and_then(|s| s.get("artifact"))
+                        .ok_or_else(|| {
+                            StorageError::integrity(
+                                "manifest_invalid",
+                                "audio segment missing artifact",
+                            )
+                        })?;
+                    raw_descriptors.push(art);
+                }
+            }
+            Some("not_recorded") => {}
+            _ => {
+                return Err(StorageError::integrity(
+                    "manifest_invalid",
+                    "audio.state must be 'recorded' or 'not_recorded'",
+                ));
+            }
         }
     }
 

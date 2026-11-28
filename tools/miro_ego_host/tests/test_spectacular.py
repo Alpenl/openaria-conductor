@@ -827,6 +827,202 @@ class SpectacularTests(unittest.TestCase):
         with self.assertRaisesRegex(CaptureValidationError, "host interval is invalid"):
             analyze_capture(bad_latest, imu_rate_hz=400.0)
 
+    def test_v2_synced_fmp4_calibration_session_validates_mett_track_end_to_end(self) -> None:
+        import struct
+
+        def box(tag: bytes, payload: bytes) -> bytes:
+            return struct.pack(">I", len(payload) + 8) + tag + payload
+
+        v2_dir = self.root / "v2-cal-session"
+        v2_dir.mkdir()
+        timescale = 48_000
+        ticks_per_frame = 1_600
+        frame_count = 4
+        imu_samples = 0
+        mett_payloads: list[bytes] = []
+        for idx in range(frame_count):
+            mono_ns = 1_000_000_000 + idx * 33_333_333
+            p0 = mono_ns - 5_000_000
+            p1 = mono_ns
+            imu_rows = [
+                [p0, 1, 2, 3, 4, 5, 6],
+                [p1, 2, 3, 4, 5, 6, 7],
+            ]
+            imu_samples += len(imu_rows)
+            mett_payloads.append(
+                json.dumps(
+                    {
+                        "seq": idx,
+                        "vseq": idx + 1,
+                        "mono_ns": mono_ns,
+                        "raw_ns": mono_ns,
+                        "hw_s": idx * ticks_per_frame,
+                        "dur": ticks_per_frame,
+                        "flags": 16,
+                        "deq_ns": mono_ns,
+                        "cam_ctr": idx + 10,
+                        "imu": imu_rows,
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+
+        ftyp = box(b"ftyp", b"isom\x00\x00\x02\x00isomiso6")
+        traks = []
+        for tid, handler in ((1, b"vide"), (2, b"vide"), (3, b"meta")):
+            tkhd = box(b"tkhd", struct.pack(">IIII", 3, 0, 0, tid) + b"\x00" * 68)
+            hdlr = box(b"hdlr", b"\x00" * 8 + handler + b"\x00" * 16)
+            mdia = box(b"mdia", hdlr)
+            traks.append(box(b"trak", tkhd + mdia))
+        moov = box(b"moov", b"".join(traks))
+
+        trafs = []
+        for tid in (1, 2):
+            tfhd = box(b"tfhd", struct.pack(">II", 0x020000, tid))
+            trun = box(
+                b"trun",
+                struct.pack(">IIi", 0x0701, frame_count, 0)
+                + b"".join(struct.pack(">III", ticks_per_frame, 4, 0) for _ in range(frame_count)),
+            )
+            trafs.append(box(b"traf", tfhd + trun))
+        # Temporarily measure moof size with placeholder data_offset for track 3
+        dummy_trun3 = box(
+            b"trun",
+            struct.pack(">IIi", 0x0701, frame_count, 0)
+            + b"".join(struct.pack(">III", ticks_per_frame, len(p), 0) for p in mett_payloads),
+        )
+        dummy_traf3 = box(b"traf", box(b"tfhd", struct.pack(">II", 0x020000, 3)) + dummy_trun3)
+        moof_len = len(box(b"moof", b"".join(trafs) + dummy_traf3))
+        mdat_payload_off = moof_len + 8 + frame_count * 4 * 2
+        trun3 = box(
+            b"trun",
+            struct.pack(">IIi", 0x0701, frame_count, mdat_payload_off)
+            + b"".join(struct.pack(">III", ticks_per_frame, len(p), 0) for p in mett_payloads),
+        )
+        traf3 = box(b"traf", box(b"tfhd", struct.pack(">II", 0x020000, 3)) + trun3)
+        moof = box(b"moof", b"".join(trafs) + traf3)
+        mdat = box(b"mdat", b"\x00" * (frame_count * 4 * 2) + b"".join(mett_payloads))
+        session_mp4 = ftyp + moov + moof + mdat
+        (v2_dir / "session.mp4").write_bytes(session_mp4)
+        digest = hashlib.sha256(session_mp4).hexdigest()
+
+        v2_manifest = {
+            "schema": "miro-ego.device-session.v2",
+            "manifest_id": "0198c9a8-7a3c-7000-8000-000000000101",
+            "sealed": True,
+            "sealed_at": "2026-11-28T04:00:00Z",
+            "session_id": "0198c9a8-7a3c-7000-8000-000000000102",
+            "volume_id": "2c9d0e1f-4444-4000-8000-000000000103",
+            "capture_mode": "calibration",
+            "display_name": "V2 Cal",
+            "device": {
+                "device_id": "2c9d0e1f-4444-4000-8000-000000000104",
+                "device_label": "Miro-Ego-12345678",
+                "hardware_fingerprint": f"sha256:{'b' * 64}",
+                "platform": "rdk-x5",
+                "software_version": "0.3.0",
+                "commit": "b" * 40,
+            },
+            "time": {
+                "started_at": "2026-11-28T03:59:55Z",
+                "ended_at": "2026-11-28T04:00:00Z",
+                "timezone": "UTC",
+                "duration_seconds": 0.133,
+                "duration_clock": "host_monotonic",
+            },
+            "take": {
+                "take_id": "0198c9a8-7a3c-7000-8000-000000000102",
+                "sequence": 1,
+                "continuation_of": None,
+            },
+            "camera": {
+                "width": 3840,
+                "height": 1080,
+                "eye_width": 1920,
+                "sensor_fps": 30.0,
+                "frame_decimation": 1,
+                "effective_fps": 30.0,
+                "coordinate_frame": "opencv_optical",
+            },
+            "media": {
+                "container": "fmp4",
+                "layout": "synced-fmp4",
+                "timescale": timescale,
+                "duration_ticks": frame_count * ticks_per_frame,
+                "fragment_count": 1,
+                "artifact": {
+                    "artifact_id": digest,
+                    "role": "media.session",
+                    "path": "session.mp4",
+                    "media_type": "video/mp4",
+                    "bytes": len(session_mp4),
+                    "sha256": digest,
+                },
+            },
+            "video": {
+                "layout": "split-eyes",
+                "codec": "hevc",
+                "container": "fmp4",
+                "frame_count": frame_count,
+                "tracks": {"left_track_id": 1, "right_track_id": 2},
+                "encoding": {
+                    "schema": "miro-ego.recording-encoding.v1",
+                    "codec": "hevc",
+                    "rate_control": "vbr",
+                    "profile": "main",
+                    "pixel_format": "yuv420p",
+                    "bit_depth": 8,
+                    "b_frames": 0,
+                    "bitrate_kbps": None,
+                    "min_qp": None,
+                    "max_qp": None,
+                    "intra_qp": 22,
+                    "initial_qp": None,
+                    "gop_frames": 30,
+                    "vbv_ms": None,
+                },
+            },
+            "imu": {
+                "embedded_in": "media.session",
+                "track_id": 3,
+                "mime_type": "application/x-miro-ego-sync+json",
+                "sample_count": imu_samples,
+                "units": "raw_int16",
+                "coordinate_frame": "raw_device_axes",
+            },
+            "frames": {
+                "embedded_in": "media.session",
+                "track_id": 3,
+                "mime_type": "application/x-miro-ego-sync+json",
+                "count": frame_count,
+            },
+            "audio": {
+                "state": "not_recorded",
+                "requested_mode": "disabled",
+                "resolved_mode": "disabled",
+                "reason": "user_disabled",
+            },
+            "logs": [],
+            "integrity": {
+                "verified_at": "2026-11-28T04:00:00Z",
+                "dropped_frames": 0,
+                "drop_events": [],
+                "fatal_errors": [],
+            },
+        }
+        _write_manifest(v2_dir, v2_manifest)
+
+        timing = analyze_capture(v2_dir)
+        model = build_model_input(timing)
+        result = check_capture(timing)
+        self.assertEqual(timing.capture.source_schema, "miro-ego.device-session.v2")
+        self.assertEqual(model["source"]["artifact_roles"], ["media.session"])
+        self.assertEqual(model["video"]["container"], "fmp4")
+        self.assertEqual(model["video"]["media_path"], "session.mp4")
+        self.assertEqual(len(model["frames"]), frame_count)
+        self.assertEqual(len(model["imu_samples"]), imu_samples)
+        self.assertEqual(result["diagnostics"]["imu_time_basis"], "mett_sync_host_monotonic")
+
 
 if __name__ == "__main__":
     unittest.main()

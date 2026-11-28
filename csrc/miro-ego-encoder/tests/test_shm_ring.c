@@ -56,7 +56,13 @@ static void test_binary_layout_offsets(void)
     assert(offsetof(miro_ego_shm_slot_t, payload_len) == 16u);
     assert(offsetof(miro_ego_shm_slot_t, flags) == 20u);
     assert(offsetof(miro_ego_shm_slot_t, data_offset) == 24u);
-    assert(offsetof(miro_ego_shm_slot_t, reserved) == 32u);
+    assert(offsetof(miro_ego_shm_slot_t, sample_number) == 32u);
+    assert(offsetof(miro_ego_shm_slot_t, duration_ticks) == 40u);
+    assert(offsetof(miro_ego_shm_slot_t, pcm_offset) == 44u);
+    assert(offsetof(miro_ego_shm_slot_t, pcm_len) == 48u);
+    assert(offsetof(miro_ego_shm_slot_t, meta_offset) == 52u);
+    assert(offsetof(miro_ego_shm_slot_t, meta_len) == 56u);
+    assert(offsetof(miro_ego_shm_slot_t, reserved) == 60u);
 
     /* Data region alignment checks */
     assert(miro_ego_shm_data_offset(1u) == 8192u);
@@ -293,6 +299,64 @@ static void test_bounds_and_corruption_rejection(void)
     close_fds(shm_fd, kick_fd, done_fd);
 }
 
+static void test_sync_bundle_roundtrip_and_bounds(void)
+{
+    int shm_fd, kick_fd, done_fd;
+    make_fds(&shm_fd, &kick_fd, &done_fd, EFD_NONBLOCK);
+
+    miro_ego_shm_ring_t prod, cons;
+    char err[128] = {0};
+    assert(miro_ego_shm_ring_init_fd(&prod, shm_fd, kick_fd, done_fd,
+                                     4u, 4096u, err, sizeof(err)) == 0);
+    assert(miro_ego_shm_ring_attach(&cons, shm_fd, kick_fd, done_fd, err, sizeof(err)) == 0);
+
+    uint8_t jpeg[128];
+    uint8_t pcm[640];
+    const char *meta = "{\"seq\":7,\"ticks\":1600}";
+    memset(jpeg, 0xaa, sizeof(jpeg));
+    for (size_t i = 0; i < sizeof(pcm); i += 1u) {
+        pcm[i] = (uint8_t)(i & 0xffu);
+    }
+
+    assert(miro_ego_shm_ring_push_bundle(
+               &prod, jpeg, sizeof(jpeg),
+               pcm, (uint32_t)sizeof(pcm),
+               (const uint8_t *)meta, (uint32_t)strlen(meta),
+               7ULL, 123456789ULL, 11200ULL, 1600u, 1000) == MIRO_EGO_SHM_OK);
+
+    miro_ego_shm_frame_t frame;
+    assert(miro_ego_shm_ring_receive(&cons, &frame, 1000) == MIRO_EGO_SHM_OK);
+    assert((frame.flags & MIRO_EGO_SHM_SLOT_FLAG_SYNC_BUNDLE) != 0u);
+    assert(frame.frame_seq == 7ULL);
+    assert(frame.monotonic_ns == 123456789ULL);
+    assert(frame.sample_number == 11200ULL);
+    assert(frame.duration_ticks == 1600u);
+    assert(frame.payload_len == sizeof(jpeg));
+    assert(memcmp(frame.data, jpeg, sizeof(jpeg)) == 0);
+    assert(frame.pcm_len == sizeof(pcm) && frame.pcm != NULL);
+    assert(memcmp(frame.pcm, pcm, sizeof(pcm)) == 0);
+    assert(frame.meta_len == strlen(meta) && frame.meta != NULL);
+    assert(memcmp(frame.meta, meta, strlen(meta)) == 0);
+    assert(miro_ego_shm_ring_release(&cons) == MIRO_EGO_SHM_OK);
+
+    /* Overlapping PCM offset into JPEG payload rejected as CORRUPT */
+    prod.slots[1].frame_seq = 8ULL;
+    prod.slots[1].monotonic_ns = 1ULL;
+    prod.slots[1].data_offset = prod.data_offset + 4096ULL;
+    prod.slots[1].payload_len = 128u;
+    prod.slots[1].flags = MIRO_EGO_SHM_SLOT_FLAG_SYNC_BUNDLE;
+    prod.slots[1].pcm_offset = 64u;
+    prod.slots[1].pcm_len = 64u;
+    prod.slots[1].meta_offset = 0u;
+    prod.slots[1].meta_len = 0u;
+    atomic_store_explicit(&prod.header->write_idx, 2ULL, memory_order_release);
+    assert(miro_ego_shm_ring_receive(&cons, &frame, 10) == MIRO_EGO_SHM_CORRUPT);
+
+    miro_ego_shm_ring_detach(&cons);
+    miro_ego_shm_ring_detach(&prod);
+    close_fds(shm_fd, kick_fd, done_fd);
+}
+
 typedef struct {
     miro_ego_shm_ring_t *ring;
     uint32_t frames;
@@ -377,6 +441,7 @@ int main(void)
     test_mt_wraparound(EFD_NONBLOCK);
     test_eof_drain_and_backpressure();
     test_bounds_and_corruption_rejection();
+    test_sync_bundle_roundtrip_and_bounds();
     test_throughput_benchmark();
     printf("test_shm_ring: PASS (layout + wraparound + backpressure + EOF drain + bounds + bench)\n");
     return 0;

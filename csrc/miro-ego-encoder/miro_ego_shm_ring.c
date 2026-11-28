@@ -288,6 +288,40 @@ miro_ego_shm_status_t miro_ego_shm_ring_receive(miro_ego_shm_ring_t *ring,
                 return MIRO_EGO_SHM_CORRUPT;
             }
 
+            if ((desc.flags & MIRO_EGO_SHM_SLOT_FLAG_SYNC_BUNDLE) != 0u) {
+                if (desc.pcm_len > 0u) {
+                    if (desc.pcm_offset < desc.payload_len ||
+                        desc.pcm_offset > ring->slot_capacity ||
+                        desc.pcm_len > ring->slot_capacity - desc.pcm_offset ||
+                        (desc.pcm_len % 4u) != 0u) {
+                        return MIRO_EGO_SHM_CORRUPT;
+                    }
+                }
+                if (desc.meta_len > 0u) {
+                    const uint64_t min_meta_off = (desc.pcm_len > 0u)
+                                                      ? (uint64_t)desc.pcm_offset + (uint64_t)desc.pcm_len
+                                                      : (uint64_t)desc.payload_len;
+                    if ((uint64_t)desc.meta_offset < min_meta_off ||
+                        desc.meta_offset > ring->slot_capacity ||
+                        desc.meta_len > ring->slot_capacity - desc.meta_offset) {
+                        return MIRO_EGO_SHM_CORRUPT;
+                    }
+                }
+                frame->sample_number = desc.sample_number;
+                frame->duration_ticks = desc.duration_ticks;
+                frame->pcm = desc.pcm_len > 0u ? (ring->base + desc.data_offset + desc.pcm_offset) : NULL;
+                frame->pcm_len = desc.pcm_len;
+                frame->meta = desc.meta_len > 0u ? (ring->base + desc.data_offset + desc.meta_offset) : NULL;
+                frame->meta_len = desc.meta_len;
+            } else {
+                frame->sample_number = 0u;
+                frame->duration_ticks = 0u;
+                frame->pcm = NULL;
+                frame->pcm_len = 0u;
+                frame->meta = NULL;
+                frame->meta_len = 0u;
+            }
+
             frame->data = ring->base + desc.data_offset;
             frame->payload_len = desc.payload_len;
             frame->flags = desc.flags;
@@ -403,16 +437,30 @@ int miro_ego_shm_ring_init_fd(miro_ego_shm_ring_t *ring, int shm_fd, int kick_fd
     return miro_ego_shm_ring_attach(ring, shm_fd, kick_fd, done_fd, error, error_len);
 }
 
-miro_ego_shm_status_t miro_ego_shm_ring_push(miro_ego_shm_ring_t *ring,
-                                             const uint8_t *payload,
-                                             uint32_t payload_len,
-                                             uint64_t frame_seq,
-                                             uint64_t monotonic_ns,
-                                             uint32_t flags,
-                                             int timeout_ms)
+static miro_ego_shm_status_t push_slot_internal(miro_ego_shm_ring_t *ring,
+                                                const uint8_t *payload,
+                                                uint32_t payload_len,
+                                                const uint8_t *pcm,
+                                                uint32_t pcm_len,
+                                                const uint8_t *meta,
+                                                uint32_t meta_len,
+                                                uint64_t frame_seq,
+                                                uint64_t monotonic_ns,
+                                                uint64_t sample_number,
+                                                uint32_t duration_ticks,
+                                                uint32_t flags,
+                                                int timeout_ms)
 {
-    if (ring == NULL || ring->header == NULL || payload == NULL ||
-        payload_len == 0u || payload_len > ring->slot_capacity) {
+    if (ring == NULL || ring->header == NULL || payload == NULL || payload_len == 0u) {
+        return MIRO_EGO_SHM_INVALID_ARG;
+    }
+    if ((pcm_len > 0u && pcm == NULL) || (meta_len > 0u && meta == NULL)) {
+        return MIRO_EGO_SHM_INVALID_ARG;
+    }
+    const uint64_t pcm_off = payload_len;
+    const uint64_t meta_off = pcm_off + (uint64_t)pcm_len;
+    const uint64_t total_len = meta_off + (uint64_t)meta_len;
+    if (total_len > (uint64_t)ring->slot_capacity) {
         return MIRO_EGO_SHM_INVALID_ARG;
     }
 
@@ -435,6 +483,12 @@ miro_ego_shm_status_t miro_ego_shm_ring_push(miro_ego_shm_ring_t *ring,
             const uint64_t offset =
                 ring->data_offset + slot_idx * (uint64_t)ring->slot_capacity;
             memcpy(ring->base + offset, payload, payload_len);
+            if (pcm_len > 0u) {
+                memcpy(ring->base + offset + pcm_off, pcm, pcm_len);
+            }
+            if (meta_len > 0u) {
+                memcpy(ring->base + offset + meta_off, meta, meta_len);
+            }
 
             miro_ego_shm_slot_t *slot = &ring->slots[slot_idx];
             slot->frame_seq = frame_seq;
@@ -442,7 +496,13 @@ miro_ego_shm_status_t miro_ego_shm_ring_push(miro_ego_shm_ring_t *ring,
             slot->payload_len = payload_len;
             slot->flags = flags;
             slot->data_offset = offset;
-            memset(slot->reserved, 0, sizeof(slot->reserved));
+            slot->sample_number = sample_number;
+            slot->duration_ticks = duration_ticks;
+            slot->pcm_offset = (uint32_t)pcm_off;
+            slot->pcm_len = pcm_len;
+            slot->meta_offset = (uint32_t)meta_off;
+            slot->meta_len = meta_len;
+            slot->reserved = 0u;
 
             atomic_store_explicit(&ring->header->write_idx, write_idx + 1ULL,
                                   memory_order_release);
@@ -473,6 +533,36 @@ miro_ego_shm_status_t miro_ego_shm_ring_push(miro_ego_shm_ring_t *ring,
             return MIRO_EGO_SHM_TIMEOUT;
         }
     }
+}
+
+miro_ego_shm_status_t miro_ego_shm_ring_push(miro_ego_shm_ring_t *ring,
+                                             const uint8_t *payload,
+                                             uint32_t payload_len,
+                                             uint64_t frame_seq,
+                                             uint64_t monotonic_ns,
+                                             uint32_t flags,
+                                             int timeout_ms)
+{
+    return push_slot_internal(ring, payload, payload_len, NULL, 0u, NULL, 0u,
+                              frame_seq, monotonic_ns, 0ULL, 0u, flags, timeout_ms);
+}
+
+miro_ego_shm_status_t miro_ego_shm_ring_push_bundle(miro_ego_shm_ring_t *ring,
+                                                    const uint8_t *jpeg,
+                                                    uint32_t jpeg_len,
+                                                    const uint8_t *pcm,
+                                                    uint32_t pcm_len,
+                                                    const uint8_t *meta,
+                                                    uint32_t meta_len,
+                                                    uint64_t frame_seq,
+                                                    uint64_t monotonic_ns,
+                                                    uint64_t sample_number,
+                                                    uint32_t duration_ticks,
+                                                    int timeout_ms)
+{
+    return push_slot_internal(ring, jpeg, jpeg_len, pcm, pcm_len, meta, meta_len,
+                              frame_seq, monotonic_ns, sample_number, duration_ticks,
+                              MIRO_EGO_SHM_SLOT_FLAG_SYNC_BUNDLE, timeout_ms);
 }
 
 miro_ego_shm_status_t miro_ego_shm_ring_set_eof(miro_ego_shm_ring_t *ring)

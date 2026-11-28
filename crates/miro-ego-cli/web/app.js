@@ -7030,6 +7030,9 @@ function NetworkPanel({ state }) {
 
 function collectSessionArtifacts(manifest) {
   const list = [];
+  if (manifest.media?.artifact) {
+    list.push(manifest.media.artifact);
+  }
   for (const seg of manifest.video?.segments ?? []) {
     if (seg.artifacts.left) list.push(seg.artifacts.left);
     if (seg.artifacts.right) list.push(seg.artifacts.right);
@@ -7041,6 +7044,7 @@ function collectSessionArtifacts(manifest) {
   if (manifest.imu?.artifact) list.push(manifest.imu.artifact);
   for (const logEntry of manifest.logs ?? []) {
     if (logEntry.artifact) list.push(logEntry.artifact);
+    else if (logEntry.artifact_id && logEntry.path) list.push(logEntry);
   }
   return list;
 }
@@ -7076,18 +7080,71 @@ function SessionReplaySection({ detail, enabled }) {
   const segments = (detail.video?.segments ?? []).filter(
     (s) => s.artifacts.left || s.artifacts.right
   );
+  const unifiedMedia = !segments.length ? detail.media?.artifact ?? null : null;
   const [segIdx, setSegIdx] = useState(0);
   const leftVideoRef = useRef(null);
   const rightVideoRef = useRef(null);
   const syncingRef = useRef(false);
   const [playErr, setPlayErr] = useState(false);
 
+  const urlFor = (art) => (art ? Api.artifactUrl(detail.session_id, art.artifact_id) : undefined);
+
+  if (unifiedMedia) {
+    return h("section", {
+      class: "detail-section replay-section",
+      "data-testid": "session-replay",
+      children: [
+        h("span", { class: "eyebrow", children: "REPLAY" }),
+        h("div", {
+          class: "replay-toolbar",
+          children: h("span", {
+            class: "replay-hint",
+            children:
+              detail.audio?.state === "recorded"
+                ? "单文件硬件同步 fMP4（含左/右目 + FLAC 音轨 + 元数据轨，0 边界偏移）"
+                : "单文件同步 fMP4（左/右目 + 元数据轨）",
+          }),
+        }),
+        h("div", {
+          class: "replay-player",
+          children: [
+            h("span", { class: "artifact-role", children: unifiedMedia.path || "session.mp4" }),
+            enabled
+              ? h("video", {
+                  controls: true,
+                  playsInline: true,
+                  preload: "metadata",
+                  src: urlFor(unifiedMedia),
+                  "data-testid": "replay-session",
+                  onError: () => setPlayErr(true),
+                })
+              : h("div", {
+                  class: "replay-unavailable",
+                  children: "设备不支持 Range 回放",
+                }),
+          ],
+        }),
+        playErr
+          ? h("p", {
+              class: "panel-note",
+              role: "alert",
+              children:
+                detail.video?.codec === "hevc"
+                  ? "H.265 回放需要浏览器和系统支持 HEVC。若此浏览器无法播放，请下载后使用支持 HEVC 的播放器打开。"
+                  : readAccessToken()
+                    ? "当前处于受保护访问令牌模式，请下载制品文件到本地播放器查看。"
+                    : "录像暂时无法播放（录制期间会返回 423 capture_busy），请待机后重试或下载播放。",
+            })
+          : null,
+      ],
+    });
+  }
+
   if (!segments.length) return null;
   const currentSeg = segments[segIdx] ?? segments[0];
   if (!currentSeg) return null;
 
   const audioArtifact = detail.audio?.segments?.find((a) => a.index === currentSeg.index)?.artifact;
-  const urlFor = (art) => (art ? Api.artifactUrl(detail.session_id, art.artifact_id) : undefined);
 
   const syncPeer = (sourceEl, fn) => {
     if (syncingRef.current) return;
@@ -7548,9 +7605,11 @@ function SessionDetailPanel({ state, requestDelete = false }) {
                           h("dt", { children: "存储格式" }),
                           h("dd", {
                             children:
-                              detail.schema === "miro-ego.device-session.v1"
-                                ? "Miro-Ego v1 无损封存清单"
-                                : "原始日志与音频",
+                              detail.schema === "miro-ego.device-session.v2"
+                                ? "Miro-Ego v2 单文件同步 fMP4 清单"
+                                : detail.schema === "miro-ego.device-session.v1"
+                                  ? "Miro-Ego v1 无损封存清单"
+                                  : "原始日志与音频",
                           }),
                         ],
                       }),

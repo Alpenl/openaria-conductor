@@ -1,7 +1,7 @@
 //! Crash prefix recovery, quarantine isolation, and collision-safe atomic publication
 //! for interrupted captures under `/data/.miro-ego/staging/`.
 
-use crate::catalog::{BinarySessionCatalog, DEVICE_SESSION_SCHEMA};
+use crate::catalog::{BinarySessionCatalog, DEVICE_SESSION_SCHEMA, DEVICE_SESSION_V2_SCHEMA};
 use crate::util::{
     UNKNOWN_DATE_DIR_NAME, now_rfc3339_utc, parse_rfc3339_utc_nanos,
     readable_date_time_from_rfc3339, sha256_hex, sweep_stale_atomic_temps,
@@ -275,6 +275,16 @@ impl StagingRecoveryManager {
         partial_path: &Path,
         partial_name: &str,
     ) -> StorageResult<RecoveryItemOutcome> {
+        let session_mp4_path = partial_path.join("session.mp4");
+        if let Ok(meta) = fs::symlink_metadata(&session_mp4_path) {
+            if meta.is_file() && !meta.file_type().is_symlink() {
+                return self.recover_single_fmp4_partial(
+                    partial_path,
+                    partial_name,
+                    &session_mp4_path,
+                );
+            }
+        }
         let video_dir = partial_path.join("video");
         let valid_pairs = find_contiguous_valid_stereo_pairs(&video_dir)?;
 
@@ -626,6 +636,300 @@ impl StagingRecoveryManager {
             session_id: meta.session_id,
             relative_dir,
             recovered_segments: valid_pairs.len(),
+            discarded_tail_files,
+        })
+    }
+
+    fn recover_single_fmp4_partial(
+        &self,
+        partial_path: &Path,
+        partial_name: &str,
+        session_mp4_path: &Path,
+    ) -> StorageResult<RecoveryItemOutcome> {
+        let meta = load_partial_metadata(partial_path, &self.paths, &self.defaults);
+        let scan = match scan_and_repair_partial_fmp4(session_mp4_path) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                let q_name =
+                    move_to_quarantine(&self.paths.quarantine_dir(), partial_path, partial_name)?;
+                return Ok(RecoveryItemOutcome::Quarantined {
+                    partial_name: partial_name.to_owned(),
+                    quarantine_name: q_name,
+                    reason: "no complete synced fragments found in session.mp4".to_owned(),
+                });
+            }
+            Err(err) if is_transient_storage_error(&err) => return Err(err),
+            Err(err) => {
+                let q_name =
+                    move_to_quarantine(&self.paths.quarantine_dir(), partial_path, partial_name)?;
+                return Ok(RecoveryItemOutcome::Quarantined {
+                    partial_name: partial_name.to_owned(),
+                    quarantine_name: q_name,
+                    reason: format!("corrupt session.mp4: {err}"),
+                });
+            }
+        };
+
+        let _ = fsync_directory(partial_path);
+        let media_digest = hash_file(session_mp4_path).map_err(|err| {
+            StorageError::integrity(
+                "recovery_hash_failed",
+                format!("session.mp4: {}", err.message),
+            )
+        })?;
+
+        let planned_discarded_tail_files = count_fmp4_stray_files(partial_path)?
+            .saturating_add(usize::from(scan.truncated_tail_bytes > 0));
+
+        let now = now_rfc3339_utc();
+        let manifest_id = new_uuid_v7();
+        let codec_str = scan.codec.as_str();
+        let profile_str = match scan.codec {
+            VideoCodec::H264 => "high",
+            VideoCodec::Hevc => "main",
+        };
+        let mut recovery_encoding = meta.encoding.clone();
+        recovery_encoding.codec = scan.codec;
+
+        let effective_fps = (meta.sensor_fps / f64::from(meta.frame_decimation.max(1))).max(1.0);
+        let timescale = scan.timescale.max(1);
+        let duration_seconds = (scan.total_duration_ticks as f64) / (timescale as f64);
+        let has_audio = scan.has_audio && scan.audio_sample_count > 0;
+        let meta_track_id = if has_audio { 4_u64 } else { 3_u64 };
+        let duration_clock = if has_audio {
+            "audio_hardware_samples"
+        } else {
+            "host_monotonic"
+        };
+        let audio_json = if has_audio {
+            let req_mode = if meta.audio_requested_mode == "enabled" {
+                "enabled"
+            } else {
+                "device_default"
+            };
+            json!({
+                "state": "recorded",
+                "requested_mode": req_mode,
+                "resolved_mode": "enabled",
+                "codec": "flac",
+                "container": "fmp4",
+                "track_id": 3,
+                "sample_format": "S16_LE",
+                "sample_rate": scan.audio_sample_rate.max(8_000),
+                "channels": scan.audio_channels.max(1),
+                "sample_count": scan.audio_sample_count,
+                "sync": {
+                    "time_base": "audio_hardware_samples",
+                    "timescale": timescale,
+                    "boundary_gap_samples": 0,
+                }
+            })
+        } else {
+            json!({
+                "state": "not_recorded",
+                "requested_mode": meta.audio_requested_mode,
+                "resolved_mode": "disabled",
+                "reason": "recording_interrupted",
+            })
+        };
+
+        let manifest_value = json!({
+            "schema": DEVICE_SESSION_V2_SCHEMA,
+            "manifest_id": manifest_id,
+            "sealed": true,
+            "sealed_at": now,
+            "session_id": meta.session_id,
+            "volume_id": meta.volume_id,
+            "capture_mode": meta.capture_mode,
+            "display_name": meta.display_name,
+            "device": {
+                "device_id": meta.device_id,
+                "device_label": meta.device_label,
+                "hardware_fingerprint": meta.hardware_fingerprint,
+                "platform": meta.platform,
+                "software_version": meta.software_version,
+                "commit": meta.commit,
+            },
+            "time": {
+                "started_at": meta.started_at,
+                "ended_at": now,
+                "timezone": meta.timezone,
+                "duration_seconds": duration_seconds,
+                "duration_clock": duration_clock,
+            },
+            "take": {
+                "take_id": meta.take_id,
+                "sequence": meta.take_sequence,
+                "continuation_of": meta.continuation_of,
+            },
+            "camera": {
+                "width": meta.camera_width,
+                "height": meta.camera_height,
+                "eye_width": (meta.camera_width / 2).max(1),
+                "sensor_fps": meta.sensor_fps,
+                "frame_decimation": meta.frame_decimation,
+                "effective_fps": effective_fps,
+                "coordinate_frame": "opencv_optical",
+            },
+            "media": {
+                "container": "fmp4",
+                "layout": "synced-fmp4",
+                "timescale": timescale,
+                "duration_ticks": scan.total_duration_ticks,
+                "fragment_count": scan.fragment_count,
+                "artifact": {
+                    "artifact_id": media_digest.sha256,
+                    "role": "media.session",
+                    "path": "session.mp4",
+                    "media_type": "video/mp4",
+                    "bytes": media_digest.identity.size,
+                    "sha256": media_digest.sha256,
+                }
+            },
+            "video": {
+                "layout": "split-eyes",
+                "codec": codec_str,
+                "container": "fmp4",
+                "frame_count": scan.frame_count,
+                "tracks": {
+                    "left_track_id": 1,
+                    "right_track_id": 2,
+                },
+                "encoding": build_manifest_encoding_json(&recovery_encoding, profile_str),
+            },
+            "imu": {
+                "embedded_in": "media.session",
+                "track_id": meta_track_id,
+                "mime_type": "application/x-miro-ego-sync+json",
+                "sample_count": scan.imu_sample_count,
+                "units": "raw_int16",
+                "coordinate_frame": "raw_device_axes",
+            },
+            "frames": {
+                "embedded_in": "media.session",
+                "track_id": meta_track_id,
+                "mime_type": "application/x-miro-ego-sync+json",
+                "count": scan.frame_count,
+            },
+            "audio": audio_json,
+            "logs": [],
+            "integrity": {
+                "verified_at": now,
+                "dropped_frames": 0,
+                "drop_events": [],
+                "fatal_errors": [],
+            },
+            "capture_audit": {
+                "schema": "miro-ego.capture-audit.v1",
+                "recovery": {
+                    "recovered_prefix": true,
+                    "recovered_segments": scan.fragment_count,
+                    "discarded_tail_files": planned_discarded_tail_files,
+                    "recovered_at": now,
+                }
+            }
+        });
+
+        let mut manifest_bytes =
+            serde_json::to_vec_pretty(&manifest_value).map_err(|err| StorageError::Catalog {
+                message: format!("serialize recovered v2 manifest failed: {err}"),
+            })?;
+        manifest_bytes.push(b'\n');
+        let manifest_sha256 = sha256_hex(&manifest_bytes);
+
+        let _ = crate::catalog::parse_indexed_session_from_manifest(
+            "2026-01-01/00-00-00",
+            &manifest_value,
+            &manifest_sha256,
+        )?;
+        if let Some(catalog) = &self.catalog {
+            if catalog.get_indexed_session(&meta.session_id)?.is_some() {
+                let q_name =
+                    move_to_quarantine(&self.paths.quarantine_dir(), partial_path, partial_name)?;
+                return Ok(RecoveryItemOutcome::Quarantined {
+                    partial_name: partial_name.to_owned(),
+                    quarantine_name: q_name,
+                    reason: format!("session_id {} already exists in catalog", meta.session_id),
+                });
+            }
+        }
+
+        let manifest_path = partial_path.join("manifest.json");
+        write_bytes_atomic(&manifest_path, &manifest_bytes, 0o640, true).map_err(|err| {
+            StorageError::io(
+                "recovery_manifest_write",
+                "write recovered manifest.json",
+                err,
+            )
+        })?;
+        let _ = fsync_directory(partial_path);
+
+        let (moved_strays, _tail_dir) =
+            quarantine_fmp4_stray_files(&self.paths.quarantine_dir(), partial_path, partial_name)?;
+        let discarded_tail_files =
+            moved_strays.saturating_add(usize::from(scan.truncated_tail_bytes > 0));
+
+        let relative_dir = publish_staging_directory(&self.paths, partial_path, &meta.started_at)?;
+        let final_root = self.paths.recordings_dir().join(&relative_dir);
+        if let Some(catalog) = &self.catalog {
+            let admit_res: StorageResult<()> = (|| {
+                let mut indexed = crate::catalog::parse_indexed_session_from_manifest(
+                    &relative_dir,
+                    &manifest_value,
+                    &manifest_sha256,
+                )?;
+                let build_sha256 = sha256_hex(
+                    format!("miro-ego:{}:{}", meta.software_version, meta.commit).as_bytes(),
+                );
+                indexed.verification = Some(crate::catalog::GatewayVerification {
+                    actor: "gateway".to_owned(),
+                    validator: crate::catalog::GatewayValidatorInfo {
+                        name: "miro-ego".to_owned(),
+                        version: meta.software_version.clone(),
+                        build_sha256,
+                    },
+                    manifest_sha256: manifest_sha256.clone(),
+                    verified_at: now.clone(),
+                    verdict: "usable".to_owned(),
+                    diagnostics: Vec::new(),
+                });
+                catalog.admit_indexed_session(indexed)
+            })();
+
+            if let Err(post_err) = admit_res {
+                if is_transient_storage_error(&post_err) {
+                    if fs::rename(&final_root, partial_path).is_ok() {
+                        cleanup_empty_date_parent(&self.paths.recordings_dir(), &final_root);
+                        return Ok(RecoveryItemOutcome::Deferred {
+                            partial_name: partial_name.to_owned(),
+                            reason: post_err.to_string(),
+                        });
+                    }
+                    return Err(post_err);
+                }
+                let q_name =
+                    move_to_quarantine(&self.paths.quarantine_dir(), &final_root, partial_name)?;
+                cleanup_empty_date_parent(&self.paths.recordings_dir(), &final_root);
+                return Ok(RecoveryItemOutcome::Quarantined {
+                    partial_name: partial_name.to_owned(),
+                    quarantine_name: q_name,
+                    reason: post_err.to_string(),
+                });
+            }
+        }
+
+        if self.catalog.is_some() {
+            let _ = remove_control_markers_with_logs(&final_root, &[]);
+        } else {
+            remove_control_markers_with_logs(&final_root, &[])?;
+        }
+        let _ = fsync_directory(&final_root);
+
+        Ok(RecoveryItemOutcome::Recovered {
+            partial_name: partial_name.to_owned(),
+            session_id: meta.session_id,
+            relative_dir,
+            recovered_segments: scan.fragment_count as usize,
             discarded_tail_files,
         })
     }
@@ -2628,4 +2932,820 @@ fn parse_recording_encoding_value(val: &Value) -> Option<RecordingEncoding> {
 fn path_cstring(path: &Path) -> StorageResult<CString> {
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| StorageError::invalid_input("invalid_path", "path contains NUL byte"))
+}
+
+const MAX_FMP4_MOOV_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_FMP4_MOOF_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_FMP4_METT_SAMPLE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct PartialFmp4RecoveryScan {
+    codec: VideoCodec,
+    has_audio: bool,
+    timescale: u32,
+    audio_sample_rate: u32,
+    audio_channels: u16,
+    total_duration_ticks: u64,
+    fragment_count: u64,
+    frame_count: u64,
+    audio_sample_count: u64,
+    imu_sample_count: u64,
+    truncated_tail_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BoxHeader {
+    tag: [u8; 4],
+    header_size: u64,
+    total_size: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DurationFieldOffset {
+    file_offset: u64,
+    is_u64: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MoovLayout {
+    timescale: u32,
+    codec: VideoCodec,
+    has_audio: bool,
+    audio_sample_rate: u32,
+    audio_channels: u16,
+    num_tracks: usize,
+    meta_track_id: u32,
+    duration_fields: Vec<DurationFieldOffset>,
+}
+
+fn read_be_u16(bytes: &[u8]) -> Option<u16> {
+    bytes
+        .get(..2)
+        .and_then(|s| s.try_into().ok())
+        .map(u16::from_be_bytes)
+}
+
+fn read_be_u32(bytes: &[u8]) -> Option<u32> {
+    bytes
+        .get(..4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_be_bytes)
+}
+
+fn read_be_i32(bytes: &[u8]) -> Option<i32> {
+    bytes
+        .get(..4)
+        .and_then(|s| s.try_into().ok())
+        .map(i32::from_be_bytes)
+}
+
+fn read_be_u64(bytes: &[u8]) -> Option<u64> {
+    bytes
+        .get(..8)
+        .and_then(|s| s.try_into().ok())
+        .map(u64::from_be_bytes)
+}
+
+fn read_at_exact(
+    file: &File,
+    buf: &mut [u8],
+    offset: u64,
+    context: &'static str,
+) -> StorageResult<()> {
+    let mut done = 0_usize;
+    while done < buf.len() {
+        let off = i64::try_from(offset.saturating_add(done as u64)).map_err(|_| {
+            StorageError::integrity("recovery_fmp4_offset", "file offset exceeds i64::MAX")
+        })?;
+        let n = pread_retry(file.as_raw_fd(), &mut buf[done..], off)
+            .map_err(|err| StorageError::io("recovery_fmp4_read", context, err))?;
+        if n == 0 {
+            return Err(StorageError::integrity(
+                "recovery_fmp4_eof",
+                format!("unexpected EOF while reading {context}"),
+            ));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+fn read_box_header_at(file: &File, offset: u64, file_len: u64) -> StorageResult<Option<BoxHeader>> {
+    if offset.saturating_add(8) > file_len {
+        return Ok(None);
+    }
+    let mut hdr = [0_u8; 8];
+    read_at_exact(file, &mut hdr, offset, "read mp4 box header")?;
+    let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+    let tag = [hdr[4], hdr[5], hdr[6], hdr[7]];
+    let (header_size, total_size) = if size32 == 1 {
+        if offset.saturating_add(16) > file_len {
+            return Ok(None);
+        }
+        let mut ext = [0_u8; 8];
+        read_at_exact(file, &mut ext, offset + 8, "read mp4 ext box size")?;
+        (16_u64, u64::from_be_bytes(ext))
+    } else if size32 == 0 {
+        (8_u64, file_len.saturating_sub(offset))
+    } else {
+        (8_u64, u64::from(size32))
+    };
+    if total_size < header_size {
+        return Ok(None);
+    }
+    Ok(Some(BoxHeader {
+        tag,
+        header_size,
+        total_size,
+    }))
+}
+
+fn parse_slice_box_header(buf: &[u8], off: usize) -> Option<(usize, [u8; 4], usize, usize)> {
+    let hdr = buf.get(off..off.checked_add(8)?)?;
+    let size32 = read_be_u32(&hdr[..4])?;
+    let tag = [hdr[4], hdr[5], hdr[6], hdr[7]];
+    let (hdr_len, total_len) = if size32 == 1 {
+        let ext = buf.get(off + 8..off + 16)?;
+        let sz64 = read_be_u64(ext)?;
+        (16_usize, usize::try_from(sz64).ok()?)
+    } else if size32 == 0 {
+        (8_usize, buf.len().checked_sub(off)?)
+    } else {
+        (8_usize, usize::try_from(size32).ok()?)
+    };
+    if total_len < hdr_len || off.checked_add(total_len)? > buf.len() {
+        return None;
+    }
+    Some((hdr_len, tag, off + hdr_len, off + total_len))
+}
+
+fn find_child_box_ranges(
+    buf: &[u8],
+    start: usize,
+    end: usize,
+    target_tag: [u8; 4],
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut cur = start;
+    while cur < end {
+        let Some((_hdr, tag, payload_start, box_end)) = parse_slice_box_header(buf, cur) else {
+            break;
+        };
+        if box_end > end {
+            break;
+        }
+        if tag == target_tag {
+            out.push((payload_start, box_end));
+        }
+        if box_end <= cur {
+            break;
+        }
+        cur = box_end;
+    }
+    out
+}
+
+fn parse_moov_layout(moov_bytes: &[u8], moov_payload_file_off: u64) -> Option<MoovLayout> {
+    let mut duration_fields = Vec::new();
+    let mut timescale = 0_u32;
+
+    for (ps, pe) in find_child_box_ranges(moov_bytes, 0, moov_bytes.len(), *b"mvhd") {
+        let mvhd = moov_bytes.get(ps..pe)?;
+        let version = *mvhd.first()?;
+        if version == 0 && mvhd.len() >= 20 {
+            timescale = read_be_u32(&mvhd[12..16])?;
+            duration_fields.push(DurationFieldOffset {
+                file_offset: moov_payload_file_off + (ps as u64) + 16,
+                is_u64: false,
+            });
+        } else if version == 1 && mvhd.len() >= 32 {
+            timescale = read_be_u32(&mvhd[20..24])?;
+            duration_fields.push(DurationFieldOffset {
+                file_offset: moov_payload_file_off + (ps as u64) + 24,
+                is_u64: true,
+            });
+        }
+    }
+    if timescale == 0 {
+        return None;
+    }
+
+    for (mvs, mve) in find_child_box_ranges(moov_bytes, 0, moov_bytes.len(), *b"mvex") {
+        for (mes, mee) in find_child_box_ranges(moov_bytes, mvs, mve, *b"mehd") {
+            let mehd = moov_bytes.get(mes..mee)?;
+            let version = *mehd.first()?;
+            if version == 0 && mehd.len() >= 8 {
+                duration_fields.push(DurationFieldOffset {
+                    file_offset: moov_payload_file_off + (mes as u64) + 4,
+                    is_u64: false,
+                });
+            } else if version == 1 && mehd.len() >= 12 {
+                duration_fields.push(DurationFieldOffset {
+                    file_offset: moov_payload_file_off + (mes as u64) + 4,
+                    is_u64: true,
+                });
+            }
+        }
+    }
+
+    let mut codec: Option<VideoCodec> = None;
+    let mut has_audio = false;
+    let mut audio_sample_rate = timescale;
+    let mut audio_channels = 2_u16;
+    let mut meta_track_id = 0_u32;
+    let mut track_count = 0_usize;
+
+    for (ts, te) in find_child_box_ranges(moov_bytes, 0, moov_bytes.len(), *b"trak") {
+        let mut track_id = 0_u32;
+        for (tks, tke) in find_child_box_ranges(moov_bytes, ts, te, *b"tkhd") {
+            let tkhd = moov_bytes.get(tks..tke)?;
+            let version = *tkhd.first()?;
+            if version == 0 && tkhd.len() >= 24 {
+                track_id = read_be_u32(&tkhd[12..16])?;
+                duration_fields.push(DurationFieldOffset {
+                    file_offset: moov_payload_file_off + (tks as u64) + 20,
+                    is_u64: false,
+                });
+            } else if version == 1 && tkhd.len() >= 36 {
+                track_id = read_be_u32(&tkhd[20..24])?;
+                duration_fields.push(DurationFieldOffset {
+                    file_offset: moov_payload_file_off + (tks as u64) + 28,
+                    is_u64: true,
+                });
+            }
+        }
+        if track_id == 0 {
+            return None;
+        }
+        track_count += 1;
+        if usize::try_from(track_id).ok()? != track_count {
+            return None;
+        }
+
+        let mut handler = [0_u8; 4];
+        let mut found_sample_tag = [0_u8; 4];
+        for (mds, mde) in find_child_box_ranges(moov_bytes, ts, te, *b"mdia") {
+            for (hs, he) in find_child_box_ranges(moov_bytes, mds, mde, *b"hdlr") {
+                if let Some(h) = moov_bytes.get(hs..he).and_then(|s| s.get(8..12)) {
+                    handler.copy_from_slice(h);
+                }
+            }
+            for (mis, mie) in find_child_box_ranges(moov_bytes, mds, mde, *b"minf") {
+                for (sts, ste) in find_child_box_ranges(moov_bytes, mis, mie, *b"stbl") {
+                    for (sds, sde) in find_child_box_ranges(moov_bytes, sts, ste, *b"stsd") {
+                        let stsd = moov_bytes.get(sds..sde)?;
+                        if stsd.len() >= 16 {
+                            let entry_start = sds + 8;
+                            if let Some((_ehdr, etag, eps, epe)) =
+                                parse_slice_box_header(moov_bytes, entry_start)
+                            {
+                                found_sample_tag = etag;
+                                if etag == *b"fLaC" {
+                                    if let Some(flac) = moov_bytes.get(eps..epe) {
+                                        if flac.len() >= 28 {
+                                            audio_channels =
+                                                read_be_u16(&flac[16..18]).unwrap_or(2).max(1);
+                                            let sr_fixed = read_be_u32(&flac[24..28]).unwrap_or(0);
+                                            let sr = sr_fixed >> 16;
+                                            if (8_000..=384_000).contains(&sr) {
+                                                audio_sample_rate = sr;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        match &handler {
+            b"vide" => {
+                let detected = match &found_sample_tag {
+                    b"avc1" => VideoCodec::H264,
+                    b"hvc1" => VideoCodec::Hevc,
+                    _ => return None,
+                };
+                if let Some(prev) = codec {
+                    if prev != detected {
+                        return None;
+                    }
+                } else {
+                    codec = Some(detected);
+                }
+            }
+            b"soun" => {
+                if found_sample_tag != *b"fLaC" || track_id != 3 {
+                    return None;
+                }
+                has_audio = true;
+            }
+            b"meta" => {
+                if found_sample_tag != *b"mett" {
+                    return None;
+                }
+                meta_track_id = track_id;
+            }
+            _ => return None,
+        }
+    }
+
+    let expected_tracks = if has_audio { 4 } else { 3 };
+    if track_count != expected_tracks || meta_track_id != expected_tracks as u32 {
+        return None;
+    }
+
+    Some(MoovLayout {
+        timescale,
+        codec: codec?,
+        has_audio,
+        audio_sample_rate,
+        audio_channels,
+        num_tracks: expected_tracks,
+        meta_track_id,
+        duration_fields,
+    })
+}
+
+#[derive(Debug)]
+struct ParsedTraf {
+    track_id: u32,
+    base_dts: u64,
+    sample_count: u64,
+    total_duration: u64,
+    data_offset: i64,
+    sample_sizes: Vec<u32>,
+}
+
+fn parse_traf_box(traf_bytes: &[u8]) -> Option<ParsedTraf> {
+    let mut track_id = None;
+    let mut default_dur = 0_u32;
+    let mut default_size = 0_u32;
+    for (ts, te) in find_child_box_ranges(traf_bytes, 0, traf_bytes.len(), *b"tfhd") {
+        let tfhd = traf_bytes.get(ts..te)?;
+        if tfhd.len() < 8 {
+            return None;
+        }
+        let flags = u32::from_be_bytes([0, tfhd[1], tfhd[2], tfhd[3]]);
+        track_id = Some(read_be_u32(&tfhd[4..8])?);
+        let mut off = 8_usize;
+        if flags & 0x01 != 0 {
+            off = off.checked_add(8)?;
+        }
+        if flags & 0x02 != 0 {
+            off = off.checked_add(4)?;
+        }
+        if flags & 0x08 != 0 {
+            default_dur = read_be_u32(tfhd.get(off..off + 4)?)?;
+            off += 4;
+        }
+        if flags & 0x10 != 0 {
+            default_size = read_be_u32(tfhd.get(off..off + 4)?)?;
+        }
+    }
+
+    let mut base_dts = None;
+    for (ds, de) in find_child_box_ranges(traf_bytes, 0, traf_bytes.len(), *b"tfdt") {
+        let tfdt = traf_bytes.get(ds..de)?;
+        let version = *tfdt.first()?;
+        base_dts = if version == 0 && tfdt.len() >= 8 {
+            Some(u64::from(read_be_u32(&tfdt[4..8])?))
+        } else if version == 1 && tfdt.len() >= 12 {
+            read_be_u64(&tfdt[4..12])
+        } else {
+            None
+        };
+    }
+
+    let mut trun_parsed = None;
+    for (rs, re) in find_child_box_ranges(traf_bytes, 0, traf_bytes.len(), *b"trun") {
+        let trun = traf_bytes.get(rs..re)?;
+        if trun.len() < 8 {
+            return None;
+        }
+        let flags = u32::from_be_bytes([0, trun[1], trun[2], trun[3]]);
+        let sample_count = read_be_u32(&trun[4..8])?;
+        let mut off = 8_usize;
+        let data_offset = if flags & 0x01 != 0 {
+            let d = read_be_i32(trun.get(off..off + 4)?)?;
+            off += 4;
+            i64::from(d)
+        } else {
+            0
+        };
+        if flags & 0x04 != 0 {
+            off = off.checked_add(4)?;
+        }
+        let mut sample_sizes = Vec::with_capacity((sample_count as usize).min(65536));
+        let mut total_duration = 0_u64;
+        for _ in 0..sample_count {
+            let dur = if flags & 0x100 != 0 {
+                let d = read_be_u32(trun.get(off..off + 4)?)?;
+                off += 4;
+                d
+            } else {
+                default_dur
+            };
+            let sz = if flags & 0x200 != 0 {
+                let s = read_be_u32(trun.get(off..off + 4)?)?;
+                off += 4;
+                s
+            } else {
+                default_size
+            };
+            if flags & 0x400 != 0 {
+                off = off.checked_add(4)?;
+            }
+            if flags & 0x800 != 0 {
+                off = off.checked_add(4)?;
+            }
+            total_duration = total_duration.checked_add(u64::from(dur))?;
+            sample_sizes.push(sz);
+        }
+        trun_parsed = Some((
+            u64::from(sample_count),
+            total_duration,
+            data_offset,
+            sample_sizes,
+        ));
+    }
+
+    let (sample_count, total_duration, data_offset, sample_sizes) = trun_parsed?;
+    Some(ParsedTraf {
+        track_id: track_id?,
+        base_dts: base_dts?,
+        sample_count,
+        total_duration,
+        data_offset,
+        sample_sizes,
+    })
+}
+
+fn build_mfra_bytes(mfra_entries: [&[(u64, u64)]; 2]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mfra_pos = out.len();
+    out.extend_from_slice(&0_u32.to_be_bytes());
+    out.extend_from_slice(b"mfra");
+
+    for (idx, entries) in mfra_entries.iter().enumerate() {
+        let track_id = (idx as u32) + 1;
+        let tfra_pos = out.len();
+        out.extend_from_slice(&0_u32.to_be_bytes());
+        out.extend_from_slice(b"tfra");
+        out.extend_from_slice(&0x0100_0000_u32.to_be_bytes());
+        out.extend_from_slice(&track_id.to_be_bytes());
+        out.extend_from_slice(&0_u32.to_be_bytes());
+        out.extend_from_slice(&(u32::try_from(entries.len()).ok()?).to_be_bytes());
+        for &(time, moof_off) in *entries {
+            out.extend_from_slice(&time.to_be_bytes());
+            out.extend_from_slice(&moof_off.to_be_bytes());
+            out.push(1);
+            out.push(1);
+            out.push(1);
+        }
+        let tfra_sz = u32::try_from(out.len() - tfra_pos).ok()?;
+        out[tfra_pos..tfra_pos + 4].copy_from_slice(&tfra_sz.to_be_bytes());
+    }
+
+    out.extend_from_slice(&16_u32.to_be_bytes());
+    out.extend_from_slice(b"mfro");
+    out.extend_from_slice(&0_u32.to_be_bytes());
+    let total_sz = u32::try_from(out.len() + 4 - mfra_pos).ok()?;
+    out.extend_from_slice(&total_sz.to_be_bytes());
+    out[mfra_pos..mfra_pos + 4].copy_from_slice(&total_sz.to_be_bytes());
+    Some(out)
+}
+
+fn scan_and_repair_partial_fmp4(
+    session_mp4_path: &Path,
+) -> StorageResult<Option<PartialFmp4RecoveryScan>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(session_mp4_path)
+        .map_err(|err| {
+            StorageError::io("recovery_fmp4_open", "open session.mp4 for repair", err)
+        })?;
+
+    let meta = file
+        .metadata()
+        .map_err(|err| StorageError::io("recovery_fmp4_stat", "stat session.mp4", err))?;
+    let file_len = meta.len();
+    if file_len < 16 {
+        return Ok(None);
+    }
+
+    let Some(ftyp) = read_box_header_at(&file, 0, file_len)? else {
+        return Ok(None);
+    };
+    if &ftyp.tag != b"ftyp" || ftyp.total_size > file_len {
+        return Ok(None);
+    }
+    let moov_off = ftyp.total_size;
+    let Some(moov_hdr) = read_box_header_at(&file, moov_off, file_len)? else {
+        return Ok(None);
+    };
+    if &moov_hdr.tag != b"moov"
+        || moov_off.saturating_add(moov_hdr.total_size) > file_len
+        || moov_hdr.total_size > MAX_FMP4_MOOV_BYTES
+    {
+        return Ok(None);
+    }
+    let moov_payload_len = usize::try_from(moov_hdr.total_size - moov_hdr.header_size)
+        .map_err(|_| StorageError::integrity("recovery_fmp4_invalid", "moov size overflow"))?;
+    let mut moov_bytes = vec![0_u8; moov_payload_len];
+    let moov_payload_off = moov_off + moov_hdr.header_size;
+    read_at_exact(&file, &mut moov_bytes, moov_payload_off, "read moov box")?;
+
+    let Some(layout) = parse_moov_layout(&moov_bytes, moov_payload_off) else {
+        return Ok(None);
+    };
+
+    let mut pos = moov_off + moov_hdr.total_size;
+    let mut last_valid_end = 0_u64;
+    let mut total_duration_ticks = 0_u64;
+    let mut fragment_count = 0_u64;
+    let mut frame_count = 0_u64;
+    let mut audio_sample_count = 0_u64;
+    let mut imu_sample_count = 0_u64;
+    let mut track1_mfra: Vec<(u64, u64)> = Vec::new();
+    let mut track2_mfra: Vec<(u64, u64)> = Vec::new();
+
+    while pos < file_len {
+        let Some(moof_hdr) = read_box_header_at(&file, pos, file_len)? else {
+            break;
+        };
+        if &moof_hdr.tag == b"mfra" || &moof_hdr.tag != b"moof" {
+            break;
+        }
+        let Some(moof_end) = pos.checked_add(moof_hdr.total_size) else {
+            break;
+        };
+        if moof_end > file_len || moof_hdr.total_size > MAX_FMP4_MOOF_BYTES {
+            break;
+        }
+        let Some(mdat_hdr) = read_box_header_at(&file, moof_end, file_len)? else {
+            break;
+        };
+        if &mdat_hdr.tag != b"mdat" {
+            break;
+        }
+        let Some(mdat_end) = moof_end.checked_add(mdat_hdr.total_size) else {
+            break;
+        };
+        if mdat_end > file_len {
+            break;
+        }
+        let mdat_payload_start = moof_end + mdat_hdr.header_size;
+
+        let Ok(moof_payload_len) = usize::try_from(moof_hdr.total_size - moof_hdr.header_size)
+        else {
+            break;
+        };
+        let mut moof_bytes = vec![0_u8; moof_payload_len];
+        read_at_exact(
+            &file,
+            &mut moof_bytes,
+            pos + moof_hdr.header_size,
+            "read moof box",
+        )?;
+
+        let traf_ranges = find_child_box_ranges(&moof_bytes, 0, moof_bytes.len(), *b"traf");
+        if traf_ranges.len() != layout.num_tracks {
+            break;
+        }
+        let mut trafs: Vec<Option<ParsedTraf>> = (0..layout.num_tracks).map(|_| None).collect();
+        let mut parse_ok = true;
+        for (ts, te) in traf_ranges {
+            let Some(pt) = parse_traf_box(&moof_bytes[ts..te]) else {
+                parse_ok = false;
+                break;
+            };
+            let idx = pt.track_id.saturating_sub(1) as usize;
+            if idx >= layout.num_tracks || trafs[idx].is_some() {
+                parse_ok = false;
+                break;
+            }
+            trafs[idx] = Some(pt);
+        }
+        if !parse_ok || trafs.iter().any(Option::is_none) {
+            break;
+        }
+
+        let Some(t0) = trafs[0].as_ref() else {
+            break;
+        };
+        let Some(t1) = trafs[1].as_ref() else {
+            break;
+        };
+        let frag_dur = t0.total_duration;
+        if frag_dur == 0 || t0.sample_count == 0 || t1.sample_count != t0.sample_count {
+            break;
+        }
+        if !trafs
+            .iter()
+            .flatten()
+            .all(|tr| tr.total_duration == frag_dur)
+        {
+            break;
+        }
+
+        let mut payload_bounds_ok = true;
+        let mut frag_imu_count = 0_u64;
+        for tr in trafs.iter().flatten() {
+            let Ok(start_i128) = i128::from(pos)
+                .checked_add(i128::from(tr.data_offset))
+                .ok_or(())
+            else {
+                payload_bounds_ok = false;
+                break;
+            };
+            let Ok(mut cur) = u64::try_from(start_i128) else {
+                payload_bounds_ok = false;
+                break;
+            };
+            if cur < mdat_payload_start {
+                payload_bounds_ok = false;
+                break;
+            }
+            for &sz in &tr.sample_sizes {
+                let Some(sample_end) = cur.checked_add(u64::from(sz)) else {
+                    payload_bounds_ok = false;
+                    break;
+                };
+                if sample_end > mdat_end {
+                    payload_bounds_ok = false;
+                    break;
+                }
+                if tr.track_id == layout.meta_track_id {
+                    let s_len = sz as usize;
+                    if s_len == 0 || s_len > MAX_FMP4_METT_SAMPLE_BYTES {
+                        payload_bounds_ok = false;
+                        break;
+                    }
+                    let mut sample_buf = vec![0_u8; s_len];
+                    read_at_exact(&file, &mut sample_buf, cur, "read mett metadata sample")?;
+                    let Ok(val) = serde_json::from_slice::<Value>(&sample_buf) else {
+                        payload_bounds_ok = false;
+                        break;
+                    };
+                    if let Some(arr) = val.get("imu").and_then(Value::as_array) {
+                        frag_imu_count = frag_imu_count.saturating_add(arr.len() as u64);
+                    }
+                }
+                cur = sample_end;
+            }
+            if !payload_bounds_ok {
+                break;
+            }
+        }
+        if !payload_bounds_ok {
+            break;
+        }
+
+        track1_mfra.push((t0.base_dts, pos));
+        track2_mfra.push((t1.base_dts, pos));
+        total_duration_ticks = total_duration_ticks.saturating_add(frag_dur);
+        fragment_count = fragment_count.saturating_add(1);
+        frame_count = frame_count.saturating_add(t0.sample_count);
+        if layout.has_audio {
+            audio_sample_count = audio_sample_count.saturating_add(frag_dur);
+        }
+        imu_sample_count = imu_sample_count.saturating_add(frag_imu_count);
+        last_valid_end = mdat_end;
+        pos = mdat_end;
+    }
+
+    if fragment_count == 0 || frame_count == 0 || last_valid_end == 0 {
+        return Ok(None);
+    }
+
+    let truncated_tail_bytes = file_len.saturating_sub(last_valid_end);
+    file.set_len(last_valid_end).map_err(|err| {
+        StorageError::io("recovery_fmp4_truncate", "truncate session.mp4 tail", err)
+    })?;
+
+    let mfra_bytes = build_mfra_bytes([&track1_mfra, &track2_mfra]).ok_or_else(|| {
+        StorageError::integrity("recovery_fmp4_mfra", "failed to construct mfra index box")
+    })?;
+    file.seek(SeekFrom::Start(last_valid_end))
+        .map_err(|err| StorageError::io("recovery_fmp4_seek", "seek to mfra write offset", err))?;
+    file.write_all(&mfra_bytes)
+        .map_err(|err| StorageError::io("recovery_fmp4_write", "write mfra box", err))?;
+
+    for field in &layout.duration_fields {
+        file.seek(SeekFrom::Start(field.file_offset))
+            .map_err(|err| {
+                StorageError::io("recovery_fmp4_seek", "seek to moov duration offset", err)
+            })?;
+        if field.is_u64 {
+            file.write_all(&total_duration_ticks.to_be_bytes())
+                .map_err(|err| {
+                    StorageError::io("recovery_fmp4_write", "patch u64 duration", err)
+                })?;
+        } else {
+            let d32 =
+                u32::try_from(total_duration_ticks.min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
+            file.write_all(&d32.to_be_bytes()).map_err(|err| {
+                StorageError::io("recovery_fmp4_write", "patch u32 duration", err)
+            })?;
+        }
+    }
+
+    file.sync_data().map_err(|err| {
+        StorageError::io("recovery_fmp4_fsync", "fsync repaired session.mp4", err)
+    })?;
+
+    Ok(Some(PartialFmp4RecoveryScan {
+        codec: layout.codec,
+        has_audio: layout.has_audio,
+        timescale: layout.timescale,
+        audio_sample_rate: layout.audio_sample_rate,
+        audio_channels: layout.audio_channels,
+        total_duration_ticks,
+        fragment_count,
+        frame_count,
+        audio_sample_count,
+        imu_sample_count,
+        truncated_tail_bytes,
+    }))
+}
+
+fn collect_fmp4_stray_files(partial_path: &Path) -> StorageResult<Vec<(PathBuf, String)>> {
+    let mut stray_files = Vec::new();
+    for entry in fs::read_dir(partial_path)
+        .map_err(|err| StorageError::io("recovery_readdir", "readdir fmp4 staging root", err))?
+        .flatten()
+    {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name == "session.mp4"
+            || name == "manifest.json"
+            || RECOVERY_CONTROL_FILES.contains(&name.as_str())
+        {
+            continue;
+        }
+        let path = entry.path();
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+            for sub in fs::read_dir(&path)
+                .map_err(|err| {
+                    StorageError::io("recovery_readdir", "readdir fmp4 stray subdir", err)
+                })?
+                .flatten()
+            {
+                if let Ok(sname) = sub.file_name().into_string() {
+                    if !(name == "audio" && is_audio_checkpoint_control_name(&sname)) {
+                        stray_files.push((sub.path(), format!("{name}_{sname}")));
+                    }
+                }
+            }
+        } else {
+            stray_files.push((path, name));
+        }
+    }
+    Ok(stray_files)
+}
+
+fn count_fmp4_stray_files(partial_path: &Path) -> StorageResult<usize> {
+    Ok(collect_fmp4_stray_files(partial_path)?.len())
+}
+
+fn quarantine_fmp4_stray_files(
+    quarantine_root: &Path,
+    partial_path: &Path,
+    partial_name: &str,
+) -> StorageResult<(usize, Option<PathBuf>)> {
+    let stray_files = collect_fmp4_stray_files(partial_path)?;
+    if stray_files.is_empty() {
+        return Ok((0, None));
+    }
+    fs::create_dir_all(quarantine_root)
+        .map_err(|err| StorageError::io("quarantine_dir_create", "create quarantine root", err))?;
+    let tail_dir_name =
+        allocate_unique_child_dir(quarantine_root, &format!("{partial_name}-tail"))?;
+    let tail_dir = quarantine_root.join(tail_dir_name);
+    let mut moved = 0_usize;
+    for (src, flat_name) in stray_files {
+        let dst = tail_dir.join(flat_name);
+        fs::rename(&src, &dst).map_err(|err| {
+            StorageError::io(
+                "quarantine_tail_move_failed",
+                format!("move stray fmp4 file {}", src.display()),
+                err,
+            )
+        })?;
+        moved += 1;
+    }
+    for leftover_dir in ["video", "audio", "logs"] {
+        let d = partial_path.join(leftover_dir);
+        if d.is_dir() {
+            let _ = fs::remove_dir(&d);
+        }
+    }
+    let _ = fsync_directory(&tail_dir);
+    let _ = fsync_directory(quarantine_root);
+    Ok((moved, Some(tail_dir)))
 }

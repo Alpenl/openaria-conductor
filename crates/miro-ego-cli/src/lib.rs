@@ -11,3 +11,7 @@ pub mod runtime;
 /// Embedded `miro-ego.device-session.v1` JSON Schema used by `miro-ego validate`.
 pub const DEVICE_SESSION_V1_SCHEMA: &str =
     include_str!("../../../contracts/schemas/miro-ego-device-session-v1.schema.json");
+
+/// Embedded `miro-ego.device-session.v2` JSON Schema used by `miro-ego validate`.
+pub const DEVICE_SESSION_V2_SCHEMA: &str =
+    include_str!("../../../contracts/schemas/miro-ego-device-session-v2.schema.json");

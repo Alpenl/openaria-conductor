@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Completed stereo MP4 segment reported by `miro-ego-encoder` on `stdout`.
+/// Completed stereo MP4 segment reported by legacy segmented `miro-ego-encoder` on `stdout`.
 ///
 /// Includes optional streaming `left_sha256` / `right_sha256` digests computed while
 /// segment bytes are written so session sealing skips rereading the MP4 segments.
@@ -17,4 +17,28 @@ pub struct SegmentEvent {
     pub right_path: String,
     pub right_bytes: u64,
     pub right_sha256: Option<String>,
+}
+
+/// Completed atomic multi-track fMP4 fragment reported by `miro-ego-encoder` on `stdout`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FragmentEvent {
+    pub index: u64,
+    pub start_frame: u64,
+    pub end_frame: u64,
+    pub duration_ticks: u64,
+    pub bytes: u64,
+}
+
+/// Finalized single-container `session.mp4` summary emitted by `miro-ego-encoder` on `stdout`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedMediaEvent {
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub frames: u64,
+    pub fragments: u64,
+    pub duration_ticks: u64,
+    pub timescale: u32,
+    pub audio_samples: u64,
+    pub imu_samples: u64,
 }

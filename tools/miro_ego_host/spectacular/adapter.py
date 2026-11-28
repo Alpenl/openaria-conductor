@@ -11,6 +11,7 @@ import math
 import os
 import re
 import stat
+import struct
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Literal
 
 DEVICE_SESSION_SCHEMA = "miro-ego.device-session.v1"
+DEVICE_SESSION_V2_SCHEMA = "miro-ego.device-session.v2"
+DEVICE_SESSION_SCHEMAS = (DEVICE_SESSION_SCHEMA, DEVICE_SESSION_V2_SCHEMA)
 FRAME_INDEX_SCHEMA = "miro-ego.frame-index.v1"
 FRAME_TIMESTAMP_AUDIT_SCHEMA = "miro-ego.frame-timestamp-audit.v1"
 IMU_SAMPLE_FORMAT = "miro-ego.imu.v1"
@@ -70,6 +73,7 @@ class CaptureVideo:
     container: str = "mp4"
     layout: str = "split-eyes"
     segments: tuple[CaptureVideoSegment, ...] = ()
+    media_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -940,31 +944,35 @@ def _normalize_device_imu(
 
 def _validate_manifest_metadata(manifest: dict[str, Any]) -> str:
     schema = manifest.get("schema")
-    if schema != DEVICE_SESSION_SCHEMA:
+    if schema not in DEVICE_SESSION_SCHEMAS:
         raise CaptureValidationError(f"unsupported Device Session schema: {schema!r}")
+
+    required_keys = {
+        "schema",
+        "manifest_id",
+        "sealed",
+        "sealed_at",
+        "session_id",
+        "volume_id",
+        "capture_mode",
+        "display_name",
+        "device",
+        "time",
+        "take",
+        "camera",
+        "video",
+        "imu",
+        "frames",
+        "audio",
+        "logs",
+        "integrity",
+    }
+    if schema == DEVICE_SESSION_V2_SCHEMA:
+        required_keys.add("media")
 
     _ensure_keys(
         manifest,
-        required={
-            "schema",
-            "manifest_id",
-            "sealed",
-            "sealed_at",
-            "session_id",
-            "volume_id",
-            "capture_mode",
-            "display_name",
-            "device",
-            "time",
-            "take",
-            "camera",
-            "video",
-            "imu",
-            "frames",
-            "audio",
-            "logs",
-            "integrity",
-        },
+        required=required_keys,
         optional={"capture_audit"},
         label="Device Session manifest",
     )
@@ -1007,8 +1015,15 @@ def _validate_manifest_metadata(manifest: dict[str, Any]) -> str:
         label="time",
     )
     _number(time_block["duration_seconds"], "time.duration_seconds", non_negative=True)
-    if "duration_clock" in time_block and time_block["duration_clock"] != "host_monotonic":
-        raise CaptureValidationError("time.duration_clock must be 'host_monotonic'")
+    allowed_clocks = (
+        {"host_monotonic", "audio_hardware_samples"}
+        if schema == DEVICE_SESSION_V2_SCHEMA
+        else {"host_monotonic"}
+    )
+    if "duration_clock" in time_block and time_block["duration_clock"] not in allowed_clocks:
+        raise CaptureValidationError(
+            f"time.duration_clock {time_block['duration_clock']!r} invalid"
+        )
 
     take = _mapping(manifest["take"], "take")
     _ensure_keys(take, required={"take_id", "sequence", "continuation_of"}, label="take")
@@ -1105,6 +1120,274 @@ def _validate_video_encoding(encoding_raw: object, *, video_codec: str) -> None:
         raise CaptureValidationError(f"unsupported video.encoding.rate_control: {rc!r}")
 
 
+def _iter_slice_child_boxes(
+    data: bytes, start: int = 0, end: int | None = None
+) -> Iterator[tuple[bytes, int, int]]:
+    limit = len(data) if end is None else end
+    cur = start
+    while cur + 8 <= limit:
+        sz32, tag = struct.unpack_from(">I4s", data, cur)
+        if sz32 == 1:
+            if cur + 16 > limit:
+                break
+            sz = struct.unpack_from(">Q", data, cur + 8)[0]
+            hdr = 16
+        elif sz32 == 0:
+            sz = limit - cur
+            hdr = 8
+        else:
+            sz = sz32
+            hdr = 8
+        if sz < hdr or cur + sz > limit:
+            break
+        yield tag, cur + hdr, cur + sz
+        cur += sz
+
+
+def _read_stream_box_header(
+    stream: BinaryIO, pos: int, file_len: int
+) -> tuple[bytes, int, int] | None:
+    if pos + 8 > file_len:
+        return None
+    stream.seek(pos)
+    hdr_bytes = stream.read(8)
+    if len(hdr_bytes) != 8:
+        raise CaptureValidationError("short read reading ISO-BMFF box header")
+    sz32, tag = struct.unpack(">I4s", hdr_bytes)
+    if sz32 == 1:
+        if pos + 16 > file_len:
+            raise CaptureValidationError("truncated extended ISO-BMFF box header")
+        ext = stream.read(8)
+        if len(ext) != 8:
+            raise CaptureValidationError("short read reading extended ISO-BMFF box size")
+        total = struct.unpack(">Q", ext)[0]
+        hdr = 16
+    elif sz32 == 0:
+        total = file_len - pos
+        hdr = 8
+    else:
+        total = sz32
+        hdr = 8
+    if total < hdr or pos + total > file_len:
+        raise CaptureValidationError("truncated ISO-BMFF box payload")
+    return tag, hdr, total
+
+
+def _parse_fmp4_mett_metadata(
+    mp4_path: Path,
+    *,
+    expected_meta_track_id: int,
+    frame_decimation: int,
+) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+    with open_regular(mp4_path, label="media.session") as stream:
+        file_len = os.fstat(stream.fileno()).st_size
+        pos = 0
+        ftyp = _read_stream_box_header(stream, pos, file_len)
+        if ftyp is None or ftyp[0] != b"ftyp":
+            raise CaptureValidationError("session.mp4 must start with ftyp box")
+        pos += ftyp[2]
+
+        moov = _read_stream_box_header(stream, pos, file_len)
+        if moov is None or moov[0] != b"moov" or moov[2] > MAX_MANIFEST_BYTES:
+            raise CaptureValidationError("session.mp4 missing valid moov box")
+        stream.seek(pos + moov[1])
+        moov_bytes = stream.read(moov[2] - moov[1])
+        pos += moov[2]
+
+        track_handlers: dict[int, bytes] = {}
+        for ctag, cs, ce in _iter_slice_child_boxes(moov_bytes):
+            if ctag != b"trak":
+                continue
+            tid: int | None = None
+            handler: bytes | None = None
+            for ttag, ts, te in _iter_slice_child_boxes(moov_bytes, cs, ce):
+                if ttag == b"tkhd" and te - ts >= 16:
+                    ver = moov_bytes[ts]
+                    tid = struct.unpack_from(">I", moov_bytes, ts + (20 if ver == 1 else 12))[0]
+                elif ttag == b"mdia":
+                    for mtag, ms, me in _iter_slice_child_boxes(moov_bytes, ts, te):
+                        if mtag == b"hdlr" and me - ms >= 12:
+                            handler = moov_bytes[ms + 8 : ms + 12]
+            if tid is not None and handler is not None:
+                track_handlers[tid] = handler
+        if (
+            track_handlers.get(1) != b"vide"
+            or track_handlers.get(2) != b"vide"
+            or track_handlers.get(expected_meta_track_id) != b"meta"
+        ):
+            raise CaptureValidationError("session.mp4 moov track layout does not match v2 schema")
+
+        frames: list[dict[str, Any]] = []
+        imu_samples: list[dict[str, Any]] = []
+        prev_host = -1
+        prev_vseq: int | None = None
+        frag_idx = 0
+
+        while pos < file_len:
+            hdr = _read_stream_box_header(stream, pos, file_len)
+            if hdr is None:
+                break
+            tag, hlen, total = hdr
+            if tag == b"mfra":
+                if pos + total != file_len:
+                    raise CaptureValidationError("session.mp4 contains trailing data after mfra")
+                break
+            if tag != b"moof" or total > MAX_MANIFEST_BYTES:
+                raise CaptureValidationError(f"session.mp4 unexpected top-level box {tag!r}")
+            moof_off = pos
+            stream.seek(moof_off + hlen)
+            moof_bytes = stream.read(total - hlen)
+            pos = moof_off + total
+
+            mdat = _read_stream_box_header(stream, pos, file_len)
+            if mdat is None or mdat[0] != b"mdat":
+                raise CaptureValidationError("session.mp4 moof not followed by mdat")
+            mdat_payload_start = pos + mdat[1]
+            mdat_end = pos + mdat[2]
+            pos = mdat_end
+
+            meta_slices: list[tuple[int, int]] | None = None
+            for traf_tag, ts, te in _iter_slice_child_boxes(moof_bytes):
+                if traf_tag != b"traf":
+                    continue
+                tid = None
+                def_dur = 0
+                def_size = 0
+                trun_entry: tuple[int, list[int]] | None = None
+                for btag, bs, be in _iter_slice_child_boxes(moof_bytes, ts, te):
+                    if btag == b"tfhd" and be - bs >= 8:
+                        flags = int.from_bytes(moof_bytes[bs + 1 : bs + 4], "big")
+                        tid = struct.unpack_from(">I", moof_bytes, bs + 4)[0]
+                        off = bs + 8
+                        if flags & 0x01:
+                            off += 8
+                        if flags & 0x02:
+                            off += 4
+                        if flags & 0x08 and off + 4 <= be:
+                            def_dur = struct.unpack_from(">I", moof_bytes, off)[0]
+                            off += 4
+                        if flags & 0x10 and off + 4 <= be:
+                            def_size = struct.unpack_from(">I", moof_bytes, off)[0]
+                    elif btag == b"trun" and be - bs >= 8:
+                        flags = int.from_bytes(moof_bytes[bs + 1 : bs + 4], "big")
+                        sample_count = struct.unpack_from(">I", moof_bytes, bs + 4)[0]
+                        off = bs + 8
+                        data_offset = 0
+                        if flags & 0x01:
+                            data_offset = struct.unpack_from(">i", moof_bytes, off)[0]
+                            off += 4
+                        if flags & 0x04:
+                            off += 4
+                        sizes: list[int] = []
+                        for _ in range(sample_count):
+                            if flags & 0x100:
+                                _ = def_dur
+                                off += 4
+                            if flags & 0x200:
+                                sz = struct.unpack_from(">I", moof_bytes, off)[0]
+                                off += 4
+                            else:
+                                sz = def_size
+                            if flags & 0x400:
+                                off += 4
+                            if flags & 0x800:
+                                off += 4
+                            sizes.append(sz)
+                        trun_entry = (data_offset, sizes)
+                if tid == expected_meta_track_id and trun_entry is not None:
+                    cur = moof_off + trun_entry[0]
+                    meta_slices = []
+                    for sz in trun_entry[1]:
+                        if (
+                            cur < mdat_payload_start
+                            or cur + sz > mdat_end
+                            or sz > MAX_NDJSON_LINE_BYTES
+                        ):
+                            raise CaptureValidationError(
+                                "session.mp4 mett sample offset out of bounds"
+                            )
+                        meta_slices.append((cur, sz))
+                        cur += sz
+                    break
+
+            if not meta_slices:
+                raise CaptureValidationError("session.mp4 fragment missing mett metadata samples")
+
+            for seg_frame, (soff, ssz) in enumerate(meta_slices):
+                stream.seek(soff)
+                raw_json = stream.read(ssz)
+                if len(raw_json) != ssz:
+                    raise CaptureValidationError("short read reading session.mp4 mett sample")
+                rec = _mapping(_loads_json(raw_json, "mett sample"), "mett sample")
+                fidx = _integer(rec["seq"], "mett.seq")
+                vseq = _integer(rec["vseq"], "mett.vseq")
+                mono_ns = _integer(rec["mono_ns"], "mett.mono_ns", minimum=1)
+                expected_idx = len(frames)
+                if fidx != expected_idx or mono_ns <= prev_host:
+                    raise CaptureValidationError(
+                        f"session.mp4 mett frame {expected_idx} order or timestamp is invalid"
+                    )
+                if prev_vseq is not None and vseq != prev_vseq + frame_decimation:
+                    raise CaptureValidationError(
+                        f"session.mp4 source sequence gap: {prev_vseq} -> {vseq}"
+                    )
+                frames.append(
+                    {
+                        "frame_index": fidx,
+                        "uvc_sequence": vseq,
+                        "callback_monotonic_ns": mono_ns,
+                        "segment_index": frag_idx,
+                        "segment_frame": seg_frame,
+                        "source": dict(rec),
+                    }
+                )
+                prev_host = mono_ns
+                prev_vseq = vseq
+
+                raw_imu = rec.get("imu", [])
+                if not isinstance(raw_imu, list):
+                    raise CaptureValidationError("mett.imu must be a list")
+                for entry in raw_imu:
+                    if not isinstance(entry, list) or len(entry) != 7:
+                        raise CaptureValidationError("mett.imu entry must have 7 integers")
+                    ts = _integer(entry[0], "mett.imu[0]", minimum=1)
+                    ax = _integer(entry[1], "mett.imu[1]", minimum=-32768, maximum=32767)
+                    ay = _integer(entry[2], "mett.imu[2]", minimum=-32768, maximum=32767)
+                    az = _integer(entry[3], "mett.imu[3]", minimum=-32768, maximum=32767)
+                    gx = _integer(entry[4], "mett.imu[4]", minimum=-32768, maximum=32767)
+                    gy = _integer(entry[5], "mett.imu[5]", minimum=-32768, maximum=32767)
+                    gz = _integer(entry[6], "mett.imu[6]", minimum=-32768, maximum=32767)
+                    snum = len(imu_samples)
+                    imu_samples.append(
+                        {
+                            "sample_number": snum,
+                            "sample_index": snum % 2,
+                            "packet_sequence": snum // 2,
+                            "samples_in_packet": 2,
+                            "device_timestamp_raw": None,
+                            "device_ticks": None,
+                            "host_read_start_ns": ts,
+                            "host_read_end_ns": ts,
+                            "host_monotonic_ns": ts,
+                            "accel_raw": [ax, ay, az],
+                            "gyro_raw": [gx, gy, gz],
+                            "source": {
+                                "host_monotonic_ns": ts,
+                                "raw": {
+                                    "accelerometer": [ax, ay, az],
+                                    "gyroscope": [gx, gy, gz],
+                                },
+                                "sync": {},
+                            },
+                        }
+                    )
+            frag_idx += 1
+
+    if not frames:
+        raise CaptureValidationError("session.mp4 contains zero mett frames")
+    return tuple(frames), tuple(imu_samples)
+
+
 def _load_device_session(
     root: Path,
     manifest: dict[str, Any],
@@ -1112,18 +1395,38 @@ def _load_device_session(
     max_rate_error_ppm: float = MAX_RATE_ERROR_PPM,
 ) -> LoadedCapture:
     session_id = _validate_manifest_metadata(manifest)
+    schema = manifest["schema"]
+    is_v2 = schema == DEVICE_SESSION_V2_SCHEMA
 
     video = _mapping(manifest["video"], "Device Session video")
-    _ensure_keys(
-        video,
-        required={"layout", "codec", "container", "segments", "encoding"},
-        label="Device Session video",
-    )
-    if video["layout"] != "split-eyes":
-        raise CaptureValidationError("calibration Device Session must use split-eyes video")
+    if is_v2:
+        _ensure_keys(
+            video,
+            required={"layout", "codec", "container", "frame_count", "tracks", "encoding"},
+            label="Device Session video",
+        )
+        if video["layout"] != "split-eyes" or video["container"] != "fmp4":
+            raise CaptureValidationError("calibration v2 Device Session must use split-eyes fmp4")
+        tracks = _mapping(video["tracks"], "video.tracks")
+        _ensure_keys(tracks, required={"left_track_id", "right_track_id"}, label="video.tracks")
+        if tracks["left_track_id"] != 1 or tracks["right_track_id"] != 2:
+            raise CaptureValidationError("video.tracks must declare track IDs 1 and 2")
+        v2_video_frames = _integer(video["frame_count"], "video.frame_count", minimum=1)
+    else:
+        _ensure_keys(
+            video,
+            required={"layout", "codec", "container", "segments", "encoding"},
+            label="Device Session video",
+        )
+        if video["layout"] != "split-eyes":
+            raise CaptureValidationError("calibration Device Session must use split-eyes video")
+        if video["container"] != "mp4":
+            raise CaptureValidationError("calibration Device Session segmented video is invalid")
+        v2_video_frames = 0
+
     raw_codec = video["codec"]
-    if raw_codec not in {"h264", "hevc"} or video["container"] != "mp4":
-        raise CaptureValidationError("calibration Device Session segmented video is invalid")
+    if raw_codec not in {"h264", "hevc"}:
+        raise CaptureValidationError("calibration Device Session video codec is invalid")
     codec: VideoCodec = "h264" if raw_codec == "h264" else "hevc"
     _validate_video_encoding(video["encoding"], video_codec=codec)
 
@@ -1189,28 +1492,146 @@ def _load_device_session(
             )
 
     frames_block = _mapping(manifest["frames"], "Device Session frames")
-    _ensure_keys(frames_block, required={"artifact", "count"}, label="Device Session frames")
-    expected_frame_count = _integer(frames_block["count"], "frames.count", minimum=1)
-
     imu_block = _mapping(manifest["imu"], "Device Session IMU")
-    _ensure_keys(
-        imu_block,
-        required={"artifact", "sample_count", "units", "coordinate_frame"},
-        label="Device Session IMU",
-    )
     if imu_block["units"] != "raw_int16" or imu_block["coordinate_frame"] != "raw_device_axes":
         raise CaptureValidationError("Device Session IMU units or coordinate_frame invalid")
+    expected_frame_count = _integer(frames_block["count"], "frames.count", minimum=1)
     expected_imu_count = _integer(imu_block["sample_count"], "imu.sample_count", minimum=1)
 
     raw_logs = manifest["logs"]
     if not isinstance(raw_logs, list):
         raise CaptureValidationError("Device Session logs must be a list")
 
+    seen_paths: set[str] = set()
+
+    if is_v2:
+        media_block = _mapping(manifest["media"], "Device Session media")
+        _ensure_keys(
+            media_block,
+            required={
+                "container",
+                "layout",
+                "timescale",
+                "duration_ticks",
+                "fragment_count",
+                "artifact",
+            },
+            label="Device Session media",
+        )
+        if media_block["container"] != "fmp4" or media_block["layout"] != "synced-fmp4":
+            raise CaptureValidationError("Device Session v2 media container/layout invalid")
+        _integer(media_block["timescale"], "media.timescale", minimum=1)
+        _integer(media_block["duration_ticks"], "media.duration_ticks", minimum=1)
+        _integer(media_block["fragment_count"], "media.fragment_count", minimum=1)
+        _ensure_keys(
+            frames_block,
+            required={"embedded_in", "track_id", "mime_type", "count"},
+            label="Device Session frames",
+        )
+        _ensure_keys(
+            imu_block,
+            required={
+                "embedded_in",
+                "track_id",
+                "mime_type",
+                "sample_count",
+                "units",
+                "coordinate_frame",
+            },
+            label="Device Session IMU",
+        )
+        frames_track = _integer(frames_block["track_id"], "frames.track_id", minimum=3, maximum=4)
+        imu_track = _integer(imu_block["track_id"], "imu.track_id", minimum=3, maximum=4)
+        if (
+            frames_block["embedded_in"] != "media.session"
+            or imu_block["embedded_in"] != "media.session"
+            or frames_track != 3
+            or imu_track != 3
+            or frames_block["mime_type"] != "application/x-miro-ego-sync+json"
+            or imu_block["mime_type"] != "application/x-miro-ego-sync+json"
+            or v2_video_frames != expected_frame_count
+        ):
+            raise CaptureValidationError("Device Session v2 embedded metadata fields invalid")
+        _, media_path, _ = _verify_descriptor(
+            root,
+            media_block["artifact"],
+            expected_role="media.session",
+            allowed_media_types={"video/mp4"},
+            allow_empty=False,
+            seen_paths=seen_paths,
+            label="media session",
+        )
+        verified_logs: list[CaptureLogArtifact] = []
+        for log_idx, raw_log in enumerate(raw_logs):
+            log_desc, log_path, _ = _verify_descriptor(
+                root,
+                raw_log,
+                expected_role=None,
+                allowed_media_types=None,
+                allow_empty=True,
+                seen_paths=seen_paths,
+                label=f"log artifact {log_idx}",
+            )
+            if _LOG_ROLE_RE.fullmatch(log_desc["role"]) is None:
+                raise CaptureValidationError(
+                    "Device Session integrity validation failed: "
+                    f"invalid log role {log_desc['role']!r}"
+                )
+            verified_logs.append(
+                CaptureLogArtifact(
+                    role=log_desc["role"],
+                    path=log_path,
+                    media_type=log_desc["media_type"],
+                    bytes=log_desc["bytes"],
+                    sha256=log_desc["sha256"],
+                )
+            )
+        frames, imu_samples = _parse_fmp4_mett_metadata(
+            media_path,
+            expected_meta_track_id=frames_track,
+            frame_decimation=frame_decimation,
+        )
+        if len(frames) != expected_frame_count:
+            raise CaptureValidationError("Device Session frame count differs from the manifest")
+        if len(imu_samples) != expected_imu_count:
+            raise CaptureValidationError("Device Session IMU count differs from the manifest")
+        return LoadedCapture(
+            root=root,
+            source_schema=DEVICE_SESSION_V2_SCHEMA,
+            session_id=session_id,
+            manifest=manifest,
+            frames=frames,
+            imu_samples=imu_samples,
+            video=CaptureVideo(
+                authority="device_session",
+                codec=codec,
+                container="fmp4",
+                layout="split-eyes",
+                segments=(),
+                media_path=media_path,
+            ),
+            fps=expected_fps,
+            sensor_fps=sensor_fps,
+            frame_decimation=frame_decimation,
+            width=width,
+            eye_width=eye_width,
+            height=height,
+            imu_samples_per_packet=2,
+            imu_timestamp_bits=None,
+            logs=tuple(verified_logs),
+        )
+
+    _ensure_keys(frames_block, required={"artifact", "count"}, label="Device Session frames")
+    _ensure_keys(
+        imu_block,
+        required={"artifact", "sample_count", "units", "coordinate_frame"},
+        label="Device Session IMU",
+    )
+
     raw_segments = video["segments"]
     if not isinstance(raw_segments, list) or not raw_segments:
         raise CaptureValidationError("Device Session has no split-eye video segments")
 
-    seen_paths: set[str] = set()
     segments: list[CaptureVideoSegment] = []
     expected_start = 0
     for expected_index, raw_segment in enumerate(raw_segments):
@@ -1383,5 +1804,6 @@ def load_capture(path: str | Path) -> LoadedCapture:
 
 def artifact_roles(capture: LoadedCapture) -> tuple[str, ...]:
     """Return the authoritative required calibration roles without filename inference."""
-    _ = capture
+    if capture.source_schema == DEVICE_SESSION_V2_SCHEMA:
+        return ("media.session",)
     return ("video.left", "video.right", "frames.index", "imu.samples")

@@ -200,6 +200,7 @@ impl ActiveCaptureHandle for MockCaptureHandle {
                 requested_mode: "disabled".to_owned(),
                 reason: "user_disabled".to_owned(),
             },
+            synced_fmp4: None,
             logs: Vec::new(),
             dropped_frames: 0,
             drop_events: Vec::new(),
@@ -1113,6 +1114,7 @@ impl ActiveCaptureHandle for BarrierCaptureHandle {
                 requested_mode: "disabled".to_owned(),
                 reason: "user_disabled".to_owned(),
             },
+            synced_fmp4: None,
             logs: Vec::new(),
             dropped_frames: 0,
             drop_events: Vec::new(),
@@ -2398,6 +2400,7 @@ fn p1_10_and_p2_13_audio_checkpoint_recovery_ndjson_frame_filtering_mp4_hardenin
                 },
                 imu_sample_count: 1,
                 audio,
+                synced_fmp4: None,
                 logs: Vec::new(),
                 dropped_frames: 0,
                 drop_events: Vec::new(),
@@ -3114,4 +3117,292 @@ fn wave3_clock_guard_provenance_logs_async_stop_stsz_validation_and_recovery_bac
     .unwrap();
     assert_eq!(good_man.parsed["video"]["segments"][0]["end_frame"], 2);
     assert_eq!(good_man.parsed["frames"]["count"], 2);
+}
+
+fn push_test_box<F: FnOnce(&mut Vec<u8>)>(out: &mut Vec<u8>, tag: &[u8; 4], body: F) {
+    let start = out.len();
+    out.extend_from_slice(&0_u32.to_be_bytes());
+    out.extend_from_slice(tag);
+    body(out);
+    let len = (out.len() - start) as u32;
+    out[start..start + 4].copy_from_slice(&len.to_be_bytes());
+}
+
+fn build_test_partial_synced_fmp4(
+    fragments: u64,
+    with_audio: bool,
+    truncate_trailing_bytes: bool,
+) -> Vec<u8> {
+    let timescale: u32 = 48_000;
+    let ticks_per_frame: u32 = 1600;
+    let num_tracks: u32 = if with_audio { 4 } else { 3 };
+    let mut out = Vec::new();
+
+    push_test_box(&mut out, b"ftyp", |b| {
+        b.extend_from_slice(b"isom");
+        b.extend_from_slice(&0x200_u32.to_be_bytes());
+        b.extend_from_slice(b"isomiso6");
+    });
+    push_test_box(&mut out, b"moov", |b| {
+        push_test_box(b, b"mvhd", |m| {
+            m.extend_from_slice(&[0_u8; 12]);
+            m.extend_from_slice(&timescale.to_be_bytes());
+            m.extend_from_slice(&0_u32.to_be_bytes());
+            m.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+            m.extend_from_slice(&0x0100_u16.to_be_bytes());
+            m.extend_from_slice(&[0_u8; 82]);
+        });
+        push_test_box(b, b"mvex", |mv| {
+            push_test_box(mv, b"mehd", |me| {
+                me.extend_from_slice(&0_u32.to_be_bytes());
+                me.extend_from_slice(&0_u32.to_be_bytes());
+            });
+        });
+        for tid in 1_u32..=num_tracks {
+            let is_video = tid <= 2;
+            let is_audio = with_audio && tid == 3;
+            push_test_box(b, b"trak", |tr| {
+                push_test_box(tr, b"tkhd", |tk| {
+                    tk.extend_from_slice(&0x0000_0003_u32.to_be_bytes());
+                    tk.extend_from_slice(&[0_u8; 8]);
+                    tk.extend_from_slice(&tid.to_be_bytes());
+                    tk.extend_from_slice(&0_u32.to_be_bytes());
+                    tk.extend_from_slice(&0_u32.to_be_bytes());
+                    tk.extend_from_slice(&[0_u8; 60]);
+                });
+                push_test_box(tr, b"mdia", |md| {
+                    push_test_box(md, b"mdhd", |mh| {
+                        mh.extend_from_slice(&[0_u8; 12]);
+                        mh.extend_from_slice(&timescale.to_be_bytes());
+                        mh.extend_from_slice(&0_u64.to_be_bytes());
+                    });
+                    push_test_box(md, b"hdlr", |hd| {
+                        hd.extend_from_slice(&[0_u8; 8]);
+                        hd.extend_from_slice(if is_video {
+                            b"vide"
+                        } else if is_audio {
+                            b"soun"
+                        } else {
+                            b"meta"
+                        });
+                        hd.extend_from_slice(&[0_u8; 16]);
+                    });
+                    push_test_box(md, b"minf", |mi| {
+                        push_test_box(mi, b"stbl", |sb| {
+                            push_test_box(sb, b"stsd", |sd| {
+                                sd.extend_from_slice(&0_u32.to_be_bytes());
+                                sd.extend_from_slice(&1_u32.to_be_bytes());
+                                if is_video {
+                                    push_test_box(sd, b"hvc1", |ve| {
+                                        ve.extend_from_slice(&[0_u8; 78]);
+                                    });
+                                } else if is_audio {
+                                    push_test_box(sd, b"fLaC", |ae| {
+                                        ae.extend_from_slice(&[0_u8; 16]);
+                                        ae.extend_from_slice(&2_u16.to_be_bytes());
+                                        ae.extend_from_slice(&16_u16.to_be_bytes());
+                                        ae.extend_from_slice(&0_u32.to_be_bytes());
+                                        ae.extend_from_slice(&(timescale << 16).to_be_bytes());
+                                    });
+                                } else {
+                                    push_test_box(sd, b"mett", |mt| {
+                                        mt.extend_from_slice(&[0_u8; 8]);
+                                        mt.extend_from_slice(
+                                            b"\0application/x-miro-ego-sync+json\0",
+                                        );
+                                    });
+                                }
+                            });
+                        });
+                    });
+                });
+            });
+        }
+    });
+
+    for frag in 0..fragments {
+        let moof_off = out.len();
+        let meta_sample = format!(
+            "{{\"seq\":{frag},\"vseq\":{vseq},\"mono_ns\":1000,\"raw_ns\":1000,\"hw_s\":0,\"dur\":{ticks_per_frame},\"flags\":16,\"imu\":[[1000,1,2,3,4,5,6],[1001,1,2,3,4,5,6]]}}",
+            vseq = frag + 1
+        )
+        .into_bytes();
+        let payloads: Vec<Vec<u8>> = (1..=num_tracks)
+            .map(|tid| {
+                if tid == num_tracks {
+                    meta_sample.clone()
+                } else {
+                    vec![0xAA; 16]
+                }
+            })
+            .collect();
+        let mut trun_off_pos = Vec::new();
+        push_test_box(&mut out, b"moof", |mf| {
+            push_test_box(mf, b"mfhd", |fh| {
+                fh.extend_from_slice(&0_u32.to_be_bytes());
+                fh.extend_from_slice(&((frag + 1) as u32).to_be_bytes());
+            });
+            for (tidx, payload) in payloads.iter().enumerate() {
+                let tid = (tidx + 1) as u32;
+                push_test_box(mf, b"traf", |tf| {
+                    push_test_box(tf, b"tfhd", |th| {
+                        th.extend_from_slice(&0x0002_0000_u32.to_be_bytes());
+                        th.extend_from_slice(&tid.to_be_bytes());
+                    });
+                    push_test_box(tf, b"tfdt", |td| {
+                        td.extend_from_slice(&0x0100_0000_u32.to_be_bytes());
+                        td.extend_from_slice(&(frag * u64::from(ticks_per_frame)).to_be_bytes());
+                    });
+                    push_test_box(tf, b"trun", |rn| {
+                        rn.extend_from_slice(&0x0000_0701_u32.to_be_bytes());
+                        rn.extend_from_slice(&1_u32.to_be_bytes());
+                        trun_off_pos.push(rn.len());
+                        rn.extend_from_slice(&0_i32.to_be_bytes());
+                        rn.extend_from_slice(&ticks_per_frame.to_be_bytes());
+                        rn.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                        rn.extend_from_slice(&0_u32.to_be_bytes());
+                    });
+                });
+            }
+        });
+        let mdat_payload_off = out.len() + 8;
+        let mut cur_rel = (mdat_payload_off - moof_off) as i32;
+        for (idx, pos) in trun_off_pos.into_iter().enumerate() {
+            out[pos..pos + 4].copy_from_slice(&cur_rel.to_be_bytes());
+            cur_rel += payloads[idx].len() as i32;
+        }
+        push_test_box(&mut out, b"mdat", |md| {
+            for p in &payloads {
+                md.extend_from_slice(p);
+            }
+        });
+    }
+
+    if truncate_trailing_bytes {
+        out.extend_from_slice(&1024_u32.to_be_bytes());
+        out.extend_from_slice(b"mooftruncated_partial_tail_bytes");
+    }
+    out
+}
+
+#[test]
+fn v2_synced_fmp4_recovery_trims_partial_tail_writes_mfra_and_quarantines_empty() {
+    let env = TestEnv::new("v2_fmp4_recovery");
+    let probe = DynamicProbe::new(&env.root, 20 * 1024 * 1024 * 1024);
+    let mut policy = VolumePolicy::production(1024 * 1024 * 1024, 100);
+    policy.system_state_root = Some(env.root.clone());
+    let mgr = Arc::new(ExfatVolumeManager::with_probe(
+        env.paths(),
+        policy,
+        Arc::new(probe),
+    ));
+    let _ = mgr.ensure_layout().unwrap();
+    let cat = Arc::new(BinarySessionCatalog::open(env.paths()).unwrap());
+    let cfg = CoordinatorConfig {
+        device_id: new_uuid_v4(),
+        device_label: "Miro-Ego-87654321".to_owned(),
+        hardware_fingerprint: format!("sha256:{}", "f".repeat(64)),
+        run_dir: Some(env.run_dir.clone()),
+        ..CoordinatorConfig::default()
+    };
+    let rec = StagingRecoveryManager::new(
+        env.paths(),
+        RecoveryDefaults {
+            device_id: cfg.device_id,
+            device_label: cfg.device_label,
+            hardware_fingerprint: cfg.hardware_fingerprint,
+            platform: cfg.platform,
+            software_version: cfg.software_version,
+            commit: cfg.commit,
+            timezone: cfg.timezone,
+            camera_width: cfg.camera_width,
+            camera_height: cfg.camera_height,
+            sensor_fps: cfg.sensor_fps,
+            frame_decimation: cfg.frame_decimation,
+            segment_frames: 30,
+            encoding: cfg.encoding,
+        },
+        Some(Arc::clone(&cat)),
+    );
+
+    let good_sid = new_uuid_v7();
+    let good_dir = env
+        .paths()
+        .staging_dir()
+        .join(format!("{good_sid}.partial"));
+    fs::create_dir_all(&good_dir).unwrap();
+    let mp4_bytes = build_test_partial_synced_fmp4(2, true, true);
+    fs::write(good_dir.join("session.mp4"), &mp4_bytes).unwrap();
+    fs::write(
+        good_dir.join("capture.json"),
+        json!({"session_id": good_sid, "capture_mode": "production", "audio_requested_mode": "enabled"}).to_string(),
+    )
+    .unwrap();
+    fs::write(good_dir.join("frames.ndjson"), b"").unwrap();
+
+    let empty_sid = new_uuid_v7();
+    let empty_dir = env
+        .paths()
+        .staging_dir()
+        .join(format!("{empty_sid}.partial"));
+    fs::create_dir_all(&empty_dir).unwrap();
+    let corrupt_bytes = build_test_partial_synced_fmp4(0, false, true);
+    fs::write(empty_dir.join("session.mp4"), &corrupt_bytes).unwrap();
+
+    let report = rec.recover_staging_detailed().unwrap();
+    assert_eq!(report.summary.recovered, 1);
+    assert_eq!(report.summary.quarantined, 1);
+
+    let recovered_item = report
+        .items
+        .iter()
+        .find(|i| matches!(i, RecoveryItemOutcome::Recovered { .. }))
+        .cloned()
+        .unwrap();
+    match recovered_item {
+        RecoveryItemOutcome::Recovered {
+            session_id,
+            recovered_segments,
+            discarded_tail_files,
+            relative_dir,
+            ..
+        } => {
+            assert_eq!(session_id, good_sid);
+            assert_eq!(recovered_segments, 2);
+            assert!(discarded_tail_files >= 2);
+            let rec_dir = env.paths().recordings_dir().join(&relative_dir);
+            let man = open_manifest(
+                &env.paths().recordings_dir(),
+                &relative_dir,
+                Some(&good_sid),
+            )
+            .unwrap();
+            assert_eq!(man.parsed["schema"], "miro-ego.device-session.v2");
+            assert_eq!(man.parsed["media"]["fragment_count"], 2);
+            assert_eq!(man.parsed["media"]["duration_ticks"], 3200);
+            assert_eq!(man.parsed["frames"]["count"], 2);
+            assert_eq!(man.parsed["imu"]["sample_count"], 4);
+            assert_eq!(man.parsed["audio"]["state"], "recorded");
+            assert_eq!(man.parsed["audio"]["codec"], "flac");
+            assert_eq!(man.parsed["audio"]["sample_count"], 3200);
+            assert_eq!(
+                man.parsed["capture_audit"]["recovery"]["recovered_prefix"],
+                true
+            );
+            let schema_v2 =
+                include_str!("../../../contracts/schemas/miro-ego-device-session-v2.schema.json");
+            let validator = SchemaValidator::new(schema_v2).unwrap();
+            assert!(
+                validator
+                    .is_valid(std::str::from_utf8(&man.raw_bytes).unwrap())
+                    .unwrap()
+            );
+            assert!(rec_dir.join("session.mp4").is_file());
+            let repaired = fs::read(rec_dir.join("session.mp4")).unwrap();
+            assert!(repaired.windows(4).any(|w| w == b"mfra"));
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    assert!(cat.get_indexed_session(&good_sid).unwrap().is_some());
+    assert!(cat.get_indexed_session(&empty_sid).unwrap().is_none());
 }

@@ -5,7 +5,7 @@ pub mod diagnostics;
 pub mod recorder;
 pub mod wav_writer;
 
-pub use recorder::Recorder;
+pub use recorder::{Recorder, SyncedAudioCapture, SyncedAudioSummary};
 
 use diagnostics::WriterDiagnostics;
 use std::io;

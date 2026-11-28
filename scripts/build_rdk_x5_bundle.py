@@ -50,7 +50,8 @@ ENCODER_C_SOURCES = (
     "miro_ego_shm_ring.c",
     "miro_ego_sha256.c",
     "miro_ego_split.c",
-    "miro_ego_mp4_meta.c",
+    "miro_ego_flac.c",
+    "miro_ego_fmp4.c",
 )
 MAX_BUNDLE_FILES = 256
 MAX_BINARY_BYTES = 256 * 1024 * 1024

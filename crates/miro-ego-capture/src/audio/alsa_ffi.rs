@@ -198,6 +198,13 @@ unsafe impl Send for Pcm {}
 
 impl Pcm {
     pub fn open(config: &RecorderConfig) -> Result<Self, AudioError> {
+        Self::open_with_period(config, DEFAULT_PERIOD_FRAMES)
+    }
+
+    pub fn open_with_period(
+        config: &RecorderConfig,
+        requested_period_frames: u64,
+    ) -> Result<Self, AudioError> {
         let alsa = Alsa::cached()?;
         let device = CString::new(config.device.as_str())
             .map_err(|_| AudioError::new("invalid_argument", "audio device contains NUL"))?;
@@ -227,14 +234,18 @@ impl Pcm {
             buffer_frames: 0,
             bytes_per_frame: 0,
         };
-        if let Err(error) = pcm.configure(config) {
+        if let Err(error) = pcm.configure(config, requested_period_frames) {
             let _ = pcm.close();
             return Err(error);
         }
         Ok(pcm)
     }
 
-    fn configure(&mut self, config: &RecorderConfig) -> Result<(), AudioError> {
+    fn configure(
+        &mut self,
+        config: &RecorderConfig,
+        requested_period_frames: u64,
+    ) -> Result<(), AudioError> {
         let bytes_per_frame = u64::from(config.channels)
             .checked_mul(crate::audio::BYTES_PER_SAMPLE)
             .filter(|&n| n > 0)
@@ -308,7 +319,8 @@ impl Pcm {
             ));
         }
         direction = 0;
-        let mut period = SndPcmUframes::try_from(DEFAULT_PERIOD_FRAMES)
+        let requested_period = requested_period_frames.max(64);
+        let mut period = SndPcmUframes::try_from(requested_period)
             .map_err(|_| AudioError::new("invalid_argument", "period is too large"))?;
         self.check(
             "unsupported_audio_mode",

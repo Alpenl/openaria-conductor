@@ -1,7 +1,7 @@
 use crate::session::session_io;
 use crate::session::shm_ring::{
-    ShmRingConfig, ShmRingError, ShmRingProducer, create_eventfd, min_slot_capacity_for_dimensions,
-    wake_eventfd_best_effort,
+    ShmRingConfig, ShmRingError, ShmRingProducer, SyncSlotBundle, create_eventfd,
+    min_slot_capacity_for_dimensions, wake_eventfd_best_effort,
 };
 use miro_ego_core::ids::is_valid_sha256;
 use miro_ego_core::sys::clock::monotonic_ns;
@@ -51,12 +51,20 @@ impl EncoderEventError {
     }
 }
 
-pub use miro_ego_core::media_types::SegmentEvent;
+pub use miro_ego_core::media_types::{FragmentEvent, SealedMediaEvent, SegmentEvent};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncoderMediaOutcome {
+    pub fragments: Vec<FragmentEvent>,
+    pub sealed: Option<SealedMediaEvent>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncoderEvent {
     Ready,
     Segment(SegmentEvent),
+    Fragment(FragmentEvent),
+    Sealed(SealedMediaEvent),
     Stats(BTreeMap<String, i64>),
     Done(BTreeMap<String, i64>),
     Error { code: String, message: String },
@@ -122,6 +130,8 @@ struct ProcessState {
     stderr_closed: bool,
     failure: Option<EncoderProcessError>,
     segments: Vec<SegmentEvent>,
+    fragments: Vec<FragmentEvent>,
+    sealed: Option<SealedMediaEvent>,
     stats: BTreeMap<String, i64>,
     stderr_ring: VecDeque<u8>,
     wake_done_fd: Option<OwnedFd>,
@@ -136,6 +146,8 @@ impl ProcessState {
             stderr_closed: false,
             failure: None,
             segments: Vec::new(),
+            fragments: Vec::new(),
+            sealed: None,
             stats: BTreeMap::new(),
             stderr_ring: VecDeque::new(),
             wake_done_fd: None,
@@ -455,6 +467,48 @@ impl EncoderProcess {
         proc.base_args.push(intra_period.to_string());
         proc.args = proc.base_args.clone();
         Ok(proc)
+    }
+
+    pub fn set_fmp4_options(
+        &mut self,
+        output_file: &str,
+        fragment_frames: u64,
+        timescale: u32,
+        audio_tracks: u8,
+    ) -> Result<(), EncoderProcessError> {
+        if self.child.is_some() || output_file.is_empty() || timescale == 0 || audio_tracks > 1 {
+            return Err(EncoderProcessError::new(
+                "invalid_argument",
+                "invalid fMP4 encoder options",
+            ));
+        }
+        let eff_frag = if fragment_frames > 0 {
+            fragment_frames
+        } else {
+            self.segment_frames
+        };
+        let eff_gop = self.intra_period.filter(|&p| p > 0).unwrap_or(self.fps);
+        if eff_frag > 0 && (eff_gop == 0 || eff_frag % eff_gop != 0) {
+            return Err(EncoderProcessError::new(
+                "invalid_argument",
+                format!(
+                    "fragment_frames ({eff_frag}) must be a multiple of effective intra_period ({eff_gop})"
+                ),
+            ));
+        }
+        self.segment_frames = eff_frag;
+        let updates = [
+            ("--output-file", output_file.to_owned()),
+            ("--fragment-frames", eff_frag.to_string()),
+            ("--segment-frames", eff_frag.to_string()),
+            ("--timescale", timescale.to_string()),
+            ("--audio-tracks", audio_tracks.to_string()),
+        ];
+        for (flag, val) in updates {
+            upsert_flag_pair(&mut self.base_args, flag, &val);
+            upsert_flag_pair(&mut self.args, flag, &val);
+        }
+        Ok(())
     }
 
     fn validate_qp_bounds(&self) -> Result<(), EncoderProcessError> {
@@ -915,7 +969,114 @@ impl EncoderProcess {
         Ok(written)
     }
 
+    pub fn submit_sync_bundle_with_stop_check<F>(
+        &mut self,
+        bundle: SyncSlotBundle<'_>,
+        mut stop_check: F,
+    ) -> Result<u64, EncoderProcessError>
+    where
+        F: FnMut() -> bool,
+    {
+        if bundle.jpeg.is_empty() {
+            return Err(EncoderProcessError::new(
+                "invalid_argument",
+                "encoder frame payload must not be empty",
+            ));
+        }
+        self.raise_if_failed()?;
+        let shared = &self.shared;
+        let wake_fd = shared.wake_raw_fd();
+        let transport = self.active_transport.as_mut().ok_or_else(|| {
+            EncoderProcessError::new("invalid_state", "encoder process not started")
+        })?;
+        let written = match transport {
+            ActiveTransport::ShmRing(ring) => {
+                match ring.push_bundle_wait_with_backpressure_check(
+                    bundle,
+                    SHM_SUBMIT_TIMEOUT,
+                    |is_full| {
+                        shared.raise_if_failed()?;
+                        if is_full && stop_check() {
+                            return Err(EncoderProcessError::new(
+                                "capture_stopped",
+                                "capture stopped while encoder input was backpressured",
+                            ));
+                        }
+                        Ok(())
+                    },
+                ) {
+                    Ok(_) => u64::try_from(bundle.jpeg.len()).unwrap_or(u64::MAX),
+                    Err(error) => {
+                        shared.raise_if_failed()?;
+                        return Err(error);
+                    }
+                }
+            }
+            ActiveTransport::StdinPipe(stdin) => {
+                let mut check_error: Option<EncoderProcessError> = None;
+                match session_io::write_encoder_frame_nonblocking(
+                    stdin.as_raw_fd(),
+                    wake_fd,
+                    bundle.jpeg,
+                    SHM_SUBMIT_TIMEOUT,
+                    |mid_frame, would_block| {
+                        if let Err(causal) = shared.raise_if_failed() {
+                            check_error = Some(causal);
+                            return Err(session_io::SessionIoError {
+                                code: "write_failed",
+                                message: "encoder process failed".to_owned(),
+                            });
+                        }
+                        if would_block && !mid_frame && stop_check() {
+                            check_error = Some(EncoderProcessError::new(
+                                "capture_stopped",
+                                "capture stopped while encoder stdin pipe was backpressured",
+                            ));
+                            return Err(session_io::SessionIoError {
+                                code: "write_failed",
+                                message: "capture stopped".to_owned(),
+                            });
+                        }
+                        Ok(())
+                    },
+                ) {
+                    Ok(written) => written,
+                    Err(error) => {
+                        if let Some(captured) = check_error {
+                            return Err(captured);
+                        }
+                        shared.raise_if_failed()?;
+                        return Err(error.into());
+                    }
+                }
+            }
+        };
+        self.submitted = self.submitted.checked_add(1).ok_or_else(|| {
+            EncoderProcessError::new(
+                "counter_overflow",
+                "encoder submitted frame count overflowed",
+            )
+        })?;
+        Ok(written)
+    }
+
     pub fn finish(&mut self, timeout: Duration) -> Result<Vec<SegmentEvent>, EncoderProcessError> {
+        self.finish_internal(timeout)?;
+        Ok(self.segments())
+    }
+
+    pub fn finish_media(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<EncoderMediaOutcome, EncoderProcessError> {
+        self.finish_internal(timeout)?;
+        Ok(EncoderMediaOutcome {
+            fragments: self.fragments(),
+            sealed: self.sealed(),
+        })
+    }
+
+    fn finish_internal(&mut self, timeout: Duration) -> Result<(), EncoderProcessError> {
         if timeout.is_zero() {
             return Err(EncoderProcessError::new(
                 "invalid_argument",
@@ -972,7 +1133,7 @@ impl EncoderProcess {
                 self.with_stderr(format!("encoder exit code {}", status.code().unwrap_or(-1))),
             ));
         }
-        Ok(self.segments())
+        Ok(())
     }
 
     pub fn abort(&mut self) {
@@ -1024,6 +1185,34 @@ impl EncoderProcess {
             EncoderProcessError::new("segment_invalid", "encoder segment list regressed")
         })?;
         Ok(tail.to_vec())
+    }
+
+    pub fn fragments(&self) -> Vec<FragmentEvent> {
+        match self.shared.state.lock() {
+            Ok(state) => state.fragments.clone(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn fragments_since(
+        &self,
+        offset: usize,
+    ) -> Result<Vec<FragmentEvent>, EncoderProcessError> {
+        let state = self.shared.state.lock().map_err(|_| {
+            EncoderProcessError::new("encoder_failed", "encoder process mutex is poisoned")
+        })?;
+        let tail = state.fragments.get(offset..).ok_or_else(|| {
+            EncoderProcessError::new("segment_invalid", "encoder fragment list regressed")
+        })?;
+        Ok(tail.to_vec())
+    }
+
+    pub fn sealed(&self) -> Option<SealedMediaEvent> {
+        self.shared
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.sealed.clone())
     }
 
     pub fn stats(&self) -> BTreeMap<String, i64> {
@@ -1311,6 +1500,12 @@ fn handle_event(shared: &SharedProcess, line: &[u8]) -> Result<(), EncoderProces
         EncoderEvent::Segment(segment) => {
             state.segments.push(segment);
         }
+        EncoderEvent::Fragment(fragment) => {
+            state.fragments.push(fragment);
+        }
+        EncoderEvent::Sealed(sealed) => {
+            state.sealed = Some(sealed);
+        }
         EncoderEvent::Stats(stats) => {
             state.stats = stats;
         }
@@ -1417,6 +1612,8 @@ pub fn parse_event(line: &[u8]) -> Result<Option<EncoderEvent>, EncoderEventErro
     match kind {
         "ready" => Ok(Some(EncoderEvent::Ready)),
         "segment" => Ok(Some(EncoderEvent::Segment(parse_segment(object)?))),
+        "fragment" => Ok(Some(EncoderEvent::Fragment(parse_fragment(object)?))),
+        "sealed" => Ok(Some(EncoderEvent::Sealed(parse_sealed(object)?))),
         "stats" => {
             let stats = object
                 .iter()
@@ -1540,6 +1737,82 @@ fn optional_sha256(
     }
 }
 
+fn upsert_flag_pair(args: &mut Vec<String>, flag: &str, value: &str) {
+    let mut i = 0;
+    while i + 1 < args.len() {
+        if args[i] == flag {
+            args[i + 1] = value.to_owned();
+            return;
+        }
+        i += 2;
+    }
+    args.push(flag.to_owned());
+    args.push(value.to_owned());
+}
+
+fn parse_fragment(
+    object: &serde_json::Map<String, Value>,
+) -> Result<FragmentEvent, EncoderEventError> {
+    let bytes = object
+        .get("bytes")
+        .or_else(|| object.get("frag_bytes"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| EncoderEventError::new("encoder_failed", "fragment missing bytes"))?;
+    Ok(FragmentEvent {
+        index: required_u64(object, "index")?,
+        start_frame: required_u64(object, "start_frame")?,
+        end_frame: required_u64(object, "end_frame")?,
+        duration_ticks: required_u64(object, "duration_ticks")?,
+        bytes,
+    })
+}
+
+fn parse_sealed(
+    object: &serde_json::Map<String, Value>,
+) -> Result<SealedMediaEvent, EncoderEventError> {
+    let sha256 = required_str(object, "sha256")?;
+    if !is_valid_sha256(&sha256) {
+        return Err(EncoderEventError::new(
+            "encoder_failed",
+            "sealed sha256 must be 64 lowercase hex characters",
+        ));
+    }
+    let fragments = object
+        .get("fragments")
+        .or_else(|| object.get("moof_count"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| EncoderEventError::new("encoder_failed", "sealed missing moof_count"))?;
+    let duration_ticks = required_u64(object, "duration_ticks")?;
+    let timescale = object
+        .get("timescale")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(48_000);
+    let has_audio = object
+        .get("has_audio")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let audio_samples = object
+        .get("audio_samples")
+        .and_then(Value::as_u64)
+        .unwrap_or(if has_audio { duration_ticks } else { 0 });
+    let imu_samples = object
+        .get("imu_samples")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Ok(SealedMediaEvent {
+        path: required_str(object, "path")?,
+        bytes: required_u64(object, "bytes")?,
+        sha256,
+        frames: required_u64(object, "frames")?,
+        fragments,
+        duration_ticks,
+        timescale,
+        audio_samples,
+        imu_samples,
+    })
+}
+
 fn required_artifact_path(
     object: &serde_json::Map<String, Value>,
     key: &'static str,
@@ -1648,6 +1921,65 @@ mod tests {
 
         let bad_sha = br#"{"event":"segment","index":0,"start_frame":0,"end_frame":90,"left_path":"video/l.mp4","left_bytes":1,"left_sha256":"INVALID","right_path":"video/r.mp4","right_bytes":1}"#;
         assert_eq!(parse_event(bad_sha).unwrap_err().code, "encoder_failed");
+    }
+
+    #[test]
+    fn parses_fragment_and_sealed_events_and_fmp4_options() {
+        let frag_line = br#"{"event":"fragment","index":2,"start_frame":60,"end_frame":90,"duration_ticks":48000,"frag_offset":10240,"frag_bytes":51200}"#;
+        assert_eq!(
+            parse_event(frag_line).unwrap(),
+            Some(EncoderEvent::Fragment(super::FragmentEvent {
+                index: 2,
+                start_frame: 60,
+                end_frame: 90,
+                duration_ticks: 48000,
+                bytes: 51200,
+            }))
+        );
+
+        let sha = "c".repeat(64);
+        let sealed_line = format!(
+            r#"{{"event":"sealed","path":"session.mp4","bytes":99999,"sha256":"{sha}","frames":180,"duration_ticks":288000,"moof_count":6,"has_audio":true}}"#
+        );
+        assert_eq!(
+            parse_event(sealed_line.as_bytes()).unwrap(),
+            Some(EncoderEvent::Sealed(super::SealedMediaEvent {
+                path: "session.mp4".to_owned(),
+                bytes: 99999,
+                sha256: sha,
+                frames: 180,
+                fragments: 6,
+                duration_ticks: 288000,
+                timescale: 48_000,
+                audio_samples: 288000,
+                imu_samples: 0,
+            }))
+        );
+
+        let mut enc = EncoderProcess::new(EncoderConfig {
+            out_dir: std::path::Path::new("/tmp"),
+            executable: std::path::Path::new("/bin/true"),
+            width: 3840,
+            height: 1080,
+            fps: 30,
+            bitrate_kbps: 8192,
+            segment_frames: 30,
+            path_prefix: "",
+        })
+        .unwrap();
+        enc.set_fmp4_options("session.mp4", 30, 48000, 1).unwrap();
+        assert!(
+            enc.args
+                .windows(2)
+                .any(|w| w == ["--output-file", "session.mp4"])
+        );
+        assert!(
+            enc.args
+                .windows(2)
+                .any(|w| w == ["--fragment-frames", "30"])
+        );
+        assert!(enc.args.windows(2).any(|w| w == ["--timescale", "48000"]));
+        assert!(enc.args.windows(2).any(|w| w == ["--audio-tracks", "1"]));
     }
 
     #[test]

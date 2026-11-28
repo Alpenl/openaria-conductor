@@ -600,6 +600,7 @@ impl ActiveCaptureHandle for CrashingHandle {
                 requested_mode: self.audio_requested_mode.clone(),
                 reason: self.audio_not_recorded_reason.clone(),
             },
+            synced_fmp4: None,
             logs: Vec::new(),
             dropped_frames: 0,
             drop_events: Vec::new(),
@@ -2267,7 +2268,7 @@ async fn openapi_error_and_degraded_schema_parity_for_sessions_network_and_unmou
         .unwrap()
         .to_owned();
     let manifest_val: Value = serde_json::from_slice(&m_body).unwrap();
-    let aid = manifest_val["video"]["segments"][0]["artifacts"]["left"]["sha256"]
+    let aid = manifest_val["media"]["artifact"]["sha256"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -3125,7 +3126,7 @@ async fn safe_swap_stream_leases_drain_timeout_released_volume_gates_and_restart
             .unwrap()
             .to_owned();
         let mdoc: Value = serde_json::from_slice(&mbody).unwrap();
-        let aid = mdoc["video"]["segments"][0]["artifacts"]["left"]["sha256"]
+        let aid = mdoc["media"]["artifact"]["sha256"]
             .as_str()
             .unwrap()
             .to_owned();

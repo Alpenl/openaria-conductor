@@ -1565,7 +1565,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "./schemas/miro-ego-device-session-v1.schema.json"
+                oneOf:
+                  - $ref: "./schemas/miro-ego-device-session-v1.schema.json"
+                  - $ref: "./schemas/miro-ego-device-session-v2.schema.json"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":

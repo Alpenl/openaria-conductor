@@ -1323,4 +1323,510 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn synced_audio_clock_bridge_and_slice_extraction_preserve_zero_gap() {
+        let mut bridge = SyncedAudioBridge::new(48_000, 2);
+        // Simulate 48004.835 Hz (+100.7 ppm) hardware crystal
+        let true_rate = 48_004.835_f64;
+        for step in 0..64_u64 {
+            let hw_sample = step * 512 + 512;
+            let raw_ns = 10_000_000_000_u64 + ((hw_sample as f64 / true_rate) * 1e9) as u64;
+            bridge.observe_anchor(raw_ns, hw_sample);
+        }
+        assert!(bridge.has_anchor);
+        assert!((bridge.effective_rate_hz() - true_rate).abs() < 2.0);
+        // Check mapping accuracy across 2 frames (~33.3 ms apart)
+        let s0 = bridge
+            .map_raw_ns_to_sample(10_000_000_000 + 300_000_000)
+            .unwrap();
+        let s1 = bridge
+            .map_raw_ns_to_sample(10_000_000_000 + 333_333_333)
+            .unwrap();
+        assert!((1598..=1602).contains(&(s1 - s0)));
+
+        // Push synthetic PCM up to sample 20_000 and slice exact [s0, s1)
+        let mut pcm_bytes = Vec::with_capacity(20_000 * 4);
+        for s in 0..20_000_u64 {
+            let val = (s & 0x7fff) as i16;
+            pcm_bytes.extend_from_slice(&val.to_le_bytes());
+            pcm_bytes.extend_from_slice(&val.wrapping_neg().to_le_bytes());
+        }
+        bridge.push_pcm_bytes(&pcm_bytes, 20_000);
+        let slice = bridge.slice_pcm(s0, s1, false).unwrap();
+        assert_eq!(slice.len(), ((s1 - s0) * 4) as usize);
+        let first_sample = i16::from_le_bytes([slice[0], slice[1]]);
+        assert_eq!(first_sample, (s0 & 0x7fff) as i16);
+    }
+}
+
+/// Summary metrics emitted when [`SyncedAudioCapture`] stops.
+#[derive(Debug, Clone)]
+pub struct SyncedAudioSummary {
+    pub device: String,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub sample_count: u64,
+    pub period_frames: u64,
+    pub buffer_frames: u64,
+    pub started_monotonic_ns: u64,
+    pub stopped_monotonic_ns: u64,
+    pub max_residual_ns: u64,
+    pub effective_rate_hz: f64,
+}
+
+const SYNC_AUDIO_PERIOD_FRAMES: u64 = 512;
+const SYNC_CLOCK_WINDOW: usize = 64;
+const SYNC_PCM_MAX_SECONDS: u64 = 12;
+
+struct SyncedAudioBridge {
+    sample_rate_hz: u32,
+    channels: u16,
+    pcm: std::collections::VecDeque<i16>,
+    base_sample: u64,
+    total_samples: u64,
+    clock_points: std::collections::VecDeque<(u64, u64)>,
+    has_anchor: bool,
+    ref_raw_ns: u64,
+    ref_sample: f64,
+    slope_samples_per_ns: f64,
+    max_residual_ns: u64,
+    error: Option<AudioError>,
+    stopped: bool,
+}
+
+impl SyncedAudioBridge {
+    fn new(sample_rate_hz: u32, channels: u16) -> Self {
+        Self {
+            sample_rate_hz,
+            channels,
+            pcm: std::collections::VecDeque::with_capacity(
+                (u64::from(sample_rate_hz) * u64::from(channels) * 2) as usize,
+            ),
+            base_sample: 0,
+            total_samples: 0,
+            clock_points: std::collections::VecDeque::with_capacity(SYNC_CLOCK_WINDOW),
+            has_anchor: false,
+            ref_raw_ns: 0,
+            ref_sample: 0.0,
+            slope_samples_per_ns: f64::from(sample_rate_hz) / 1_000_000_000.0,
+            max_residual_ns: 0,
+            error: None,
+            stopped: false,
+        }
+    }
+
+    fn effective_rate_hz(&self) -> f64 {
+        self.slope_samples_per_ns * 1_000_000_000.0
+    }
+
+    fn push_pcm_bytes(&mut self, bytes: &[u8], frames: u64) {
+        for chunk in bytes.chunks_exact(2) {
+            self.pcm.push_back(i16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        self.total_samples = self.total_samples.saturating_add(frames);
+        let max_frames = u64::from(self.sample_rate_hz) * SYNC_PCM_MAX_SECONDS;
+        if self.total_samples.saturating_sub(self.base_sample) > max_frames {
+            let evict_frames = self.total_samples - self.base_sample - max_frames;
+            let evict_i16 = (evict_frames * u64::from(self.channels)) as usize;
+            let to_drain = evict_i16.min(self.pcm.len());
+            self.pcm.drain(..to_drain);
+            self.base_sample = self
+                .base_sample
+                .saturating_add(u64::try_from(to_drain / usize::from(self.channels)).unwrap_or(0));
+        }
+    }
+
+    fn observe_anchor(&mut self, raw_ns: u64, hw_sample_pos: u64) {
+        if let Some(&(prev_t, prev_s)) = self.clock_points.back() {
+            if raw_ns <= prev_t || hw_sample_pos <= prev_s {
+                return;
+            }
+        }
+        if self.clock_points.len() >= SYNC_CLOCK_WINDOW {
+            self.clock_points.pop_front();
+        }
+        self.clock_points.push_back((raw_ns, hw_sample_pos));
+        self.has_anchor = true;
+
+        let n = self.clock_points.len();
+        if n < 4 {
+            self.ref_raw_ns = raw_ns;
+            self.ref_sample = hw_sample_pos as f64;
+            self.slope_samples_per_ns = f64::from(self.sample_rate_hz) / 1_000_000_000.0;
+            return;
+        }
+
+        let (t0, y0) = self.clock_points[0];
+        let mut sum_x = 0.0_f64;
+        let mut sum_y = 0.0_f64;
+        for &(ti, yi) in &self.clock_points {
+            sum_x += (ti.saturating_sub(t0)) as f64;
+            sum_y += (yi.saturating_sub(y0)) as f64;
+        }
+        let n_f = n as f64;
+        let mx = sum_x / n_f;
+        let my = sum_y / n_f;
+        let mut sxx = 0.0_f64;
+        let mut sxy = 0.0_f64;
+        for &(ti, yi) in &self.clock_points {
+            let dx = (ti.saturating_sub(t0)) as f64 - mx;
+            let dy = (yi.saturating_sub(y0)) as f64 - my;
+            sxx += dx * dx;
+            sxy += dx * dy;
+        }
+        let nominal = f64::from(self.sample_rate_hz) / 1_000_000_000.0;
+        let slope = if sxx > 0.0 {
+            let est = sxy / sxx;
+            if (est / nominal - 1.0).abs() <= 0.01 {
+                est
+            } else {
+                nominal
+            }
+        } else {
+            nominal
+        };
+        let mut worst_ns = 0_u64;
+        for &(ti, yi) in &self.clock_points {
+            let pred_s = y0 as f64 + my + slope * ((ti.saturating_sub(t0)) as f64 - mx);
+            let err_s = (yi as f64 - pred_s).abs();
+            let err_ns = (err_s / slope) as u64;
+            worst_ns = worst_ns.max(err_ns);
+        }
+        self.max_residual_ns = self.max_residual_ns.max(worst_ns);
+        self.ref_raw_ns = t0 + mx.round() as u64;
+        self.ref_sample = y0 as f64 + my;
+        self.slope_samples_per_ns = slope;
+    }
+
+    fn map_raw_ns_to_sample(&self, raw_ns: u64) -> Option<u64> {
+        if !self.has_anchor {
+            return None;
+        }
+        let dt = raw_ns as f64 - self.ref_raw_ns as f64;
+        let pred = self.ref_sample + dt * self.slope_samples_per_ns;
+        Some(if pred <= 0.0 { 0 } else { pred.round() as u64 })
+    }
+
+    fn drop_before(&mut self, sample: u64) {
+        if sample <= self.base_sample {
+            return;
+        }
+        let target = sample.min(self.total_samples);
+        let frames = target - self.base_sample;
+        let count_i16 = (frames * u64::from(self.channels)) as usize;
+        let to_drain = count_i16.min(self.pcm.len());
+        self.pcm.drain(..to_drain);
+        self.base_sample += u64::try_from(to_drain / usize::from(self.channels)).unwrap_or(0);
+    }
+
+    fn slice_pcm(
+        &self,
+        start_sample: u64,
+        end_sample: u64,
+        allow_tail_pad: bool,
+    ) -> Option<Vec<u8>> {
+        if end_sample <= start_sample {
+            return Some(Vec::new());
+        }
+        if !allow_tail_pad && self.total_samples < end_sample {
+            return None;
+        }
+        let frames_needed = end_sample - start_sample;
+        let ch = usize::from(self.channels);
+        let mut out = vec![0_u8; frames_needed as usize * ch * 2];
+        let copy_start = start_sample.max(self.base_sample);
+        let copy_end = end_sample.min(self.total_samples);
+        if copy_end > copy_start {
+            let dst_frame_off = (copy_start - start_sample) as usize;
+            let src_frame_off = (copy_start - self.base_sample) as usize;
+            let n_frames = (copy_end - copy_start) as usize;
+            for f in 0..n_frames {
+                for c in 0..ch {
+                    let s_val = self.pcm[(src_frame_off + f) * ch + c];
+                    let bytes = s_val.to_le_bytes();
+                    let dst_idx = ((dst_frame_off + f) * ch + c) * 2;
+                    out[dst_idx] = bytes[0];
+                    out[dst_idx + 1] = bytes[1];
+                }
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Live ALSA capture maintaining a continuous rolling PCM sample ring +
+/// `CLOCK_MONOTONIC_RAW` OLS clock bridge for zero-boundary-gap video/audio pairing.
+pub struct SyncedAudioCapture {
+    config: RecorderConfig,
+    stop: Arc<AtomicBool>,
+    state: Arc<Mutex<SyncedAudioBridge>>,
+    changed: Arc<Condvar>,
+    worker: Mutex<Option<JoinHandle<Result<SyncedAudioSummary, AudioError>>>>,
+    summary: Mutex<Option<SyncedAudioSummary>>,
+}
+
+impl SyncedAudioCapture {
+    pub fn new(device: &str, sample_rate_hz: u32, channels: u16) -> Result<Self, AudioError> {
+        if device.is_empty() || sample_rate_hz == 0 || channels == 0 || channels > MAX_CHANNELS {
+            return Err(AudioError::new(
+                "invalid_argument",
+                "synced audio capture parameters are invalid",
+            ));
+        }
+        Ok(Self {
+            config: RecorderConfig {
+                session_root: PathBuf::new(),
+                device: device.to_owned(),
+                sample_rate_hz,
+                channels,
+                segment_seconds: 1.0,
+            },
+            stop: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(SyncedAudioBridge::new(sample_rate_hz, channels))),
+            changed: Arc::new(Condvar::new()),
+            worker: Mutex::new(None),
+            summary: Mutex::new(None),
+        })
+    }
+
+    pub fn start(&self) -> Result<(), AudioError> {
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let config = self.config.clone();
+        let stop = Arc::clone(&self.stop);
+        let state = Arc::clone(&self.state);
+        let changed = Arc::clone(&self.changed);
+        let handle = thread::Builder::new()
+            .name("audio-sync-capture".to_owned())
+            .spawn(move || {
+                let mut pcm = match Pcm::open_with_period(&config, SYNC_AUDIO_PERIOD_FRAMES) {
+                    Ok(pcm) => pcm,
+                    Err(error) => {
+                        if let Ok(mut guard) = state.lock() {
+                            guard.error = Some(error.clone());
+                            guard.stopped = true;
+                            changed.notify_all();
+                        }
+                        let _ = ready_tx.send(Err(error.clone()));
+                        return Err(error);
+                    }
+                };
+                let started_ns = sys_clock::monotonic_raw_ns().unwrap_or(0);
+                let bytes_per_frame = usize::from(config.channels) * 2;
+                let period_frames = pcm.period_frames.max(SYNC_AUDIO_PERIOD_FRAMES);
+                let buffer_frames = pcm.buffer_frames;
+                let mut period_buf = vec![0_u8; period_frames as usize * bytes_per_frame];
+                let mut read_samples = 0_u64;
+                let mut ready_sent = false;
+
+                let capture_res = (|| {
+                    while !stop.load(Ordering::Acquire) {
+                        match pcm.readi(&mut period_buf, period_frames)? {
+                            ReadOutcome::Frames(frames) if frames > 0 => {
+                                read_samples = read_samples.saturating_add(frames);
+                                let byte_len = frames as usize * bytes_per_frame;
+                                let anchor = pcm.clock_anchor(read_samples)?;
+                                let mut guard = state.lock().map_err(|_| {
+                                    AudioError::new(
+                                        "native_audio_poisoned",
+                                        "synced audio mutex poisoned",
+                                    )
+                                })?;
+                                guard.push_pcm_bytes(&period_buf[..byte_len], frames);
+                                guard.observe_anchor(anchor.1, anchor.0);
+                                changed.notify_all();
+                                if !ready_sent {
+                                    ready_sent = true;
+                                    let _ = ready_tx.send(Ok(()));
+                                }
+                            }
+                            ReadOutcome::Frames(_) | ReadOutcome::Again => {
+                                let _ = pcm.wait(READ_WAIT_TIMEOUT_MS)?;
+                            }
+                        }
+                    }
+                    Ok::<(), AudioError>(())
+                })();
+
+                let stopped_ns = sys_clock::monotonic_raw_ns().unwrap_or(started_ns);
+                let close_res = pcm.close();
+                let final_res = capture_res.and(close_res);
+                let (max_residual_ns, effective_rate_hz) = {
+                    let mut guard = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.stopped = true;
+                    if let Err(err) = &final_res {
+                        if guard.error.is_none() {
+                            guard.error = Some(err.clone());
+                        }
+                    }
+                    changed.notify_all();
+                    (guard.max_residual_ns, guard.effective_rate_hz())
+                };
+                if !ready_sent {
+                    let err = final_res.as_ref().err().cloned().unwrap_or_else(|| {
+                        AudioError::new("audio_empty", "synced audio stopped before ready")
+                    });
+                    let _ = ready_tx.send(Err(err));
+                }
+                final_res.map(|()| SyncedAudioSummary {
+                    device: config.device,
+                    sample_rate_hz: config.sample_rate_hz,
+                    channels: config.channels,
+                    sample_count: read_samples,
+                    period_frames,
+                    buffer_frames,
+                    started_monotonic_ns: started_ns,
+                    stopped_monotonic_ns: stopped_ns,
+                    max_residual_ns,
+                    effective_rate_hz,
+                })
+            })
+            .map_err(|e| {
+                AudioError::new("audio_start_failed", format!("spawn audio thread: {e}"))
+            })?;
+
+        match ready_rx.recv_timeout(START_TIMEOUT) {
+            Ok(Ok(())) => {
+                if let Ok(mut guard) = self.worker.lock() {
+                    *guard = Some(handle);
+                }
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.stop.store(true, Ordering::Release);
+                let _ = handle.join();
+                Err(error)
+            }
+            Err(_) => {
+                self.stop.store(true, Ordering::Release);
+                let _ = handle.join();
+                Err(AudioError::new(
+                    "audio_start_timeout",
+                    "timed out waiting for first ALSA DMA clock anchor",
+                ))
+            }
+        }
+    }
+
+    pub fn map_raw_ns_to_sample(&self, raw_ns: u64) -> Option<u64> {
+        self.state.lock().ok()?.map_raw_ns_to_sample(raw_ns)
+    }
+
+    pub fn wait_and_read_pcm_slice(
+        &self,
+        start_sample: u64,
+        end_sample: u64,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, AudioError> {
+        if end_sample <= start_sample {
+            return Ok(Vec::new());
+        }
+        let deadline = Instant::now() + timeout;
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| AudioError::new("native_audio_poisoned", "synced audio mutex poisoned"))?;
+        loop {
+            if let Some(err) = &guard.error {
+                return Err(err.clone());
+            }
+            if let Some(slice) = guard.slice_pcm(start_sample, end_sample, guard.stopped) {
+                return Ok(slice);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(AudioError::new(
+                    "audio_timeout",
+                    format!(
+                        "timed out waiting for PCM samples [{start_sample}..{end_sample}) (have {})",
+                        guard.total_samples
+                    ),
+                ));
+            }
+            let (next, _) = self.changed.wait_timeout(guard, remaining).map_err(|_| {
+                AudioError::new("native_audio_poisoned", "synced audio mutex poisoned")
+            })?;
+            guard = next;
+        }
+    }
+
+    pub fn drop_samples_before(&self, sample: u64) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.drop_before(sample);
+        }
+    }
+
+    pub fn check_health(&self) -> Result<(), AudioError> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| AudioError::new("native_audio_poisoned", "synced audio mutex poisoned"))?;
+        if let Some(err) = &guard.error {
+            return Err(err.clone());
+        }
+        Ok(())
+    }
+
+    pub fn sample_count(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|guard| guard.total_samples)
+            .unwrap_or(0)
+    }
+
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+
+    pub fn stop(&self) -> Result<SyncedAudioSummary, AudioError> {
+        self.request_stop();
+        let handle = self.worker.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(worker) = handle {
+            let res = worker
+                .join()
+                .map_err(|_| AudioError::new("audio_failed", "synced audio thread panicked"))??;
+            if let Ok(mut sum) = self.summary.lock() {
+                *sum = Some(res.clone());
+            }
+            return Ok(res);
+        }
+        if let Ok(sum) = self.summary.lock() {
+            if let Some(res) = sum.clone() {
+                return Ok(res);
+            }
+        }
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| AudioError::new("native_audio_poisoned", "synced audio mutex poisoned"))?;
+        if let Some(err) = &guard.error {
+            return Err(err.clone());
+        }
+        Ok(SyncedAudioSummary {
+            device: self.config.device.clone(),
+            sample_rate_hz: self.config.sample_rate_hz,
+            channels: self.config.channels,
+            sample_count: guard.total_samples,
+            period_frames: SYNC_AUDIO_PERIOD_FRAMES,
+            buffer_frames: 0,
+            started_monotonic_ns: 0,
+            stopped_monotonic_ns: 0,
+            max_residual_ns: guard.max_residual_ns,
+            effective_rate_hz: guard.effective_rate_hz(),
+        })
+    }
+}
+
+impl Drop for SyncedAudioCapture {
+    fn drop(&mut self) {
+        self.request_stop();
+        if let Ok(mut guard) = self.worker.lock() {
+            if let Some(worker) = guard.take() {
+                let _ = worker.join();
+            }
+        }
+    }
 }

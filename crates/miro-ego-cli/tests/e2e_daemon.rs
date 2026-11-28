@@ -13,7 +13,7 @@ use http::{HeaderMap, Method, Request};
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
-use miro_ego_cli::DEVICE_SESSION_V1_SCHEMA;
+use miro_ego_cli::DEVICE_SESSION_V2_SCHEMA;
 use miro_ego_cli::runtime::{
     CaptureModeKind, DaemonServeOptions, ShmEncoderCaptureBackend, bind_daemon,
     run_bound_daemon_with_shutdown,
@@ -576,8 +576,8 @@ async fn full_stack_live_http_e2e_with_real_c_shm_encoder_and_network_rpc() {
     );
     let session_abs_dir = data_dir.join("recordings").join(&indexed.relative_dir);
     assert!(session_abs_dir.join("manifest.json").is_file());
-    assert!(session_abs_dir.join("video/left_00000.mp4").is_file());
-    assert!(session_abs_dir.join("video/right_00000.mp4").is_file());
+    assert!(session_abs_dir.join("session.mp4").is_file());
+    assert!(!session_abs_dir.join("video").exists());
 
     // 7. GET /api/v1/sessions
     let (code, _, body) = http_request(addr, Method::GET, "/api/v1/sessions", &[], None).await;
@@ -606,19 +606,22 @@ async fn full_stack_live_http_e2e_with_real_c_shm_encoder_and_network_rpc() {
         .to_owned();
     assert_eq!(manifest_sha_header, sha256_hex(&raw_manifest));
 
-    let validator = SchemaValidator::new(DEVICE_SESSION_V1_SCHEMA).expect("compile schema");
+    let validator = SchemaValidator::new(DEVICE_SESSION_V2_SCHEMA).expect("compile schema");
     assert!(
         validator
             .is_valid(std::str::from_utf8(&raw_manifest).unwrap())
             .expect("validate manifest"),
-        "manifest must satisfy miro-ego.device-session.v1 schema"
+        "manifest must satisfy miro-ego.device-session.v2 schema"
     );
 
     let manifest_json: Value = serde_json::from_slice(&raw_manifest).unwrap();
-    let left_art = &manifest_json["video"]["segments"][0]["artifacts"]["left"];
-    let left_sha = left_art["sha256"].as_str().expect("left sha256").to_owned();
-    let left_len = left_art["bytes"].as_u64().expect("left bytes");
-    assert!(left_len >= 64, "C encoder MP4 must be non-trivial size");
+    let media_art = &manifest_json["media"]["artifact"];
+    let left_sha = media_art["sha256"]
+        .as_str()
+        .expect("media sha256")
+        .to_owned();
+    let left_len = media_art["bytes"].as_u64().expect("media bytes");
+    assert!(left_len >= 64, "C encoder fMP4 must be non-trivial size");
 
     // 9. HEAD + GET full (200) + GET Range (206) /api/v1/sessions/{id}/artifacts/{sha256}
     let art_uri = format!("/api/v1/sessions/{session_id}/artifacts/{left_sha}");
@@ -1014,11 +1017,12 @@ fn cli_binary_subcommands_e2e() {
     );
     let val_doc: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(val_doc["valid"], true);
+    assert_eq!(val_doc["schema"], "miro-ego.device-session.v2");
     assert_eq!(val_doc["session_id"], sid);
-    assert!(val_doc["artifact_count"].as_u64().unwrap() >= 4);
+    assert_eq!(val_doc["artifact_count"].as_u64().unwrap(), 1);
 
-    // Tamper 1 byte of left MP4 and verify `validate` rejects it!
-    let mp4_path = session_dir.join("video/left_00000.mp4");
+    // Tamper 1 byte of session.mp4 and verify `validate` rejects it!
+    let mp4_path = session_dir.join("session.mp4");
     let mut mp4_bytes = fs::read(&mp4_path).unwrap();
     mp4_bytes[0] ^= 0xFF;
     fs::write(&mp4_path, &mp4_bytes).unwrap();
@@ -1648,7 +1652,7 @@ async fn wave5_embedded_console_clock_guard_provenance_async_stop_network_busy_a
     )
     .await;
     assert_eq!(m_code, 200);
-    let validator = SchemaValidator::new(DEVICE_SESSION_V1_SCHEMA).expect("compile schema");
+    let validator = SchemaValidator::new(DEVICE_SESSION_V2_SCHEMA).expect("compile schema");
     assert!(
         validator
             .is_valid(std::str::from_utf8(&raw_manifest).unwrap())

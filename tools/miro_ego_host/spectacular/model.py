@@ -72,7 +72,7 @@ def build_model_input(timing: CaptureTiming) -> dict[str, Any]:
             }
         )
 
-    video = {
+    video: dict[str, Any] = {
         "authority": capture.video.authority,
         "layout": capture.video.layout,
         "codec": capture.video.codec,
@@ -92,6 +92,9 @@ def build_model_input(timing: CaptureTiming) -> dict[str, Any]:
         "height": capture.height,
         "fps": capture.fps,
     }
+    if capture.video.media_path is not None:
+        video["media_path"] = capture.video.media_path.relative_to(capture.root).as_posix()
+        video["tracks"] = {"left_track_id": 1, "right_track_id": 2}
 
     source_block: dict[str, Any] = {
         "schema": capture.source_schema,
@@ -184,7 +187,7 @@ def _iter_frame_timestamp_rows(timing: CaptureTiming) -> Iterator[dict[str, Any]
                 "sample_number": imu["sample_number"],
                 "sample_index": imu["sample_index"],
                 "packet_sequence": imu.get("packet_sequence"),
-                "device_timestamp_raw": imu["device_timestamp_raw"],
+                "device_timestamp_raw": imu.get("device_timestamp_raw"),
                 "device_ticks": imu.get("device_ticks"),
                 "sync_quality": imu_sync.get("quality") if isinstance(imu_sync, dict) else None,
             },

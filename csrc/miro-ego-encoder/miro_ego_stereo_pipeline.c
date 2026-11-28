@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "miro_ego_stereo_pipeline.h"
-#include "miro_ego_mp4_meta.h"
+#include "miro_ego_flac.h"
+#include "miro_ego_fmp4.h"
 #include "miro_ego_packet_queue.h"
 #include "miro_ego_sha256.h"
 #include "miro_ego_split.h"
@@ -20,7 +21,6 @@
 #include <unistd.h>
 
 #include "hb_media_codec.h"
-#include "hb_media_muxer.h"
 
 #if defined(HB_SDK_ROOT) && !defined(MIRO_EGO_STUB_HB_MEDIA_CODEC_H)
 #include "hb_mem_mgr.h"
@@ -48,111 +48,101 @@ extern int32_t hb_mem_flush_buf_with_vaddr(uint64_t virt_addr, uint64_t size)
 #define MUX_QUEUE_SECONDS 32u
 /* Bound active muxers independently of closed files waiting for hash + disk sync.
  * Both limits include their respective in-flight work. */
-#define MAX_PENDING_SEGMENTS 32u
-#define MAX_PENDING_COMMITS 64u
+#define MAX_PENDING_FRAGMENTS 16u
+#define MAX_SYNC_QUEUE_ITEMS 2048u
 
-typedef struct segment {
-    struct segment *next;
-    media_muxer_context_t muxer;
-    int seal_fd;
-    int eye;
+typedef struct sync_item {
+    struct sync_item *next;
+    uint64_t frame_seq;
+    uint64_t monotonic_ns;
+    uint64_t sample_number;
+    uint32_t duration_ticks;
+    uint8_t *pcm;
+    uint32_t pcm_len;
+    uint8_t *meta_json;
+    uint32_t meta_len;
+} sync_item_t;
+
+typedef struct frag_job {
+    struct frag_job *next;
+    uint8_t *data;
+    size_t len;
     int index;
-    char absolute[PATH_LEN];
-    char relative[PATH_LEN];
     unsigned long long start_frame;
     unsigned long long end_frame;
-    unsigned long long finalize_ns;
-    miro_ego_sha256_ctx_t sha256_ctx;
-    unsigned long long sealed_bytes;
-    int sha256_ready;
-} segment_t;
+    unsigned long long duration_ticks;
+    unsigned long long frag_offset;
+} frag_job_t;
 
 typedef struct {
     miro_ego_pipeline_t *pipeline;
     int eye;
     media_codec_context_t codec;
     pthread_t thread;
-    pthread_t writer_thread;
     miro_ego_packet_queue_t packets;
     int codec_started;
     int output_started;
-    int writer_started;
     int packets_initialized;
     atomic_ullong max_write_ns;
-    segment_t *current;
-    unsigned long long ordinal; /* encoded frames emitted so far */
 } eye_t;
-
-typedef struct closed_pair {
-    struct closed_pair *next;
-    int index;
-    int eyes;
-    char paths[MIRO_EGO_EYES][PATH_LEN];
-    char sha256[MIRO_EGO_EYES][MIRO_EGO_SHA256_HEX_LEN];
-    unsigned long long bytes[MIRO_EGO_EYES];
-    unsigned long long start;
-    unsigned long long end;
-} closed_pair_t;
 
 struct miro_ego_pipeline {
     miro_ego_pipeline_config_t config;
     char *out_dir_owned;
     char *path_prefix_owned;
+    char *output_file_owned;
     int eye_width;
-    int segment_frames;
+    int fragment_frames;
+    uint32_t timescale;
+    int audio_tracks;
 
     const miro_ego_split_ops_t *split_ops;
     void *split_ctx;
     int split_ops_initialized;
 
-    /* Reusable 256 KiB page-aligned read buffers for closer and committer threads. */
-    void *closer_io_buf;
+    /* Reusable 256 KiB page-aligned read buffer for finalizing session.mp4 SHA-256. */
     void *seal_io_buf;
 
     media_codec_context_t decoder;
     eye_t eyes[MIRO_EGO_EYES];
     pthread_t split_thread;
+    pthread_t combiner_thread;
+    pthread_t writer_thread;
     int decoder_started;
     int split_started;
-    int closer_started;
-    int committer_started;
+    int combiner_started;
+    int writer_started;
     int finish_lock_initialized;
-    int ledger_initialized;
     int error_initialized;
-    int closer_lock_initialized;
-    int closer_signal_initialized;
-    int commit_signal_initialized;
+    int sync_lock_initialized;
+    int sync_cond_initialized;
+    int writer_lock_initialized;
+    int writer_cond_initialized;
+    int writer_space_cond_initialized;
     pthread_mutex_t finish_lock;
     int finished;
 
-    miro_ego_segment_closed_fn on_segment;
+    miro_ego_fragment_fn on_fragment;
+    miro_ego_sealed_fn on_sealed;
     void *user;
 
-    /* Release the vendor muxer and finish the MP4 index before queuing hash,
-     * fsync, fadvise(DONTNEED), and directory sync. Slow durability must not
-     * occupy active muxer slots. */
-    pthread_t closer_thread;
-    pthread_mutex_t closer_lock;
-    pthread_cond_t closer_signal;
-    segment_t *closer_head;
-    segment_t *closer_tail;
-    int closer_stop;
-    atomic_uint pending_segments;
-    pthread_t committer_thread;
-    pthread_cond_t commit_signal;
-    segment_t *commit_head;
-    segment_t *commit_tail;
-    int commit_stop;
-    unsigned pending_commits;
+    pthread_mutex_t sync_lock;
+    pthread_cond_t sync_cond;
+    sync_item_t *sync_head;
+    sync_item_t *sync_tail;
+    size_t sync_count;
+    int sync_stop;
 
-    pthread_mutex_t ledger_lock;
-    /* Eyes can seal at different speeds. Keep all pending pairs until the
-     * contiguous prefix is complete instead of overwriting the last eye. */
-    closed_pair_t *closed_pairs;
-    int pending_pairs;
-    int reported_pairs;
+    pthread_mutex_t writer_lock;
+    pthread_cond_t writer_cond;
+    pthread_cond_t writer_space_cond;
+    frag_job_t *writer_head;
+    frag_job_t *writer_tail;
+    size_t pending_frags;
+    int writer_stop;
+    int writer_fd;
+
     atomic_ullong max_seal_ns;
-
     atomic_ullong offered;
     atomic_ullong submitted;
     atomic_ullong decoded;
@@ -162,6 +152,12 @@ struct miro_ego_pipeline {
     atomic_ullong drop_decoder_input;
     atomic_ullong drop_encoder_input;
     atomic_ullong drop_decoder_output;
+    atomic_ullong muxed_frames;
+    atomic_ullong fragments_written;
+    atomic_ullong total_ticks;
+    atomic_ullong fdatasync_count;
+    atomic_ullong sum_fdatasync_ns;
+    atomic_ullong max_fdatasync_ns;
 
     atomic_int stopping;        /* no more frames will be submitted */
     atomic_int abort_requested; /* immediate signal/abort stop */
@@ -190,6 +186,15 @@ static void fail(miro_ego_pipeline_t *pipeline, const char *format, ...)
     }
     pthread_mutex_unlock(&pipeline->error_lock);
     atomic_store(&pipeline->failed, 1);
+    if (pipeline->sync_cond_initialized) {
+        pthread_cond_broadcast(&pipeline->sync_cond);
+    }
+    if (pipeline->writer_space_cond_initialized) {
+        pthread_cond_broadcast(&pipeline->writer_space_cond);
+    }
+    if (pipeline->writer_cond_initialized) {
+        pthread_cond_broadcast(&pipeline->writer_cond);
+    }
 }
 
 /* ---------------------------------------------------------------- codec --- */
@@ -348,290 +353,97 @@ static int configure_encoder(media_codec_context_t *context,
 
 /* --------------------------------------------------------------- muxer --- */
 
-static void close_seal_fd(segment_t *segment)
+static void sync_item_free(sync_item_t *item)
 {
-    if (segment != NULL && segment->seal_fd >= 0) {
-        close(segment->seal_fd);
-        segment->seal_fd = -1;
+    if (item == NULL) {
+        return;
     }
+    free(item->pcm);
+    free(item->meta_json);
+    free(item);
 }
 
-static int segment_open(miro_ego_pipeline_t *pipeline, eye_t *eye, int index,
-                        unsigned long long start_frame)
+static int sync_push_locked(miro_ego_pipeline_t *pipeline, sync_item_t *item)
 {
-    unsigned pending = atomic_load(&pipeline->pending_segments);
-    do {
-        if (pending >= MAX_PENDING_SEGMENTS) {
-            fail(pipeline, "segment_queue_exhausted: pending=%u limit=%u",
-                 pending, MAX_PENDING_SEGMENTS);
-            return -1;
-        }
-    } while (!atomic_compare_exchange_weak(&pipeline->pending_segments, &pending,
-                                           pending + 1u));
-
-    segment_t *segment = calloc(1, sizeof(*segment));
-    if (segment == NULL) {
-        atomic_fetch_sub(&pipeline->pending_segments, 1u);
-        fail(pipeline, "out_of_memory: segment %d", index);
+    if (pipeline->sync_count >= MAX_SYNC_QUEUE_ITEMS) {
         return -1;
     }
-    segment->seal_fd = -1;
-    segment->eye = eye->eye;
-    segment->index = index;
-    segment->start_frame = start_frame;
-    miro_ego_sha256_init(&segment->sha256_ctx);
-
-    int rel_len = snprintf(segment->relative, sizeof(segment->relative), "%s%s_%05d.mp4",
-                           pipeline->config.path_prefix, EYE_NAMES[eye->eye], index);
-    int abs_len = snprintf(segment->absolute, sizeof(segment->absolute), "%s/%s_%05d.mp4",
-                           pipeline->config.out_dir, EYE_NAMES[eye->eye], index);
-    if (rel_len < 0 || (size_t)rel_len >= sizeof(segment->relative) ||
-        abs_len < 0 || (size_t)abs_len >= sizeof(segment->absolute)) {
-        fail(pipeline, "segment_path_too_long: eye=%s index=%d",
-             EYE_NAMES[eye->eye], index);
-        free(segment);
-        atomic_fetch_sub(&pipeline->pending_segments, 1u);
-        return -1;
+    item->next = NULL;
+    if (pipeline->sync_tail != NULL) {
+        pipeline->sync_tail->next = item;
+    } else {
+        pipeline->sync_head = item;
     }
-
-    /* Open seal_fd before the vendor muxer writes byte 0 so struct file->f_wb_err
-     * samples the inode errseq_t cursor prior to any page-cache writeback error. */
-    do {
-        segment->seal_fd = open(segment->absolute,
-                                O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
-                                0640);
-    } while (segment->seal_fd < 0 && errno == EINTR);
-    if (segment->seal_fd < 0) {
-        fail(pipeline, "segment_open_failed: open %s: %s",
-             segment->relative, strerror(errno));
-        free(segment);
-        atomic_fetch_sub(&pipeline->pending_segments, 1u);
-        return -1;
-    }
-
-    if (hb_mm_mx_get_default_context(&segment->muxer) != 0) {
-        fail(pipeline, "muxer_unavailable: default context for %s", segment->relative);
-        close_seal_fd(segment);
-        unlink(segment->absolute);
-        free(segment);
-        atomic_fetch_sub(&pipeline->pending_segments, 1u);
-        return -1;
-    }
-    segment->muxer.output_file_name = segment->absolute;
-    segment->muxer.output_format = MEDIA_MUXER_OUTPUT_FORMAT_MP4;
-    if (hb_mm_mx_initialize(&segment->muxer) != 0) {
-        fail(pipeline, "muxer_unavailable: initialize %s", segment->relative);
-        close_seal_fd(segment);
-        unlink(segment->absolute);
-        free(segment);
-        atomic_fetch_sub(&pipeline->pending_segments, 1u);
-        return -1;
-    }
-
-    mx_stream_params_t params;
-    memset(&params, 0, sizeof(params));
-    params.codec_id = pipeline->config.hevc ? MEDIA_CODEC_ID_H265 : MEDIA_CODEC_ID_H264;
-    params.numerator = 1;
-    params.denominator = pipeline->config.fps;
-    params.video_params.width = pipeline->eye_width;
-    params.video_params.height = pipeline->config.height;
-    params.video_params.frame_rate = (uint32_t)pipeline->config.fps;
-    params.video_params.bit_rate = (uint32_t)pipeline->config.bitrate_kbps;
-    params.video_params.pix_fmt = MC_PIXEL_FORMAT_NV12;
-    if (hb_mm_mx_add_stream(&segment->muxer, &params) < 0 ||
-        hb_mm_mx_start(&segment->muxer) != 0) {
-        fail(pipeline, "muxer_unavailable: start %s", segment->relative);
-        hb_mm_mx_stop(&segment->muxer);
-        close_seal_fd(segment);
-        unlink(segment->absolute);
-        free(segment);
-        atomic_fetch_sub(&pipeline->pending_segments, 1u);
-        return -1;
-    }
-    eye->current = segment;
+    pipeline->sync_tail = item;
+    pipeline->sync_count += 1u;
+    pthread_cond_signal(&pipeline->sync_cond);
     return 0;
 }
 
-static void ledger_record(miro_ego_pipeline_t *pipeline, int eye_index, int segment_index,
-                          const char *relative, unsigned long long bytes,
-                          const char sha256[MIRO_EGO_SHA256_HEX_LEN],
-                          unsigned long long start_frame, unsigned long long end_frame)
+static void sync_remove_tail_locked(miro_ego_pipeline_t *pipeline, sync_item_t *target)
 {
-    pthread_mutex_lock(&pipeline->ledger_lock);
-    if (segment_index < pipeline->reported_pairs) {
-        fail(pipeline, "segment_boundary_mismatch: segment=%d", segment_index);
-        pthread_mutex_unlock(&pipeline->ledger_lock);
+    if (pipeline->sync_tail != target) {
         return;
     }
-    closed_pair_t **position = &pipeline->closed_pairs;
-    while (*position != NULL && (*position)->index < segment_index) {
-        position = &(*position)->next;
+    sync_item_t *prev = NULL;
+    sync_item_t *cur = pipeline->sync_head;
+    while (cur != NULL && cur != target) {
+        prev = cur;
+        cur = cur->next;
     }
-    closed_pair_t *pair = *position;
-    if (pair == NULL || pair->index != segment_index) {
-        pair = pipeline->pending_pairs < 128 ? calloc(1, sizeof(*pair)) : NULL;
-        if (pair == NULL) {
-            fail(pipeline, "segment_ledger_exhausted: pending pairs=%d",
-                 pipeline->pending_pairs);
-            pthread_mutex_unlock(&pipeline->ledger_lock);
-            return;
+    if (cur == target) {
+        if (prev != NULL) {
+            prev->next = NULL;
+        } else {
+            pipeline->sync_head = NULL;
         }
-        pair->index = segment_index;
-        pair->start = start_frame;
-        pair->end = end_frame;
-        pair->next = *position;
-        *position = pair;
-        pipeline->pending_pairs += 1;
+        pipeline->sync_tail = prev;
+        pipeline->sync_count -= 1u;
     }
-    if (pair->start != start_frame || pair->end != end_frame ||
-        (pair->eyes & (1 << eye_index)) != 0) {
-        fail(pipeline, "segment_boundary_mismatch: segment=%d", segment_index);
-        pthread_mutex_unlock(&pipeline->ledger_lock);
-        return;
-    }
-    int path_len = snprintf(pair->paths[eye_index], PATH_LEN, "%s", relative);
-    if (path_len < 0 || (size_t)path_len >= PATH_LEN) {
-        fail(pipeline, "segment_path_too_long: segment=%d", segment_index);
-        pthread_mutex_unlock(&pipeline->ledger_lock);
-        return;
-    }
-    memcpy(pair->sha256[eye_index], sha256, MIRO_EGO_SHA256_HEX_LEN);
-    pair->sha256[eye_index][MIRO_EGO_SHA256_HEX_LEN - 1u] = '\0';
-    pair->eyes |= 1 << eye_index;
-    pair->bytes[eye_index] = bytes;
+}
 
-    closed_pair_t *ready_head = NULL;
-    closed_pair_t **ready_tail = &ready_head;
-    while ((pair = pipeline->closed_pairs) != NULL && pair->eyes == 3 &&
-           pair->index == pipeline->reported_pairs) {
-        pipeline->closed_pairs = pair->next;
-        pipeline->pending_pairs -= 1;
-        pipeline->reported_pairs += 1;
-        pair->next = NULL;
-        *ready_tail = pair;
-        ready_tail = &pair->next;
+static sync_item_t *sync_pop(miro_ego_pipeline_t *pipeline)
+{
+    pthread_mutex_lock(&pipeline->sync_lock);
+    while (pipeline->sync_head == NULL && !pipeline->sync_stop &&
+           atomic_load(&pipeline->failed) == 0) {
+        pthread_cond_wait(&pipeline->sync_cond, &pipeline->sync_lock);
     }
-    pthread_mutex_unlock(&pipeline->ledger_lock);
-
-    while (ready_head != NULL) {
-        closed_pair_t *ready = ready_head;
-        ready_head = ready->next;
-        if (pipeline->on_segment != NULL) {
-            pipeline->on_segment(pipeline->user, ready->index, ready->start, ready->end,
-                                 ready->paths[0], ready->bytes[0], ready->sha256[0],
-                                 ready->paths[1], ready->bytes[1], ready->sha256[1]);
+    sync_item_t *item = pipeline->sync_head;
+    if (item != NULL) {
+        pipeline->sync_head = item->next;
+        if (pipeline->sync_head == NULL) {
+            pipeline->sync_tail = NULL;
         }
-        free(ready);
+        item->next = NULL;
+        pipeline->sync_count -= 1u;
     }
+    pthread_mutex_unlock(&pipeline->sync_lock);
+    return item;
 }
 
-static void queue_segment(segment_t **head, segment_t **tail, segment_t *segment)
+static int write_all_fd(int fd, const uint8_t *buf, size_t len)
 {
-    segment->next = NULL;
-    if (*tail != NULL) {
-        (*tail)->next = segment;
-    } else {
-        *head = segment;
-    }
-    *tail = segment;
-}
-
-/* Hands the finished segment to the closer thread; never blocks the encoder. */
-static void segment_close(miro_ego_pipeline_t *pipeline, eye_t *eye)
-{
-    segment_t *segment = eye->current;
-    if (segment == NULL) {
-        return;
-    }
-    eye->current = NULL;
-    segment->end_frame = eye->ordinal;
-    pthread_mutex_lock(&pipeline->closer_lock);
-    queue_segment(&pipeline->closer_head, &pipeline->closer_tail, segment);
-    pthread_cond_signal(&pipeline->closer_signal);
-    pthread_mutex_unlock(&pipeline->closer_lock);
-}
-
-static int segment_finalize(miro_ego_pipeline_t *pipeline, segment_t *segment)
-{
-    if (segment->end_frame == segment->start_frame) {
-        /* A segment with zero frames has no media; release muxer best-effort and unlink. */
-        (void)hb_mm_mx_stop(&segment->muxer);
-        close_seal_fd(segment);
-        unlink(segment->absolute);
-        return 0;
-    }
-    if (hb_mm_mx_stop(&segment->muxer) != 0) {
-        close_seal_fd(segment);
-        fail(pipeline, "segment_seal_failed: stop %s", segment->relative);
-        return 0;
-    }
-    char reason[128] = {0};
-    if (miro_ego_mp4_extend_durations_and_hash_fd(segment->seal_fd, pipeline->config.fps,
-                                                  pipeline->closer_io_buf,
-                                                  MIRO_EGO_SHA256_IO_BUF_SIZE,
-                                                  &segment->sha256_ctx,
-                                                  &segment->sealed_bytes,
-                                                  reason, sizeof(reason)) != 0) {
-        close_seal_fd(segment);
-        fail(pipeline, "segment_seal_failed: %s duration fixup: %s",
-             segment->relative, reason);
-        return 0;
-    }
-    segment->sha256_ready = 1;
-    return 1;
-}
-
-static void segment_seal(miro_ego_pipeline_t *pipeline, segment_t *segment)
-{
-    /*
-     * Reuse segment->seal_fd opened before byte 0 so fdatasync() observes any
-     * asynchronous page-cache writeback failure via f_wb_err, finalize the
-     * incremental SHA-256 populated during MP4 finalize, fdatasync() for
-     * durability, and evict clean pages via posix_fadvise(POSIX_FADV_DONTNEED).
-     */
-    int fd = segment->seal_fd;
-    segment->seal_fd = -1;
-    if (fd < 0) {
-        fail(pipeline, "segment_seal_failed: missing descriptor for %s",
-             segment->relative);
-        return;
-    }
-    struct stat metadata;
-    memset(&metadata, 0, sizeof(metadata));
-    if (fstat(fd, &metadata) != 0 || metadata.st_size < 0) {
-        fail(pipeline, "segment_seal_failed: fstat %s: %s",
-             segment->relative, strerror(errno));
-        close(fd);
-        return;
-    }
-    const unsigned long long bytes = (unsigned long long)metadata.st_size;
-
-    char sha256_hex[MIRO_EGO_SHA256_HEX_LEN] = {0};
-    unsigned long long hashed_bytes = 0;
-    if (segment->sha256_ready) {
-        uint8_t digest[MIRO_EGO_SHA256_DIGEST_LEN];
-        miro_ego_sha256_final(&segment->sha256_ctx, digest);
-        miro_ego_sha256_to_hex(digest, sha256_hex);
-        hashed_bytes = segment->sealed_bytes;
-    } else {
-        int hash_ret = pipeline->seal_io_buf != NULL
-                           ? miro_ego_sha256_fd_with_buf(fd, pipeline->seal_io_buf,
-                                                         MIRO_EGO_SHA256_IO_BUF_SIZE,
-                                                         sha256_hex, &hashed_bytes)
-                           : miro_ego_sha256_fd(fd, sha256_hex, &hashed_bytes);
-        if (hash_ret != 0) {
-            fail(pipeline, "segment_seal_failed: sha256 %s: %s",
-                 segment->relative, strerror(errno));
-            close(fd);
-            return;
+    size_t off = 0u;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
         }
+        if (n == 0) {
+            errno = EIO;
+            return -1;
+        }
+        off += (size_t)n;
     }
-    if (hashed_bytes != bytes) {
-        fail(pipeline, "segment_seal_failed: size_mismatch %s: stat=%llu hashed=%llu",
-             segment->relative, bytes, hashed_bytes);
-        close(fd);
-        return;
-    }
+    return 0;
+}
+
+static int durable_sync_fd(int fd)
+{
     int sync_ret;
     do {
         sync_ret = fdatasync(fd);
@@ -641,25 +453,19 @@ static void segment_seal(miro_ego_pipeline_t *pipeline, segment_t *segment)
             sync_ret = fsync(fd);
         } while (sync_ret < 0 && errno == EINTR);
     }
-    if (sync_ret != 0) {
-        fail(pipeline, "segment_seal_failed: sync %s: %s",
-             segment->relative, strerror(errno));
-        close(fd);
-        return;
-    }
-    /* Evict clean pages after fsync to keep exFAT writeback queues flat. */
-    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-    close(fd);
+    return sync_ret;
+}
 
+static int durable_sync_dir(const char *dir_path)
+{
     int dir_fd;
     do {
-        dir_fd = open(pipeline->config.out_dir,
-                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        dir_fd = open(dir_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     } while (dir_fd < 0 && errno == EINTR);
     if (dir_fd < 0) {
-        fail(pipeline, "segment_seal_failed: open video directory: %s", strerror(errno));
-        return;
+        return -1;
     }
+    int sync_ret;
     do {
         sync_ret = fsync(dir_fd);
     } while (sync_ret < 0 && errno == EINTR);
@@ -668,84 +474,460 @@ static void segment_seal(miro_ego_pipeline_t *pipeline, segment_t *segment)
             sync_ret = syncfs(dir_fd);
         } while (sync_ret < 0 && errno == EINTR);
     }
-    if (sync_ret != 0 && errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP) {
-        fail(pipeline, "segment_seal_failed: sync video directory: %s", strerror(errno));
-        close(dir_fd);
-        return;
-    }
+    int saved_errno = errno;
     close(dir_fd);
-
-    ledger_record(pipeline, segment->eye, segment->index, segment->relative, bytes,
-                  sha256_hex, segment->start_frame, segment->end_frame);
+    if (sync_ret != 0 && saved_errno != EINVAL && saved_errno != ENOSYS &&
+        saved_errno != EOPNOTSUPP) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
 }
 
-static segment_t *wait_segment(miro_ego_pipeline_t *pipeline, pthread_cond_t *signal,
-                               segment_t **head, segment_t **tail, const int *stopping)
+static int writer_enqueue(miro_ego_pipeline_t *pipeline, frag_job_t *job)
 {
-    pthread_mutex_lock(&pipeline->closer_lock);
-    while (*head == NULL && !*stopping) {
-        pthread_cond_wait(signal, &pipeline->closer_lock);
+    pthread_mutex_lock(&pipeline->writer_lock);
+    while (pipeline->pending_frags >= MAX_PENDING_FRAGMENTS &&
+           !pipeline->writer_stop && atomic_load(&pipeline->failed) == 0) {
+        pthread_cond_wait(&pipeline->writer_space_cond, &pipeline->writer_lock);
     }
-    segment_t *segment = *head;
-    if (segment != NULL) {
-        *head = segment->next;
-        if (*head == NULL) {
-            *tail = NULL;
-        }
+    if (pipeline->writer_stop || atomic_load(&pipeline->failed) != 0) {
+        pthread_mutex_unlock(&pipeline->writer_lock);
+        return -1;
     }
-    pthread_mutex_unlock(&pipeline->closer_lock);
-    return segment;
+    job->next = NULL;
+    if (pipeline->writer_tail != NULL) {
+        pipeline->writer_tail->next = job;
+    } else {
+        pipeline->writer_head = job;
+    }
+    pipeline->writer_tail = job;
+    pipeline->pending_frags += 1u;
+    pthread_cond_signal(&pipeline->writer_cond);
+    pthread_mutex_unlock(&pipeline->writer_lock);
+    return 0;
 }
 
-static void *closer_thread_main(void *argument)
+static void *writer_thread_main(void *argument)
 {
     miro_ego_pipeline_t *pipeline = (miro_ego_pipeline_t *)argument;
-    segment_t *segment;
-    while ((segment = wait_segment(pipeline, &pipeline->closer_signal,
-                                   &pipeline->closer_head, &pipeline->closer_tail,
-                                   &pipeline->closer_stop)) != NULL) {
-        unsigned long long started = monotonic_time_ns();
-        int finalized = segment_finalize(pipeline, segment);
-        segment->finalize_ns = monotonic_time_ns() - started;
-        atomic_fetch_sub(&pipeline->pending_segments, 1u);
-        if (!finalized) {
-            observe_max(&pipeline->max_seal_ns, segment->finalize_ns);
-            free(segment);
-            continue;
+    for (;;) {
+        pthread_mutex_lock(&pipeline->writer_lock);
+        while (pipeline->writer_head == NULL && !pipeline->writer_stop) {
+            pthread_cond_wait(&pipeline->writer_cond, &pipeline->writer_lock);
         }
-        pthread_mutex_lock(&pipeline->closer_lock);
-        unsigned pending = pipeline->pending_commits;
-        if (pending < MAX_PENDING_COMMITS) {
-            pipeline->pending_commits += 1u;
-            queue_segment(&pipeline->commit_head, &pipeline->commit_tail, segment);
-            pthread_cond_signal(&pipeline->commit_signal);
+        frag_job_t *job = pipeline->writer_head;
+        if (job != NULL) {
+            pipeline->writer_head = job->next;
+            if (pipeline->writer_head == NULL) {
+                pipeline->writer_tail = NULL;
+            }
+            pipeline->pending_frags -= 1u;
+            pthread_cond_signal(&pipeline->writer_space_cond);
         }
-        pthread_mutex_unlock(&pipeline->closer_lock);
-        if (pending >= MAX_PENDING_COMMITS) {
-            fail(pipeline, "segment_commit_queue_exhausted: pending=%u limit=%u",
-                 pending, MAX_PENDING_COMMITS);
-            close_seal_fd(segment);
-            free(segment);
+        int fd = pipeline->writer_fd;
+        pthread_mutex_unlock(&pipeline->writer_lock);
+
+        if (job == NULL) {
+            break;
         }
+        if (atomic_load(&pipeline->failed) == 0 && fd >= 0) {
+            unsigned long long w0 = monotonic_time_ns();
+            if (write_all_fd(fd, job->data, job->len) != 0) {
+                fail(pipeline, "fragment_write_failed: index=%d: %s",
+                     job->index, strerror(errno));
+            } else {
+                unsigned long long fs0 = monotonic_time_ns();
+                if (durable_sync_fd(fd) != 0) {
+                    fail(pipeline, "fragment_sync_failed: index=%d: %s",
+                         job->index, strerror(errno));
+                } else {
+                    unsigned long long fs_dt = monotonic_time_ns() - fs0;
+                    atomic_fetch_add(&pipeline->fdatasync_count, 1ULL);
+                    atomic_fetch_add(&pipeline->sum_fdatasync_ns, fs_dt);
+                    observe_max(&pipeline->max_fdatasync_ns, fs_dt);
+                    (void)posix_fadvise(fd, (off_t)job->frag_offset,
+                                        (off_t)job->len, POSIX_FADV_DONTNEED);
+                    observe_max(&pipeline->eyes[0].max_write_ns, monotonic_time_ns() - w0);
+                    atomic_fetch_add(&pipeline->fragments_written, 1ULL);
+                    if (pipeline->on_fragment != NULL) {
+                        pipeline->on_fragment(pipeline->user, job->index,
+                                              job->start_frame, job->end_frame,
+                                              job->duration_ticks,
+                                              job->frag_offset,
+                                              (unsigned long long)job->len);
+                    }
+                }
+            }
+        }
+        free(job->data);
+        free(job);
     }
     return NULL;
 }
 
-static void *committer_thread_main(void *argument)
+static int resolve_output_paths(const miro_ego_pipeline_t *pipeline,
+                                char *rel_out, size_t rel_cap,
+                                char *abs_out, size_t abs_cap)
+{
+    const char *name = (pipeline->output_file_owned != NULL &&
+                        pipeline->output_file_owned[0] != '\0')
+                           ? pipeline->output_file_owned
+                           : "session.mp4";
+    int n1 = snprintf(rel_out, rel_cap, "%s", name);
+    int n2 = (name[0] == '/')
+                 ? snprintf(abs_out, abs_cap, "%s", name)
+                 : snprintf(abs_out, abs_cap, "%s/%s",
+                            pipeline->out_dir_owned, name);
+    if (n1 < 0 || (size_t)n1 >= rel_cap || n2 < 0 || (size_t)n2 >= abs_cap) {
+        return -1;
+    }
+    return 0;
+}
+
+static void *mux_combiner_thread_main(void *argument)
 {
     miro_ego_pipeline_t *pipeline = (miro_ego_pipeline_t *)argument;
-    segment_t *segment;
-    while ((segment = wait_segment(pipeline, &pipeline->commit_signal,
-                                   &pipeline->commit_head, &pipeline->commit_tail,
-                                   &pipeline->commit_stop)) != NULL) {
-        unsigned long long started = monotonic_time_ns();
-        segment_seal(pipeline, segment);
-        observe_max(&pipeline->max_seal_ns, segment->finalize_ns + monotonic_time_ns() - started);
-        free(segment);
-        pthread_mutex_lock(&pipeline->closer_lock);
-        pipeline->pending_commits -= 1u;
-        pthread_mutex_unlock(&pipeline->closer_lock);
+    miro_ego_fmp4_t mx;
+    memset(&mx, 0, sizeof(mx));
+    miro_ego_video_ps_t ps[MIRO_EGO_EYES] = {{0}, {0}};
+    miro_ego_bbuf_t avcc[MIRO_EGO_EYES] = {{0}, {0}};
+    miro_ego_bbuf_t mfra_buf = {0};
+    uint8_t *flac_buf = NULL;
+    size_t flac_cap = 0u;
+    size_t flac_len = 0u;
+    int16_t *flac_l = NULL;
+    int16_t *flac_r = NULL;
+    int16_t *silent_pcm = NULL;
+    size_t silent_cap_samples = 0u;
+    int out_fd = -1;
+
+    if (pipeline->audio_tracks > 0) {
+        flac_l = malloc(65536u * sizeof(int16_t));
+        flac_r = malloc(65536u * sizeof(int16_t));
+        if (flac_l == NULL || flac_r == NULL) {
+            fail(pipeline, "out_of_memory: flac scratch");
+            goto cleanup;
+        }
     }
+
+    char rel_path[PATH_LEN] = {0};
+    char abs_path[PATH_LEN] = {0};
+    if (resolve_output_paths(pipeline, rel_path, sizeof(rel_path),
+                             abs_path, sizeof(abs_path)) != 0) {
+        fail(pipeline, "output_path_too_long");
+        goto cleanup;
+    }
+
+    const uint32_t default_dur =
+        pipeline->config.fps > 0
+            ? (pipeline->timescale / (uint32_t)pipeline->config.fps)
+            : 1600u;
+
+    int mx_opened = 0;
+    int writable = 1;
+    int frag_index = 0;
+    unsigned long long ordinal = 0ULL;
+    unsigned long long frag_start_frame = 0ULL;
+    unsigned long long total_ticks = 0ULL;
+
+    for (;;) {
+        miro_ego_packet_t *pkt_l = miro_ego_packet_queue_pop(&pipeline->eyes[0].packets);
+        miro_ego_packet_t *pkt_r = miro_ego_packet_queue_pop(&pipeline->eyes[1].packets);
+        if (pkt_l == NULL || pkt_r == NULL) {
+            if (pkt_l != NULL) miro_ego_packet_queue_done(&pipeline->eyes[0].packets, pkt_l);
+            if (pkt_r != NULL) miro_ego_packet_queue_done(&pipeline->eyes[1].packets, pkt_r);
+            break;
+        }
+        sync_item_t *sb = sync_pop(pipeline);
+
+        if (writable && atomic_load(&pipeline->failed) == 0) {
+            int idr_l = 0;
+            int idr_r = 0;
+            if (miro_ego_annexb_to_avcc(pipeline->config.hevc, pkt_l->data, pkt_l->size,
+                                        &ps[0], &avcc[0], &idr_l) != 0 ||
+                miro_ego_annexb_to_avcc(pipeline->config.hevc, pkt_r->data, pkt_r->size,
+                                        &ps[1], &avcc[1], &idr_r) != 0) {
+                fail(pipeline, "video_annexb_parse_failed: frame=%llu", ordinal);
+                writable = 0;
+            }
+            int is_idr_l = pkt_l->key_frame || idr_l;
+            int is_idr_r = pkt_r->key_frame || idr_r;
+            if (writable && ordinal == frag_start_frame && (!is_idr_l || !is_idr_r)) {
+                fail(pipeline, "segment_missing_idr: frame=%llu", ordinal);
+                writable = 0;
+            }
+
+            if (writable && !mx_opened) {
+                do {
+                    out_fd = open(abs_path, O_RDWR | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                                  0640);
+                } while (out_fd < 0 && errno == EINTR);
+                if (out_fd < 0) {
+                    fail(pipeline, "segment_open_failed: open %s: %s",
+                         rel_path, strerror(errno));
+                    writable = 0;
+                } else if (miro_ego_fmp4_init(&mx, out_fd, pipeline->config.hevc,
+                                              pipeline->audio_tracks, pipeline->eye_width,
+                                              pipeline->config.height,
+                                              pipeline->timescale) != 0 ||
+                           miro_ego_fmp4_write_header(&mx, ps) != 0 ||
+                           durable_sync_fd(out_fd) != 0) {
+                    fail(pipeline, "muxer_header_failed: %s", rel_path);
+                    writable = 0;
+                } else {
+                    pthread_mutex_lock(&pipeline->writer_lock);
+                    pipeline->writer_fd = out_fd;
+                    pthread_mutex_unlock(&pipeline->writer_lock);
+                    mx_opened = 1;
+                }
+            }
+
+            if (writable) {
+                uint32_t dur = (sb != NULL && sb->duration_ticks > 0u)
+                                   ? sb->duration_ticks
+                                   : default_dur;
+                uint64_t sample_no = (sb != NULL) ? sb->sample_number : total_ticks;
+
+                if (pipeline->audio_tracks > 0) {
+                    const int16_t *pcm_ptr = NULL;
+                    uint32_t blocksize = dur;
+                    if (sb != NULL && sb->pcm_len > 0u) {
+                        if (sb->pcm_len % 4u != 0u ||
+                            sb->pcm_len / 4u != dur ||
+                            dur == 0u || dur > 65535u) {
+                            fail(pipeline, "sync_audio_duration_mismatch: frame=%llu pcm=%u dur=%u",
+                                 ordinal, sb->pcm_len, dur);
+                            writable = 0;
+                        } else {
+                            pcm_ptr = (const int16_t *)sb->pcm;
+                            blocksize = sb->pcm_len / 4u;
+                        }
+                    } else {
+                        if (blocksize == 0u || blocksize > 65535u) {
+                            fail(pipeline, "invalid_audio_blocksize: %u", blocksize);
+                            writable = 0;
+                        } else {
+                            if ((size_t)blocksize * 2u > silent_cap_samples) {
+                                int16_t *np = realloc(silent_pcm,
+                                                      (size_t)blocksize * 2u * sizeof(int16_t));
+                                if (np == NULL) {
+                                    fail(pipeline, "out_of_memory: silent pcm");
+                                    writable = 0;
+                                } else {
+                                    memset(np, 0, (size_t)blocksize * 2u * sizeof(int16_t));
+                                    silent_pcm = np;
+                                    silent_cap_samples = (size_t)blocksize * 2u;
+                                }
+                            }
+                            pcm_ptr = silent_pcm;
+                        }
+                    }
+                    if (writable &&
+                        miro_ego_flac_encode_frame(&flac_buf, &flac_cap, &flac_len, pcm_ptr,
+                                                   blocksize, sample_no, flac_l, flac_r) != 0) {
+                        fail(pipeline, "flac_encode_failed: frame=%llu", ordinal);
+                        writable = 0;
+                    }
+                }
+
+                char fallback_meta[128];
+                const uint8_t *meta_ptr = NULL;
+                uint32_t meta_len = 0u;
+                if (sb != NULL && sb->meta_json != NULL && sb->meta_len > 0u) {
+                    meta_ptr = sb->meta_json;
+                    meta_len = sb->meta_len;
+                } else {
+                    int ml = snprintf(fallback_meta, sizeof(fallback_meta),
+                                      "{\"seq\":%llu,\"ticks\":%u}", ordinal, dur);
+                    meta_ptr = (const uint8_t *)fallback_meta;
+                    meta_len = ml > 0 ? (uint32_t)ml : 2u;
+                }
+
+                if (writable) {
+                    uint32_t flags_l = is_idr_l ? 0x02000000u : 0x01010000u;
+                    uint32_t flags_r = is_idr_r ? 0x02000000u : 0x01010000u;
+                    int meta_track = pipeline->audio_tracks > 0 ? 3 : 2;
+                    int push_err = 0;
+                    if (miro_ego_fmp4_push_sample(&mx, 0, dur, avcc[0].data,
+                                                  (uint32_t)avcc[0].len, flags_l) != 0 ||
+                        miro_ego_fmp4_push_sample(&mx, 1, dur, avcc[1].data,
+                                                  (uint32_t)avcc[1].len, flags_r) != 0) {
+                        push_err = 1;
+                    }
+                    if (!push_err && pipeline->audio_tracks > 0) {
+                        if (miro_ego_fmp4_push_sample(&mx, 2, dur, flac_buf,
+                                                      (uint32_t)flac_len, 0x02000000u) != 0) {
+                            push_err = 1;
+                        }
+                    }
+                    if (!push_err &&
+                        miro_ego_fmp4_push_sample(&mx, meta_track, dur, meta_ptr,
+                                                  meta_len, 0x02000000u) != 0) {
+                        push_err = 1;
+                    }
+                    if (push_err) {
+                        fail(pipeline, "fmp4_push_sample_failed: frame=%llu", ordinal);
+                        writable = 0;
+                    }
+                }
+
+                if (writable) {
+                    atomic_fetch_add(&pipeline->bytes[0], (unsigned long long)pkt_l->size);
+                    atomic_fetch_add(&pipeline->bytes[1], (unsigned long long)pkt_r->size);
+                    ordinal += 1ULL;
+                    total_ticks += (unsigned long long)dur;
+                    atomic_store(&pipeline->muxed_frames, ordinal);
+                    atomic_store(&pipeline->total_ticks, total_ticks);
+
+                    if (pipeline->fragment_frames > 0 &&
+                        (ordinal - frag_start_frame) >= (unsigned long long)pipeline->fragment_frames) {
+                        miro_ego_bbuf_t frag_buf = {0};
+                        uint64_t frag_off = 0u;
+                        uint64_t frag_dur = 0u;
+                        if (miro_ego_fmp4_build_fragment(&mx, &frag_buf, &frag_off, &frag_dur) != 0) {
+                            miro_ego_bbuf_free(&frag_buf);
+                            fail(pipeline, "fmp4_build_fragment_failed: index=%d", frag_index);
+                            writable = 0;
+                        } else if (frag_buf.len > 0u) {
+                            frag_job_t *job = calloc(1, sizeof(*job));
+                            if (job == NULL) {
+                                miro_ego_bbuf_free(&frag_buf);
+                                fail(pipeline, "out_of_memory: frag job");
+                                writable = 0;
+                            } else {
+                                job->data = frag_buf.data;
+                                job->len = frag_buf.len;
+                                job->index = frag_index;
+                                job->start_frame = frag_start_frame;
+                                job->end_frame = ordinal;
+                                job->duration_ticks = frag_dur;
+                                job->frag_offset = frag_off;
+                                if (writer_enqueue(pipeline, job) != 0) {
+                                    free(job->data);
+                                    free(job);
+                                    writable = 0;
+                                } else {
+                                    frag_index += 1;
+                                    frag_start_frame = ordinal;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        sync_item_free(sb);
+        miro_ego_packet_queue_done(&pipeline->eyes[0].packets, pkt_l);
+        miro_ego_packet_queue_done(&pipeline->eyes[1].packets, pkt_r);
+    }
+
+    if (writable && mx_opened && atomic_load(&pipeline->failed) == 0 &&
+        mx.tracks[0].n_samples > 0u) {
+        miro_ego_bbuf_t frag_buf = {0};
+        uint64_t frag_off = 0u;
+        uint64_t frag_dur = 0u;
+        if (miro_ego_fmp4_build_fragment(&mx, &frag_buf, &frag_off, &frag_dur) != 0) {
+            miro_ego_bbuf_free(&frag_buf);
+            fail(pipeline, "fmp4_build_fragment_failed: tail index=%d", frag_index);
+            writable = 0;
+        } else if (frag_buf.len > 0u) {
+            frag_job_t *job = calloc(1, sizeof(*job));
+            if (job == NULL) {
+                miro_ego_bbuf_free(&frag_buf);
+                fail(pipeline, "out_of_memory: tail frag job");
+                writable = 0;
+            } else {
+                job->data = frag_buf.data;
+                job->len = frag_buf.len;
+                job->index = frag_index;
+                job->start_frame = frag_start_frame;
+                job->end_frame = ordinal;
+                job->duration_ticks = frag_dur;
+                job->frag_offset = frag_off;
+                if (writer_enqueue(pipeline, job) != 0) {
+                    free(job->data);
+                    free(job);
+                    writable = 0;
+                } else {
+                    frag_index += 1;
+                }
+            }
+        }
+    }
+
+    pthread_mutex_lock(&pipeline->writer_lock);
+    pipeline->writer_stop = 1;
+    pthread_cond_broadcast(&pipeline->writer_cond);
+    pthread_cond_broadcast(&pipeline->writer_space_cond);
+    pthread_mutex_unlock(&pipeline->writer_lock);
+    if (pipeline->writer_started) {
+        pthread_join(pipeline->writer_thread, NULL);
+        pipeline->writer_started = 0;
+    }
+
+    if (writable && mx_opened && atomic_load(&pipeline->failed) == 0) {
+        unsigned long long seal_started = monotonic_time_ns();
+        if (miro_ego_fmp4_build_mfra(&mx, &mfra_buf) != 0 ||
+            write_all_fd(out_fd, mfra_buf.data, mfra_buf.len) != 0 ||
+            miro_ego_fmp4_patch_moov_durations(&mx, out_fd, total_ticks) != 0 ||
+            durable_sync_fd(out_fd) != 0) {
+            fail(pipeline, "segment_seal_failed: finalize %s: %s",
+                 rel_path, strerror(errno));
+        } else {
+            struct stat st;
+            memset(&st, 0, sizeof(st));
+            char sha256_hex[MIRO_EGO_SHA256_HEX_LEN] = {0};
+            unsigned long long hashed_bytes = 0ULL;
+            if (fstat(out_fd, &st) != 0 || st.st_size < 0) {
+                fail(pipeline, "segment_seal_failed: fstat %s: %s",
+                     rel_path, strerror(errno));
+            } else {
+                const unsigned long long bytes = (unsigned long long)st.st_size;
+                int hret = pipeline->seal_io_buf != NULL
+                               ? miro_ego_sha256_fd_with_buf(out_fd, pipeline->seal_io_buf,
+                                                             MIRO_EGO_SHA256_IO_BUF_SIZE,
+                                                             sha256_hex, &hashed_bytes)
+                               : miro_ego_sha256_fd(out_fd, sha256_hex, &hashed_bytes);
+                if (hret != 0 || hashed_bytes != bytes) {
+                    fail(pipeline, "segment_seal_failed: sha256 %s (stat=%llu hashed=%llu)",
+                         rel_path, bytes, hashed_bytes);
+                } else {
+                    (void)posix_fadvise(out_fd, 0, 0, POSIX_FADV_DONTNEED);
+                    close(out_fd);
+                    out_fd = -1;
+                    if (durable_sync_dir(pipeline->out_dir_owned) != 0) {
+                        fail(pipeline, "segment_seal_failed: sync directory: %s",
+                             strerror(errno));
+                    } else {
+                        observe_max(&pipeline->max_seal_ns, monotonic_time_ns() - seal_started);
+                        if (pipeline->on_sealed != NULL) {
+                            pipeline->on_sealed(pipeline->user, rel_path, bytes, sha256_hex,
+                                                ordinal, total_ticks,
+                                                (unsigned long long)mx.moof_seq,
+                                                pipeline->audio_tracks);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+cleanup:
+    if (out_fd >= 0) {
+        close(out_fd);
+    }
+    miro_ego_fmp4_destroy(&mx);
+    for (int i = 0; i < MIRO_EGO_EYES; i += 1) {
+        miro_ego_video_ps_free(&ps[i]);
+        miro_ego_bbuf_free(&avcc[i]);
+    }
+    miro_ego_bbuf_free(&mfra_buf);
+    free(flac_buf);
+    free(flac_l);
+    free(flac_r);
+    free(silent_pcm);
     return NULL;
 }
 
@@ -926,62 +1108,6 @@ static void ion_invalidate_nv12_frame(const media_codec_buffer_t *frame)
 static void ion_flush_nv12_frame(const media_codec_buffer_t *frame)
 {
     ion_cache_nv12_frame(frame, 0);
-}
-
-static void *mux_writer_thread(void *argument)
-{
-    eye_t *eye = (eye_t *)argument;
-    miro_ego_pipeline_t *pipeline = eye->pipeline;
-    int writable = 1;
-    miro_ego_packet_t *packet;
-    while ((packet = miro_ego_packet_queue_pop(&eye->packets)) != NULL) {
-        if (writable && eye->current == NULL) {
-            int seg_index = pipeline->segment_frames > 0
-                                ? (int)(eye->ordinal / (unsigned long long)pipeline->segment_frames)
-                                : 0;
-            writable = segment_open(pipeline, eye, seg_index, eye->ordinal) == 0;
-        }
-        if (writable) {
-            mx_stream_t stream;
-            memset(&stream, 0, sizeof(stream));
-            stream.vir_ptr = packet->data;
-            stream.size = (uint32_t)packet->size;
-            stream.pts = eye->ordinal - eye->current->start_frame;
-            stream.is_key_frame = packet->key_frame;
-            unsigned long long started = monotonic_time_ns();
-            if (eye->ordinal == eye->current->start_frame && !packet->key_frame) {
-                fail(pipeline, "segment_missing_idr: %s", eye->current->relative);
-                writable = 0;
-            } else if (hb_mm_mx_write_stream(&eye->current->muxer, &stream) != 0) {
-                fail(pipeline, "segment_write_failed: %s", eye->current->relative);
-                writable = 0;
-            }
-            observe_max(&eye->max_write_ns, monotonic_time_ns() - started);
-            if (writable) {
-                atomic_fetch_add(&pipeline->bytes[eye->eye], (unsigned long long)packet->size);
-                eye->ordinal += 1ULL;
-                if (pipeline->segment_frames > 0 &&
-                    eye->ordinal % (unsigned long long)pipeline->segment_frames == 0) {
-                    segment_close(pipeline, eye);
-                }
-            }
-        }
-        miro_ego_packet_queue_done(&eye->packets, packet);
-    }
-    /* A failed write can have partially changed the tail MP4. Preserve that
-     * file for diagnosis, but never emit it as a completed segment. */
-    if (writable) {
-        if (eye->current != NULL) {
-            segment_close(pipeline, eye);
-        }
-    } else if (eye->current != NULL) {
-        hb_mm_mx_stop(&eye->current->muxer);
-        close_seal_fd(eye->current);
-        free(eye->current);
-        atomic_fetch_sub(&pipeline->pending_segments, 1u);
-        eye->current = NULL;
-    }
-    return NULL;
 }
 
 static void *encoder_output_thread(void *argument)
@@ -1225,7 +1351,9 @@ static void *split_thread_main(void *argument)
 /* ------------------------------------------------------------- lifetime --- */
 
 int miro_ego_pipeline_open(const miro_ego_pipeline_config_t *config,
-                           miro_ego_segment_closed_fn on_segment, void *user,
+                           miro_ego_fragment_fn on_fragment,
+                           miro_ego_sealed_fn on_sealed,
+                           void *user,
                            miro_ego_pipeline_t **out, char *error, size_t error_len)
 {
     if (out != NULL) {
@@ -1235,17 +1363,27 @@ int miro_ego_pipeline_open(const miro_ego_pipeline_config_t *config,
         config->sbs_width <= 0 || config->sbs_width % 4 != 0 || config->sbs_width > 16384 ||
         config->height <= 0 || config->height % 2 != 0 || config->height > 16384 ||
         config->fps <= 0 || config->fps > 60 ||
-        config->segment_frames < 0 || config->intra_period < 0 ||
-        config->intra_period > 300 || config->hevc < 0 || config->hevc > 1 ||
+        config->segment_frames < 0 || config->fragment_frames < 0 ||
+        config->timescale < 0 || config->audio_tracks < 0 || config->audio_tracks > 1 ||
+        config->intra_period < 0 || config->intra_period > 300 ||
+        config->hevc < 0 || config->hevc > 1 ||
         config->rate_control < 0 || config->rate_control > 3 ||
         config->bitrate_kbps < 1 || config->bitrate_kbps > 100000 ||
         config->min_qp < 0 || config->max_qp > 51 || config->min_qp > config->max_qp ||
         config->intra_qp < config->min_qp || config->intra_qp > config->max_qp ||
         config->initial_qp < config->min_qp || config->initial_qp > config->max_qp ||
         config->vbv_ms < 1 || config->vbv_ms > 3000 ||
-        config->input_stall_timeout_ms < 0 || config->input_stall_timeout_ms > 60000 ||
-        (config->segment_frames > 0 && config->segment_frames %
-         (config->intra_period > 0 ? config->intra_period : config->fps) != 0)) {
+        config->input_stall_timeout_ms < 0 || config->input_stall_timeout_ms > 60000) {
+        if (error != NULL && error_len > 0) {
+            snprintf(error, error_len, "invalid_configuration");
+        }
+        return -1;
+    }
+    const int eff_intra = config->intra_period > 0 ? config->intra_period : config->fps;
+    const int eff_frag = config->fragment_frames > 0
+                             ? config->fragment_frames
+                             : (config->segment_frames > 0 ? config->segment_frames : eff_intra);
+    if (eff_frag > 0 && eff_frag % eff_intra != 0) {
         if (error != NULL && error_len > 0) {
             snprintf(error, error_len, "invalid_configuration");
         }
@@ -1268,20 +1406,23 @@ int miro_ego_pipeline_open(const miro_ego_pipeline_config_t *config,
         }
         return -1;
     }
+    pipeline->writer_fd = -1;
     pipeline->config = *config;
     pipeline->split_ops = split_ops;
     pipeline->out_dir_owned = strdup(config->out_dir);
     pipeline->path_prefix_owned = strdup(config->path_prefix != NULL ? config->path_prefix : "");
-    if (pipeline->out_dir_owned == NULL || pipeline->path_prefix_owned == NULL) {
+    pipeline->output_file_owned =
+        strdup((config->output_file != NULL && config->output_file[0] != '\0')
+                   ? config->output_file
+                   : "session.mp4");
+    if (pipeline->out_dir_owned == NULL || pipeline->path_prefix_owned == NULL ||
+        pipeline->output_file_owned == NULL) {
         if (error != NULL && error_len > 0) {
             snprintf(error, error_len, "out_of_memory");
         }
         goto open_failed;
     }
-    if (posix_memalign(&pipeline->closer_io_buf, MIRO_EGO_SHA256_IO_ALIGN,
-                       MIRO_EGO_SHA256_IO_BUF_SIZE) != 0 ||
-        pipeline->closer_io_buf == NULL ||
-        posix_memalign(&pipeline->seal_io_buf, MIRO_EGO_SHA256_IO_ALIGN,
+    if (posix_memalign(&pipeline->seal_io_buf, MIRO_EGO_SHA256_IO_ALIGN,
                        MIRO_EGO_SHA256_IO_BUF_SIZE) != 0 ||
         pipeline->seal_io_buf == NULL) {
         if (error != NULL && error_len > 0) {
@@ -1292,35 +1433,43 @@ int miro_ego_pipeline_open(const miro_ego_pipeline_config_t *config,
 
     pipeline->config.out_dir = pipeline->out_dir_owned;
     pipeline->config.path_prefix = pipeline->path_prefix_owned;
+    pipeline->config.output_file = pipeline->output_file_owned;
     pipeline->eye_width = config->sbs_width / MIRO_EGO_EYES;
-    pipeline->segment_frames = config->segment_frames;
-    pipeline->on_segment = on_segment;
+    pipeline->fragment_frames = eff_frag;
+    pipeline->timescale = config->timescale > 0 ? (uint32_t)config->timescale : 48000u;
+    pipeline->audio_tracks = config->audio_tracks;
+    pipeline->on_fragment = on_fragment;
+    pipeline->on_sealed = on_sealed;
     pipeline->user = user;
 
     const char *resource = "finish lock";
     int ret = pthread_mutex_init(&pipeline->finish_lock, NULL);
     if (ret != 0) goto sync_failed;
     pipeline->finish_lock_initialized = 1;
-    resource = "ledger lock";
-    ret = pthread_mutex_init(&pipeline->ledger_lock, NULL);
-    if (ret != 0) goto sync_failed;
-    pipeline->ledger_initialized = 1;
     resource = "error lock";
     ret = pthread_mutex_init(&pipeline->error_lock, NULL);
     if (ret != 0) goto sync_failed;
     pipeline->error_initialized = 1;
-    resource = "closer lock";
-    ret = pthread_mutex_init(&pipeline->closer_lock, NULL);
+    resource = "sync lock";
+    ret = pthread_mutex_init(&pipeline->sync_lock, NULL);
     if (ret != 0) goto sync_failed;
-    pipeline->closer_lock_initialized = 1;
-    resource = "closer condition";
-    ret = pthread_cond_init(&pipeline->closer_signal, NULL);
+    pipeline->sync_lock_initialized = 1;
+    resource = "sync condition";
+    ret = pthread_cond_init(&pipeline->sync_cond, NULL);
     if (ret != 0) goto sync_failed;
-    pipeline->closer_signal_initialized = 1;
-    resource = "commit condition";
-    ret = pthread_cond_init(&pipeline->commit_signal, NULL);
+    pipeline->sync_cond_initialized = 1;
+    resource = "writer lock";
+    ret = pthread_mutex_init(&pipeline->writer_lock, NULL);
     if (ret != 0) goto sync_failed;
-    pipeline->commit_signal_initialized = 1;
+    pipeline->writer_lock_initialized = 1;
+    resource = "writer condition";
+    ret = pthread_cond_init(&pipeline->writer_cond, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->writer_cond_initialized = 1;
+    resource = "writer space condition";
+    ret = pthread_cond_init(&pipeline->writer_space_cond, NULL);
+    if (ret != 0) goto sync_failed;
+    pipeline->writer_space_cond_initialized = 1;
 
     /* Complete shared queue setup before any worker can observe an eye. */
     for (int eye = 0; eye < MIRO_EGO_EYES; eye += 1) {
@@ -1373,24 +1522,19 @@ int miro_ego_pipeline_open(const miro_ego_pipeline_config_t *config,
         pipeline->eyes[eye].codec_started = 1;
     }
 
-    const char *worker = "committer";
-    ret = pthread_create(&pipeline->committer_thread, NULL, committer_thread_main, pipeline);
+    const char *worker = "writer";
+    ret = pthread_create(&pipeline->writer_thread, NULL, writer_thread_main, pipeline);
     if (ret != 0) goto thread_failed;
-    pipeline->committer_started = 1;
-    worker = "closer";
-    ret = pthread_create(&pipeline->closer_thread, NULL, closer_thread_main, pipeline);
+    pipeline->writer_started = 1;
+    worker = "combiner";
+    ret = pthread_create(&pipeline->combiner_thread, NULL, mux_combiner_thread_main, pipeline);
     if (ret != 0) goto thread_failed;
-    pipeline->closer_started = 1;
+    pipeline->combiner_started = 1;
     worker = "splitter";
     ret = pthread_create(&pipeline->split_thread, NULL, split_thread_main, pipeline);
     if (ret != 0) goto thread_failed;
     pipeline->split_started = 1;
     for (int eye = 0; eye < MIRO_EGO_EYES; eye += 1) {
-        worker = eye == 0 ? "left writer" : "right writer";
-        ret = pthread_create(&pipeline->eyes[eye].writer_thread, NULL, mux_writer_thread,
-                             &pipeline->eyes[eye]);
-        if (ret != 0) goto thread_failed;
-        pipeline->eyes[eye].writer_started = 1;
         worker = eye == 0 ? "left output" : "right output";
         ret = pthread_create(&pipeline->eyes[eye].thread, NULL, encoder_output_thread,
                              &pipeline->eyes[eye]);
@@ -1416,8 +1560,10 @@ open_failed:
     return -1;
 }
 
-int miro_ego_pipeline_submit(miro_ego_pipeline_t *pipeline, const unsigned char *jpeg,
-                             size_t length, int timeout_ms)
+int miro_ego_pipeline_submit_bundle(miro_ego_pipeline_t *pipeline,
+                                    const unsigned char *jpeg, size_t length,
+                                    const miro_ego_sync_bundle_t *bundle,
+                                    int timeout_ms)
 {
     if (pipeline == NULL) {
         return -1;
@@ -1431,17 +1577,59 @@ int miro_ego_pipeline_submit(miro_ego_pipeline_t *pipeline, const unsigned char 
         fail(pipeline, "decoder_input_invalid: bytes=%zu", length);
         return -1;
     }
+    if (bundle != NULL &&
+        ((bundle->pcm_len > 0u && bundle->pcm == NULL) ||
+         (bundle->meta_len > 0u && bundle->meta_json == NULL))) {
+        atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
+        fail(pipeline, "sync_bundle_invalid");
+        return -1;
+    }
+
+    sync_item_t *item = calloc(1, sizeof(*item));
+    if (item == NULL) {
+        atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
+        fail(pipeline, "out_of_memory: sync_item");
+        return -1;
+    }
+    if (bundle != NULL) {
+        item->frame_seq = bundle->frame_seq;
+        item->monotonic_ns = bundle->monotonic_ns;
+        item->sample_number = bundle->sample_number;
+        item->duration_ticks = bundle->duration_ticks;
+        if (bundle->pcm_len > 0u) {
+            item->pcm = malloc(bundle->pcm_len);
+            if (item->pcm == NULL) {
+                sync_item_free(item);
+                fail(pipeline, "out_of_memory: sync pcm");
+                return -1;
+            }
+            memcpy(item->pcm, bundle->pcm, bundle->pcm_len);
+            item->pcm_len = bundle->pcm_len;
+        }
+        if (bundle->meta_len > 0u) {
+            item->meta_json = malloc(bundle->meta_len);
+            if (item->meta_json == NULL) {
+                sync_item_free(item);
+                fail(pipeline, "out_of_memory: sync meta");
+                return -1;
+            }
+            memcpy(item->meta_json, bundle->meta_json, bundle->meta_len);
+            item->meta_len = bundle->meta_len;
+        }
+    }
 
     media_codec_buffer_t input;
     const int timeout = timeout_ms > 0 ? timeout_ms : DECODER_INPUT_TIMEOUT_MS;
     int ret = dequeue_input_with_retry(pipeline, &pipeline->decoder, &input, timeout, 1);
     if (ret != 0) {
+        sync_item_free(item);
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
         fail(pipeline, "decoder_input_dequeue_failed: ret=%d timeout_ms=%d bytes=%zu",
              ret, timeout, length);
         return -1;
     }
     if ((size_t)input.vstream_buf.size < length || input.vstream_buf.vir_ptr == NULL) {
+        sync_item_free(item);
         fail(pipeline, "decoder_input_capacity: bytes=%zu capacity=%u",
              length, input.vstream_buf.size);
         input.vstream_buf.size = 0;
@@ -1455,14 +1643,38 @@ int miro_ego_pipeline_submit(miro_ego_pipeline_t *pipeline, const unsigned char 
     input.vstream_buf.stream_end = 0;
     memcpy(input.vstream_buf.vir_ptr, jpeg, length);
     ion_flush_range(input.vstream_buf.vir_ptr, (uint64_t)length);
+
+    pthread_mutex_lock(&pipeline->sync_lock);
+    int sync_pushed = sync_push_locked(pipeline, item);
+    pthread_mutex_unlock(&pipeline->sync_lock);
+    if (sync_pushed != 0) {
+        sync_item_free(item);
+        input.vstream_buf.size = 0;
+        input.vstream_buf.stream_end = 0;
+        hb_mm_mc_queue_input_buffer(&pipeline->decoder, &input, DECODER_INPUT_TIMEOUT_MS);
+        atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
+        fail(pipeline, "sync_queue_exhausted");
+        return -1;
+    }
+
     ret = hb_mm_mc_queue_input_buffer(&pipeline->decoder, &input, DECODER_INPUT_TIMEOUT_MS);
     if (ret != 0) {
+        pthread_mutex_lock(&pipeline->sync_lock);
+        sync_remove_tail_locked(pipeline, item);
+        pthread_mutex_unlock(&pipeline->sync_lock);
+        sync_item_free(item);
         atomic_fetch_add(&pipeline->drop_decoder_input, 1ULL);
         fail(pipeline, "decoder_input_queue_failed: ret=%d bytes=%zu", ret, length);
         return -1;
     }
     atomic_fetch_add(&pipeline->submitted, 1ULL);
     return 0;
+}
+
+int miro_ego_pipeline_submit(miro_ego_pipeline_t *pipeline, const unsigned char *jpeg,
+                             size_t length, int timeout_ms)
+{
+    return miro_ego_pipeline_submit_bundle(pipeline, jpeg, length, NULL, timeout_ms);
 }
 
 int miro_ego_pipeline_finish(miro_ego_pipeline_t *pipeline)
@@ -1485,28 +1697,36 @@ int miro_ego_pipeline_finish(miro_ego_pipeline_t *pipeline)
             if (pipeline->eyes[eye].output_started) {
                 pthread_join(pipeline->eyes[eye].thread, NULL);
             }
-            /* Startup can fail after a writer starts but before its producer does. */
             if (pipeline->eyes[eye].packets_initialized) {
                 miro_ego_packet_queue_close(&pipeline->eyes[eye].packets);
             }
-            if (pipeline->eyes[eye].writer_started) {
-                pthread_join(pipeline->eyes[eye].writer_thread, NULL);
+        }
+        if (pipeline->sync_lock_initialized) {
+            pthread_mutex_lock(&pipeline->sync_lock);
+            pipeline->sync_stop = 1;
+            if (pipeline->sync_cond_initialized) {
+                pthread_cond_broadcast(&pipeline->sync_cond);
             }
+            pthread_mutex_unlock(&pipeline->sync_lock);
         }
-        /* Only once both eyes stopped queueing can the closer drain to empty. */
-        if (pipeline->closer_started) {
-            pthread_mutex_lock(&pipeline->closer_lock);
-            pipeline->closer_stop = 1;
-            pthread_cond_signal(&pipeline->closer_signal);
-            pthread_mutex_unlock(&pipeline->closer_lock);
-            pthread_join(pipeline->closer_thread, NULL);
+        if (pipeline->combiner_started) {
+            pthread_join(pipeline->combiner_thread, NULL);
+            pipeline->combiner_started = 0;
         }
-        if (pipeline->committer_started) {
-            pthread_mutex_lock(&pipeline->closer_lock);
-            pipeline->commit_stop = 1;
-            pthread_cond_signal(&pipeline->commit_signal);
-            pthread_mutex_unlock(&pipeline->closer_lock);
-            pthread_join(pipeline->committer_thread, NULL);
+        if (pipeline->writer_lock_initialized) {
+            pthread_mutex_lock(&pipeline->writer_lock);
+            pipeline->writer_stop = 1;
+            if (pipeline->writer_cond_initialized) {
+                pthread_cond_broadcast(&pipeline->writer_cond);
+            }
+            if (pipeline->writer_space_cond_initialized) {
+                pthread_cond_broadcast(&pipeline->writer_space_cond);
+            }
+            pthread_mutex_unlock(&pipeline->writer_lock);
+        }
+        if (pipeline->writer_started) {
+            pthread_join(pipeline->writer_thread, NULL);
+            pipeline->writer_started = 0;
         }
         pipeline->finished = 1;
     }
@@ -1528,10 +1748,16 @@ void miro_ego_pipeline_close(miro_ego_pipeline_t *pipeline)
             miro_ego_packet_queue_destroy(&pipeline->eyes[eye].packets);
         }
     }
-    while (pipeline->closed_pairs != NULL) {
-        closed_pair_t *pair = pipeline->closed_pairs;
-        pipeline->closed_pairs = pair->next;
-        free(pair);
+    while (pipeline->sync_head != NULL) {
+        sync_item_t *item = pipeline->sync_head;
+        pipeline->sync_head = item->next;
+        sync_item_free(item);
+    }
+    while (pipeline->writer_head != NULL) {
+        frag_job_t *job = pipeline->writer_head;
+        pipeline->writer_head = job->next;
+        free(job->data);
+        free(job);
     }
     if (pipeline->decoder_started) {
         codec_stop(&pipeline->decoder);
@@ -1540,28 +1766,31 @@ void miro_ego_pipeline_close(miro_ego_pipeline_t *pipeline)
         pipeline->split_ops->destroy != NULL) {
         pipeline->split_ops->destroy(pipeline->split_ctx);
     }
-    if (pipeline->ledger_initialized) {
-        pthread_mutex_destroy(&pipeline->ledger_lock);
+    if (pipeline->writer_space_cond_initialized) {
+        pthread_cond_destroy(&pipeline->writer_space_cond);
+    }
+    if (pipeline->writer_cond_initialized) {
+        pthread_cond_destroy(&pipeline->writer_cond);
+    }
+    if (pipeline->writer_lock_initialized) {
+        pthread_mutex_destroy(&pipeline->writer_lock);
+    }
+    if (pipeline->sync_cond_initialized) {
+        pthread_cond_destroy(&pipeline->sync_cond);
+    }
+    if (pipeline->sync_lock_initialized) {
+        pthread_mutex_destroy(&pipeline->sync_lock);
     }
     if (pipeline->error_initialized) {
         pthread_mutex_destroy(&pipeline->error_lock);
     }
-    if (pipeline->commit_signal_initialized) {
-        pthread_cond_destroy(&pipeline->commit_signal);
-    }
-    if (pipeline->closer_lock_initialized) {
-        pthread_mutex_destroy(&pipeline->closer_lock);
-    }
-    if (pipeline->closer_signal_initialized) {
-        pthread_cond_destroy(&pipeline->closer_signal);
-    }
     if (pipeline->finish_lock_initialized) {
         pthread_mutex_destroy(&pipeline->finish_lock);
     }
-    free(pipeline->closer_io_buf);
     free(pipeline->seal_io_buf);
     free(pipeline->out_dir_owned);
     free(pipeline->path_prefix_owned);
+    free(pipeline->output_file_owned);
     free(pipeline);
 }
 
@@ -1583,6 +1812,12 @@ void miro_ego_pipeline_stats(const miro_ego_pipeline_t *pipeline,
     out->drop_encoder_input = atomic_load(&mutable_pipeline->drop_encoder_input);
     out->drop_decoder_output = atomic_load(&mutable_pipeline->drop_decoder_output);
     out->max_seal_ns = atomic_load(&mutable_pipeline->max_seal_ns);
+    out->muxed_frames = atomic_load(&mutable_pipeline->muxed_frames);
+    out->fragments_written = atomic_load(&mutable_pipeline->fragments_written);
+    out->total_ticks = atomic_load(&mutable_pipeline->total_ticks);
+    out->fdatasync_count = atomic_load(&mutable_pipeline->fdatasync_count);
+    out->sum_fdatasync_ns = atomic_load(&mutable_pipeline->sum_fdatasync_ns);
+    out->max_fdatasync_ns = atomic_load(&mutable_pipeline->max_fdatasync_ns);
     for (int eye = 0; eye < MIRO_EGO_EYES; eye += 1) {
         out->encoded[eye] = atomic_load(&mutable_pipeline->encoded[eye]);
         out->bytes[eye] = atomic_load(&mutable_pipeline->bytes[eye]);

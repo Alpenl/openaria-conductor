@@ -42,6 +42,8 @@ EXPORT_SPACE_HEADROOM = 64 * 1024**2
 
 EXPECTED_VOLUME_LABEL = "MIRO-EGO"
 SESSION_MANIFEST_SCHEMA = "miro-ego.device-session.v1"
+SESSION_MANIFEST_V2_SCHEMA = "miro-ego.device-session.v2"
+SESSION_MANIFEST_SCHEMAS = frozenset({SESSION_MANIFEST_SCHEMA, SESSION_MANIFEST_V2_SCHEMA})
 EXPORT_REPORT_SCHEMA = "miro-ego.card-export-report.v1"
 
 DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -630,57 +632,68 @@ def _read_node_bytes(node: Any, *, max_bytes: int) -> bytes:
 
 
 def manifest_artifacts(manifest: Any) -> dict[str, tuple[int, str]]:
-    """Extract and validate all declared artifacts from a ``miro-ego.device-session.v1`` manifest.
+    """Extract and validate artifacts from a ``miro-ego.device-session.v1`` or ``v2`` manifest.
 
     Returns ``{relative_posix_path: (expected_bytes, expected_sha256)}``.
     """
     if not isinstance(manifest, dict):
         raise RuntimeError("Session manifest must be a JSON object")
-    if manifest.get("schema") != SESSION_MANIFEST_SCHEMA:
-        raise RuntimeError(f"Unsupported session manifest schema: {manifest.get('schema')!r}")
+    schema = manifest.get("schema")
+    if schema not in SESSION_MANIFEST_SCHEMAS:
+        raise RuntimeError(f"Unsupported session manifest schema: {schema!r}")
     if manifest.get("sealed") is not True:
         raise RuntimeError("Session manifest is not marked sealed")
 
     declared: list[Any] = []
 
-    video = manifest.get("video")
-    if (
-        not isinstance(video, dict)
-        or not isinstance(video.get("segments"), list)
-        or not video["segments"]
-    ):
-        raise RuntimeError("Session manifest is missing video.segments")
-    for segment in video["segments"]:
-        if not isinstance(segment, dict) or not isinstance(segment.get("artifacts"), dict):
-            raise RuntimeError("Invalid video segment entry in manifest")
-        artifacts = segment["artifacts"]
-        declared.append(artifacts.get("left"))
-        declared.append(artifacts.get("right"))
+    if schema == SESSION_MANIFEST_V2_SCHEMA:
+        media = manifest.get("media")
+        if not isinstance(media, dict) or not isinstance(media.get("artifact"), dict):
+            raise RuntimeError("Session manifest is missing media.artifact")
+        declared.append(media["artifact"])
+        audio = manifest.get("audio")
+        audio_state = audio.get("state") if isinstance(audio, dict) else None
+        if not isinstance(audio, dict) or audio_state not in {"recorded", "not_recorded"}:
+            raise RuntimeError(f"Unknown audio state in manifest: {audio_state!r}")
+    else:
+        video = manifest.get("video")
+        if (
+            not isinstance(video, dict)
+            or not isinstance(video.get("segments"), list)
+            or not video["segments"]
+        ):
+            raise RuntimeError("Session manifest is missing video.segments")
+        for segment in video["segments"]:
+            if not isinstance(segment, dict) or not isinstance(segment.get("artifacts"), dict):
+                raise RuntimeError("Invalid video segment entry in manifest")
+            artifacts = segment["artifacts"]
+            declared.append(artifacts.get("left"))
+            declared.append(artifacts.get("right"))
 
-    imu = manifest.get("imu")
-    if not isinstance(imu, dict) or not isinstance(imu.get("artifact"), dict):
-        raise RuntimeError("Session manifest is missing imu.artifact")
-    declared.append(imu["artifact"])
+        imu = manifest.get("imu")
+        if not isinstance(imu, dict) or not isinstance(imu.get("artifact"), dict):
+            raise RuntimeError("Session manifest is missing imu.artifact")
+        declared.append(imu["artifact"])
 
-    frames = manifest.get("frames")
-    if not isinstance(frames, dict) or not isinstance(frames.get("artifact"), dict):
-        raise RuntimeError("Session manifest is missing frames.artifact")
-    declared.append(frames["artifact"])
+        frames = manifest.get("frames")
+        if not isinstance(frames, dict) or not isinstance(frames.get("artifact"), dict):
+            raise RuntimeError("Session manifest is missing frames.artifact")
+        declared.append(frames["artifact"])
 
-    audio = manifest.get("audio")
-    if not isinstance(audio, dict):
-        raise RuntimeError("Session manifest is missing audio section")
-    audio_state = audio.get("state")
-    if audio_state == "recorded":
-        segments = audio.get("segments")
-        if not isinstance(segments, list) or not segments:
-            raise RuntimeError("Recorded audio manifest is missing audio.segments")
-        for segment in segments:
-            if not isinstance(segment, dict) or not isinstance(segment.get("artifact"), dict):
-                raise RuntimeError("Invalid audio segment entry in manifest")
-            declared.append(segment["artifact"])
-    elif audio_state != "not_recorded":
-        raise RuntimeError(f"Unknown audio state in manifest: {audio_state!r}")
+        audio = manifest.get("audio")
+        if not isinstance(audio, dict):
+            raise RuntimeError("Session manifest is missing audio section")
+        audio_state = audio.get("state")
+        if audio_state == "recorded":
+            segments = audio.get("segments")
+            if not isinstance(segments, list) or not segments:
+                raise RuntimeError("Recorded audio manifest is missing audio.segments")
+            for segment in segments:
+                if not isinstance(segment, dict) or not isinstance(segment.get("artifact"), dict):
+                    raise RuntimeError("Invalid audio segment entry in manifest")
+                declared.append(segment["artifact"])
+        elif audio_state != "not_recorded":
+            raise RuntimeError(f"Unknown audio state in manifest: {audio_state!r}")
 
     logs = manifest.get("logs")
     if not isinstance(logs, list):

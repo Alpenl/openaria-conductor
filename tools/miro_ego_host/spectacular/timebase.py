@@ -256,6 +256,46 @@ def _analyze_capture(
         max_residual_p95_ms,
     )
 
+    if capture.source_schema == "miro-ego.device-session.v2":
+        sample_count = len(capture.imu_samples)
+        if sample_count < 6:
+            raise CaptureValidationError("v2 IMU timing requires at least 6 embedded samples")
+        for idx, rec in enumerate(capture.imu_samples):
+            if idx > 0 and int(rec["host_monotonic_ns"]) < int(
+                capture.imu_samples[idx - 1]["host_monotonic_ns"]
+            ):
+                raise CaptureValidationError("v2 embedded IMU host timestamps regressed")
+        spp = max(1, int(capture.imu_samples_per_packet))
+        packet_samples = [
+            capture.imu_samples[min(i + spp - 1, sample_count - 1)]
+            for i in range(0, sample_count - (sample_count % spp), spp)
+        ]
+        if len(packet_samples) < 3:
+            raise CaptureValidationError("v2 IMU timing requires at least 3 complete packets")
+        packet_hosts = [int(rec["host_monotonic_ns"]) for rec in packet_samples]
+        _, imu_clock = _fit_clock(
+            list(range(len(packet_hosts))),
+            packet_hosts,
+            imu_rate_hz / spp if imu_rate_hz is not None else None,
+            "IMU packet",
+            max_rate_error_ppm,
+            max_imu_residual_p95_ms,
+        )
+        imu_times = [float(int(rec["host_monotonic_ns"])) for rec in capture.imu_samples]
+        overlap_start = max(frame_times[0], imu_times[0])
+        overlap_end = min(frame_times[-1], imu_times[-1])
+        if overlap_end <= overlap_start:
+            raise CaptureValidationError("video and IMU timing windows do not overlap")
+        return CaptureTiming(
+            capture=capture,
+            frame_times_ns=tuple(frame_times),
+            imu_times_ns=tuple(imu_times),
+            frame_clock=frame_clock,
+            imu_clock=imu_clock,
+            imu_read_p95_ms=0.0,
+            imu_time_basis="mett_sync_host_monotonic",
+        )
+
     packets = _imu_packets(capture)
     packet_records = [packet[-1] for packet in packets]
     _validate_packet_timestamps(packets)

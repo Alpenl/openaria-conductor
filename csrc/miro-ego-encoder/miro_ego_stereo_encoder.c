@@ -155,6 +155,8 @@ static void emit_stats(const char *event, const miro_ego_pipeline_stats_t *stats
          "\"left_write_queue_peak_frames\":%llu,\"right_write_queue_peak_frames\":%llu,"
          "\"left_write_queue_rejected\":%llu,\"right_write_queue_rejected\":%llu,"
          "\"left_max_write_ns\":%llu,\"right_max_write_ns\":%llu,\"max_seal_ns\":%llu,"
+         "\"muxed_frames\":%llu,\"fragments_written\":%llu,\"total_ticks\":%llu,"
+         "\"fdatasync_count\":%llu,\"max_fdatasync_ns\":%llu,"
          "\"shm_dropped_frames\":%llu}",
          event, stats->offered, stats->submitted, stats->decoded,
          stats->encoded[0], stats->encoded[1], stats->bytes[0], stats->bytes[1],
@@ -163,6 +165,8 @@ static void emit_stats(const char *event, const miro_ego_pipeline_stats_t *stats
          stats->write_queue_peak_frames[0], stats->write_queue_peak_frames[1],
          stats->write_queue_rejected[0], stats->write_queue_rejected[1],
          stats->max_write_ns[0], stats->max_write_ns[1], stats->max_seal_ns,
+         stats->muxed_frames, stats->fragments_written, stats->total_ticks,
+         stats->fdatasync_count, stats->max_fdatasync_ns,
          shm_dropped_frames);
 }
 
@@ -170,32 +174,41 @@ typedef struct {
     atomic_int stats_pending;
 } encoder_callback_ctx_t;
 
-static void on_segment(void *user, int index,
-                       unsigned long long start_frame, unsigned long long end_frame,
-                       const char *left_path, unsigned long long left_bytes,
-                       const char *left_sha256,
-                       const char *right_path, unsigned long long right_bytes,
-                       const char *right_sha256)
+static void on_fragment(void *user, int index,
+                        unsigned long long start_frame, unsigned long long end_frame,
+                        unsigned long long duration_ticks,
+                        unsigned long long frag_offset, unsigned long long frag_bytes)
 {
     FILE *stream = event_output();
     flockfile(stream);
     fprintf(stream,
-            "{\"event\":\"segment\",\"index\":%d,\"start_frame\":%llu,\"end_frame\":%llu,"
-            "\"left_path\":",
-            index, start_frame, end_frame);
-    miro_ego_write_json_string(stream, left_path);
-    fprintf(stream, ",\"left_bytes\":%llu,\"left_sha256\":", left_bytes);
-    miro_ego_write_json_string(stream, left_sha256);
-    fputs(",\"right_path\":", stream);
-    miro_ego_write_json_string(stream, right_path);
-    fprintf(stream, ",\"right_bytes\":%llu,\"right_sha256\":", right_bytes);
-    miro_ego_write_json_string(stream, right_sha256);
-    fputs("}\n", stream);
+            "{\"event\":\"fragment\",\"index\":%d,\"start_frame\":%llu,\"end_frame\":%llu,"
+            "\"duration_ticks\":%llu,\"frag_offset\":%llu,\"frag_bytes\":%llu}\n",
+            index, start_frame, end_frame, duration_ticks, frag_offset, frag_bytes);
     fflush(stream);
     funlockfile(stream);
     if (user != NULL) {
         atomic_store(&((encoder_callback_ctx_t *)user)->stats_pending, 1);
     }
+}
+
+static void on_sealed(void *user, const char *artifact_path,
+                      unsigned long long bytes, const char *sha256_hex,
+                      unsigned long long total_frames, unsigned long long total_ticks,
+                      unsigned long long moof_count, int has_audio)
+{
+    (void)user;
+    FILE *stream = event_output();
+    flockfile(stream);
+    fputs("{\"event\":\"sealed\",\"path\":", stream);
+    miro_ego_write_json_string(stream, artifact_path);
+    fprintf(stream, ",\"bytes\":%llu,\"sha256\":", bytes);
+    miro_ego_write_json_string(stream, sha256_hex);
+    fprintf(stream, ",\"frames\":%llu,\"duration_ticks\":%llu,"
+                    "\"moof_count\":%llu,\"has_audio\":%s}\n",
+            total_frames, total_ticks, moof_count, has_audio ? "true" : "false");
+    fflush(stream);
+    funlockfile(stream);
 }
 
 typedef enum {
@@ -229,10 +242,11 @@ static input_result_t read_exact(void *destination, size_t length)
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s --out-dir DIR [--shm-fd FD --kick-fd FD --done-fd FD | --stdin]\n"
+            "usage: %s --out-dir DIR [--output-file session.mp4]\n"
+            "          [--shm-fd FD --kick-fd FD --done-fd FD | --stdin]\n"
             "          [--width 3840] [--height 1080] [--fps 30]\n"
-            "          [--bitrate-kbps 8192] [--segment-frames 900]\n"
-            "          [--path-prefix video/] [--min-qp 20] [--intra-qp 22]\n"
+            "          [--bitrate-kbps 8192] [--fragment-frames 30] [--timescale 48000]\n"
+            "          [--audio-tracks 1] [--min-qp 20] [--intra-qp 22]\n"
             "          [--initial-qp 24] [--max-qp 51] [--intra-period 0] [--vbv-ms 3000]\n"
             "          [--codec h264|hevc] [--rc-mode cbr|vbr|fixqp|avbr]\n",
             program);
@@ -263,9 +277,13 @@ int main(int argc, char **argv)
         .intra_qp = 22,
         .initial_qp = 24,
         .vbv_ms = 3000,
-        .segment_frames = 900,
+        .segment_frames = 0,
+        .fragment_frames = 0,
+        .timescale = 48000,
+        .audio_tracks = 0,
         .out_dir = NULL,
-        .path_prefix = "video/",
+        .path_prefix = "",
+        .output_file = "session.mp4",
         .split_ops = NULL,
         .preview = {0},
     };
@@ -284,6 +302,9 @@ int main(int argc, char **argv)
         {"--fps", &config.fps},
         {"--bitrate-kbps", &config.bitrate_kbps},
         {"--segment-frames", &config.segment_frames},
+        {"--fragment-frames", &config.fragment_frames},
+        {"--timescale", &config.timescale},
+        {"--audio-tracks", &config.audio_tracks},
         {"--intra-period", &config.intra_period},
         {"--min-qp", &config.min_qp},
         {"--max-qp", &config.max_qp},
@@ -312,6 +333,8 @@ int main(int argc, char **argv)
             config.out_dir = argv[++index];
         } else if (strcmp(name, "--path-prefix") == 0 && has_value) {
             config.path_prefix = argv[++index];
+        } else if (strcmp(name, "--output-file") == 0 && has_value) {
+            config.output_file = argv[++index];
         } else if (has_value) {
             bool matched = false;
             for (size_t opt = 0; opt < sizeof(int_options) / sizeof(int_options[0]); opt += 1) {
@@ -367,7 +390,7 @@ int main(int argc, char **argv)
 
     encoder_callback_ctx_t callback_ctx = {0};
     miro_ego_pipeline_t *pipeline = NULL;
-    if (miro_ego_pipeline_open(&config, on_segment, &callback_ctx, &pipeline,
+    if (miro_ego_pipeline_open(&config, on_fragment, on_sealed, &callback_ctx, &pipeline,
                                error, sizeof(error)) != 0) {
         if (use_shm) {
             miro_ego_shm_ring_detach(&shm_ring);
@@ -412,8 +435,24 @@ int main(int argc, char **argv)
             }
 
             /* Zero-copy submit directly from mapped memfd slot into JPU DMA buffer. */
-            const int submit_ret = miro_ego_pipeline_submit(
-                pipeline, frame.data, (size_t)frame.payload_len, 0);
+            int submit_ret;
+            if ((frame.flags & MIRO_EGO_SHM_SLOT_FLAG_SYNC_BUNDLE) != 0u) {
+                miro_ego_sync_bundle_t bundle = {
+                    .frame_seq = frame.frame_seq,
+                    .monotonic_ns = frame.monotonic_ns,
+                    .sample_number = frame.sample_number,
+                    .duration_ticks = frame.duration_ticks,
+                    .pcm = frame.pcm,
+                    .pcm_len = frame.pcm_len,
+                    .meta_json = frame.meta,
+                    .meta_len = frame.meta_len,
+                };
+                submit_ret = miro_ego_pipeline_submit_bundle(
+                    pipeline, frame.data, (size_t)frame.payload_len, &bundle, 0);
+            } else {
+                submit_ret = miro_ego_pipeline_submit(
+                    pipeline, frame.data, (size_t)frame.payload_len, 0);
+            }
             const miro_ego_shm_status_t release_ret = miro_ego_shm_ring_release(&shm_ring);
 
             if (submit_ret != 0) {

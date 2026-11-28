@@ -173,6 +173,7 @@ impl ActiveCaptureHandle for DummyHandle {
                 requested_mode: "disabled".to_owned(),
                 reason: "disabled".to_owned(),
             },
+            synced_fmp4: None,
             logs: Vec::new(),
         })
     }

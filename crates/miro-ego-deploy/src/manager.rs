@@ -213,6 +213,12 @@ pub const DEPLOYMENT_ASSETS: &[AssetSpec] = &[
         preserve_if_exists: false,
     },
     AssetSpec {
+        source_name: "uvcvideo-miro-ego.conf",
+        dest_relative: "etc/modprobe.d/uvcvideo-miro-ego.conf",
+        mode: 0o644,
+        preserve_if_exists: false,
+    },
+    AssetSpec {
         source_name: "zz-miro-ego-wifi-powersave.conf",
         dest_relative: "etc/NetworkManager/conf.d/zz-miro-ego-wifi-powersave.conf",
         mode: 0o644,
@@ -2015,6 +2021,18 @@ impl ReleaseManager {
             let _ = self
                 .systemctl
                 .run_bootstrap_command("nmcli", &["general", "reload", "conf"]);
+        }
+
+        let uvcvideo_conf = self
+            .paths
+            .system_root
+            .join("etc/modprobe.d/uvcvideo-miro-ego.conf");
+        let uvcvideo_param = self
+            .paths
+            .system_root
+            .join("sys/module/uvcvideo/parameters/hwtimestamps");
+        if uvcvideo_conf.is_file() && uvcvideo_param.exists() {
+            let _ = fs::write(&uvcvideo_param, b"1\n");
         }
 
         let device_login = self

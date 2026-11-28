@@ -11,11 +11,11 @@
 //! - `miro-ego validate <session-dir>`
 //! - `miro-ego version` / `--version` / `--help`
 
-use crate::DEVICE_SESSION_V1_SCHEMA;
 use crate::runtime::{
     CaptureModeKind, DaemonServeOptions, NoopHealthChecker, NoopSystemctlRunner, bind_daemon,
     run_bound_daemon_with_shutdown, wait_for_termination_signal,
 };
+use crate::{DEVICE_SESSION_V1_SCHEMA, DEVICE_SESSION_V2_SCHEMA};
 use miro_ego_api::API_V1_PREFIX;
 use miro_ego_capture::audio;
 use miro_ego_capture::session::shm_ring::SHM_VERSION;
@@ -1911,15 +1911,25 @@ pub fn validate_session_dir(session_dir: &Path) -> Result<Value, String> {
 
     let raw_str = std::str::from_utf8(&opened.raw_bytes)
         .map_err(|err| format!("manifest.json is not valid UTF-8: {err}"))?;
-    let validator = SchemaValidator::new(DEVICE_SESSION_V1_SCHEMA)
-        .map_err(|err| format!("failed to compile device-session v1 schema: {err}"))?;
+    let schema_name = opened
+        .parsed
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "manifest.json missing schema discriminator".to_owned())?;
+    let schema_src = match schema_name {
+        "miro-ego.device-session.v1" => DEVICE_SESSION_V1_SCHEMA,
+        "miro-ego.device-session.v2" => DEVICE_SESSION_V2_SCHEMA,
+        other => return Err(format!("unsupported manifest schema: {other}")),
+    };
+    let validator = SchemaValidator::new(schema_src)
+        .map_err(|err| format!("failed to compile {schema_name} schema: {err}"))?;
     let schema_valid = validator
         .is_valid(raw_str)
         .map_err(|err| format!("schema validation error: {err}"))?;
     if !schema_valid {
-        return Err(
-            "manifest.json failed miro-ego.device-session.v1 JSON Schema validation".to_owned(),
-        );
+        return Err(format!(
+            "manifest.json failed {schema_name} JSON Schema validation"
+        ));
     }
 
     let session_id = opened
@@ -1943,6 +1953,9 @@ pub fn validate_session_dir(session_dir: &Path) -> Result<Value, String> {
                         desc.path, desc.artifact_id
                     )
                 })?;
+        if schema_name == "miro-ego.device-session.v2" && desc.role == "media.session" {
+            validate_fmp4_box_structure(&canonical_dir.join(&desc.path))?;
+        }
         total_bytes = total_bytes.saturating_add(verified.descriptor.bytes);
         verified_artifacts.push(json!({
             "role": verified.descriptor.role,
@@ -1954,13 +1967,71 @@ pub fn validate_session_dir(session_dir: &Path) -> Result<Value, String> {
 
     Ok(json!({
         "valid": true,
-        "schema": "miro-ego.device-session.v1",
+        "schema": schema_name,
         "session_id": session_id,
         "manifest_sha256": opened.sha256,
         "artifact_count": verified_artifacts.len(),
         "total_bytes": total_bytes,
         "artifacts": verified_artifacts,
     }))
+}
+
+fn validate_fmp4_box_structure(path: &Path) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file =
+        fs::File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|err| format!("failed to stat {}: {err}", path.display()))?
+        .len();
+    let mut pos = 0_u64;
+    let mut saw_ftyp = false;
+    let mut saw_moov = false;
+    let mut saw_moof = false;
+    let mut saw_mdat = false;
+
+    while pos.saturating_add(8) <= file_len {
+        file.seek(SeekFrom::Start(pos))
+            .map_err(|err| format!("seek {} box: {err}", path.display()))?;
+        let mut hdr = [0_u8; 8];
+        file.read_exact(&mut hdr)
+            .map_err(|err| format!("read {} box header: {err}", path.display()))?;
+        let sz32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        let tag = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        let (hdr_len, total_size) = if sz32 == 1 {
+            let mut ext = [0_u8; 8];
+            file.read_exact(&mut ext)
+                .map_err(|err| format!("read {} ext box size: {err}", path.display()))?;
+            (16_u64, u64::from_be_bytes(ext))
+        } else if sz32 == 0 {
+            (8_u64, file_len - pos)
+        } else {
+            (8_u64, u64::from(sz32))
+        };
+        if total_size < hdr_len || pos.saturating_add(total_size) > file_len {
+            return Err(format!("truncated ISO-BMFF box in {}", path.display()));
+        }
+        if pos == 0 && &tag != b"ftyp" {
+            return Err(format!("{} does not start with ftyp box", path.display()));
+        }
+        match &tag {
+            b"ftyp" => saw_ftyp = true,
+            b"moov" => saw_moov = true,
+            b"moof" => saw_moof = true,
+            b"mdat" => saw_mdat = true,
+            _ => {}
+        }
+        pos += total_size;
+    }
+
+    if pos != file_len || !saw_ftyp || !saw_moov || !saw_moof || !saw_mdat {
+        return Err(format!(
+            "{} missing required fMP4 boxes (ftyp={saw_ftyp}, moov={saw_moov}, moof={saw_moof}, mdat={saw_mdat})",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn run_validate(session_dir: &Path) -> Result<(), String> {

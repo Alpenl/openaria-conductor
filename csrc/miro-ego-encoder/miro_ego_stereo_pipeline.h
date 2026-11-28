@@ -15,6 +15,7 @@
 #define MIRO_EGO_STEREO_PIPELINE_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "miro_ego_split.h"
 
@@ -39,13 +40,28 @@ typedef struct {
     int intra_qp;
     int initial_qp;
     int vbv_ms;
-    int segment_frames; /* frames per segment; 0 keeps a single open segment */
-    const char *out_dir;     /* directory that receives the segment files */
-    const char *path_prefix; /* relative prefix reported back, e.g. "video/" */
+    int segment_frames; /* legacy alias for fragment_frames */
+    int fragment_frames;/* frames per [moof][mdat] fragment; 0 selects intra_period */
+    int timescale;      /* unified sample timescale (default 48000 Hz) */
+    int audio_tracks;   /* 1 = include lossless FLAC audio track, 0 = video+meta only */
+    const char *out_dir;     /* directory that receives output_file */
+    const char *path_prefix; /* legacy field retained for ABI compatibility */
+    const char *output_file; /* filename inside out_dir, default "session.mp4" */
     const miro_ego_split_ops_t *split_ops; /* NULL selects default CPU/NEON backend */
     miro_ego_preview_config_t preview;     /* optional preview hook for VSE backend */
     int input_stall_timeout_ms;            /* 0 selects default 5000ms backpressure ceiling */
 } miro_ego_pipeline_config_t;
+
+typedef struct {
+    uint64_t frame_seq;
+    uint64_t monotonic_ns;
+    uint64_t sample_number;
+    uint32_t duration_ticks;
+    const uint8_t *pcm;
+    uint32_t pcm_len;
+    const uint8_t *meta_json;
+    uint32_t meta_len;
+} miro_ego_sync_bundle_t;
 
 typedef struct {
     unsigned long long offered;         /* frames handed to submit() */
@@ -61,34 +77,55 @@ typedef struct {
     unsigned long long write_queue_rejected[MIRO_EGO_EYES];
     unsigned long long max_write_ns[MIRO_EGO_EYES];
     unsigned long long max_seal_ns;
+    unsigned long long muxed_frames;
+    unsigned long long fragments_written;
+    unsigned long long total_ticks;
+    unsigned long long fdatasync_count;
+    unsigned long long sum_fdatasync_ns;
+    unsigned long long max_fdatasync_ns;
 } miro_ego_pipeline_stats_t;
 
 /*
- * Invoked once a segment index has closed, been hashed, fsynced, and evicted
- * from page cache on both eyes. Paths are relative to the session root
- * (path_prefix + file name). SHA-256 strings are 64 lowercase hex characters.
- * The callback runs on an internal thread outside ledger_lock and must not call
- * back into the pipeline.
+ * Invoked once a standalone [moof][mdat] fragment has been written and
+ * fdatasynced to disk cleanly on the async writer thread.
  */
-typedef void (*miro_ego_segment_closed_fn)(void *user, int index,
-                                           unsigned long long start_frame,
-                                           unsigned long long end_frame,
-                                           const char *left_path,
-                                           unsigned long long left_bytes,
-                                           const char *left_sha256,
-                                           const char *right_path,
-                                           unsigned long long right_bytes,
-                                           const char *right_sha256);
+typedef void (*miro_ego_fragment_fn)(void *user, int index,
+                                     unsigned long long start_frame,
+                                     unsigned long long end_frame,
+                                     unsigned long long duration_ticks,
+                                     unsigned long long frag_offset,
+                                     unsigned long long frag_bytes);
+
+/*
+ * Invoked once at finish() after mfra append, moov duration patching,
+ * final fdatasync, full-file SHA-256 verification, and out_dir fsync.
+ */
+typedef void (*miro_ego_sealed_fn)(void *user,
+                                   const char *artifact_path,
+                                   unsigned long long bytes,
+                                   const char *sha256_hex,
+                                   unsigned long long total_frames,
+                                   unsigned long long total_ticks,
+                                   unsigned long long moof_count,
+                                   int has_audio);
 
 int miro_ego_pipeline_open(const miro_ego_pipeline_config_t *config,
-                           miro_ego_segment_closed_fn on_segment, void *user,
+                           miro_ego_fragment_fn on_fragment,
+                           miro_ego_sealed_fn on_sealed,
+                           void *user,
                            miro_ego_pipeline_t **out, char *error, size_t error_len);
 
 /* Returns 0 when the frame entered the JPU, -1 when it was dropped or failed. */
 int miro_ego_pipeline_submit(miro_ego_pipeline_t *pipeline, const unsigned char *jpeg,
                              size_t length, int timeout_ms);
 
-/* Drains the codecs and closes/seals the trailing segment. */
+/* Submits one MJPEG frame together with its synchronized audio PCM slice & meta JSON. */
+int miro_ego_pipeline_submit_bundle(miro_ego_pipeline_t *pipeline,
+                                    const unsigned char *jpeg, size_t length,
+                                    const miro_ego_sync_bundle_t *bundle,
+                                    int timeout_ms);
+
+/* Drains the codecs, writes mfra + moov duration patch, hashes, and seals session.mp4. */
 int miro_ego_pipeline_finish(miro_ego_pipeline_t *pipeline);
 
 void miro_ego_pipeline_close(miro_ego_pipeline_t *pipeline);

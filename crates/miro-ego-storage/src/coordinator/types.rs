@@ -8,7 +8,7 @@ use crate::volume::CaptureStorageBudget;
 use crate::{StorageError, StorageResult};
 use miro_ego_core::config::RecordingEncoding;
 use miro_ego_core::ids::{is_valid_uuid_v4, is_valid_uuid_v7, new_uuid_v4};
-use miro_ego_core::media_types::SegmentEvent;
+use miro_ego_core::media_types::{FragmentEvent, SealedMediaEvent, SegmentEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fmt;
@@ -785,6 +785,16 @@ pub struct DropEventRecord {
     pub dropped: u64,
 }
 
+/// Metadata describing a sealed single-fMP4 (`session.mp4`, `v2`) capture outcome.
+#[derive(Debug, Clone)]
+pub struct SyncedFmp4Artifacts {
+    pub sealed: SealedMediaEvent,
+    pub fragments: Vec<FragmentEvent>,
+    pub audio_sample_rate: Option<u32>,
+    pub audio_channels: Option<u16>,
+    pub audio_capture_clock: Option<Value>,
+}
+
 /// Complete set of staged artifacts and streaming digests returned by [`ActiveCaptureHandle::finish`].
 #[derive(Debug, Clone)]
 pub struct CapturedSessionArtifacts {
@@ -794,6 +804,7 @@ pub struct CapturedSessionArtifacts {
     pub imu_artifact: CapturedArtifact,
     pub imu_sample_count: u64,
     pub audio: CapturedAudioOutcome,
+    pub synced_fmp4: Option<SyncedFmp4Artifacts>,
     pub logs: Vec<CapturedArtifact>,
     pub dropped_frames: u64,
     pub drop_events: Vec<DropEventRecord>,

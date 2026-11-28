@@ -36,14 +36,16 @@ SRCS := \
 	miro_ego_shm_ring.c \
 	miro_ego_sha256.c \
 	miro_ego_split.c \
-	miro_ego_mp4_meta.c
+	miro_ego_flac.c \
+	miro_ego_fmp4.c
 
 HDRS := \
 	miro_ego_stereo_pipeline.h \
 	miro_ego_shm_ring.h \
 	miro_ego_sha256.h \
 	miro_ego_split.h \
-	miro_ego_mp4_meta.h \
+	miro_ego_flac.h \
+	miro_ego_fmp4.h \
 	miro_ego_packet_queue.h \
 	miro_ego_cli_common.h
 
@@ -66,13 +68,13 @@ install: $(TARGET)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-syntax-check: $(SRCS) $(HDRS) $(STUB_INCLUDE)/hb_media_codec.h $(STUB_INCLUDE)/hb_media_muxer.h
+syntax-check: $(SRCS) $(HDRS) $(STUB_INCLUDE)/hb_media_codec.h
 	@for src in $(SRCS); do \
 		echo "  SYNTAX $$src"; \
 		$(CC) -fsyntax-only -Wall -Wextra -Werror -std=gnu11 -I$(STUB_INCLUDE) -I. $$src || exit 1; \
 	done
 
-$(MOCK_ENCODER): $(SRCS) $(HDRS) tests/mock_hobot_sdk.c tests/mock_hobot_sdk.h $(STUB_INCLUDE)/hb_media_codec.h $(STUB_INCLUDE)/hb_media_muxer.h | $(BUILD_DIR)
+$(MOCK_ENCODER): $(SRCS) $(HDRS) tests/mock_hobot_sdk.c tests/mock_hobot_sdk.h $(STUB_INCLUDE)/hb_media_codec.h | $(BUILD_DIR)
 	$(CC) $(HOST_CFLAGS) $(HOST_SANITIZE) -I$(STUB_INCLUDE) -I. -Itests -pthread -o $@ \
 		$(SRCS) tests/mock_hobot_sdk.c
 
@@ -82,13 +84,13 @@ $(BUILD_DIR)/test_sha256: tests/test_sha256.c miro_ego_sha256.c miro_ego_sha256.
 $(BUILD_DIR)/test_shm_ring: tests/test_shm_ring.c miro_ego_shm_ring.c miro_ego_shm_ring.h | $(BUILD_DIR)
 	$(CC) $(HOST_CFLAGS) $(HOST_SANITIZE) -I. -pthread -o $@ tests/test_shm_ring.c miro_ego_shm_ring.c
 
-$(BUILD_DIR)/test_pipeline_helpers: tests/test_pipeline_helpers.c miro_ego_split.c miro_ego_mp4_meta.c miro_ego_sha256.c miro_ego_split.h miro_ego_mp4_meta.h miro_ego_sha256.h miro_ego_cli_common.h miro_ego_packet_queue.h | $(BUILD_DIR)
-	$(CC) $(HOST_CFLAGS) $(HOST_SANITIZE) -I. -pthread -o $@ tests/test_pipeline_helpers.c miro_ego_split.c miro_ego_mp4_meta.c miro_ego_sha256.c
+$(BUILD_DIR)/test_pipeline_helpers: tests/test_pipeline_helpers.c miro_ego_split.c miro_ego_flac.c miro_ego_fmp4.c miro_ego_sha256.c miro_ego_split.h miro_ego_flac.h miro_ego_fmp4.h miro_ego_sha256.h miro_ego_cli_common.h miro_ego_packet_queue.h | $(BUILD_DIR)
+	$(CC) $(HOST_CFLAGS) $(HOST_SANITIZE) -I. -pthread -o $@ tests/test_pipeline_helpers.c miro_ego_split.c miro_ego_flac.c miro_ego_fmp4.c miro_ego_sha256.c
 
-$(BUILD_DIR)/test_pipeline_e2e: tests/test_pipeline_e2e.c tests/mock_hobot_sdk.c tests/mock_hobot_sdk.h miro_ego_stereo_pipeline.c miro_ego_sha256.c miro_ego_split.c miro_ego_mp4_meta.c miro_ego_shm_ring.c $(HDRS) $(STUB_INCLUDE)/hb_media_codec.h $(STUB_INCLUDE)/hb_media_muxer.h $(MOCK_ENCODER) | $(BUILD_DIR)
+$(BUILD_DIR)/test_pipeline_e2e: tests/test_pipeline_e2e.c tests/mock_hobot_sdk.c tests/mock_hobot_sdk.h miro_ego_stereo_pipeline.c miro_ego_sha256.c miro_ego_split.c miro_ego_flac.c miro_ego_fmp4.c miro_ego_shm_ring.c $(HDRS) $(STUB_INCLUDE)/hb_media_codec.h $(MOCK_ENCODER) | $(BUILD_DIR)
 	$(CC) $(HOST_CFLAGS) $(HOST_SANITIZE) -I$(STUB_INCLUDE) -I. -Itests -pthread -o $@ \
 		tests/test_pipeline_e2e.c tests/mock_hobot_sdk.c miro_ego_stereo_pipeline.c \
-		miro_ego_sha256.c miro_ego_split.c miro_ego_mp4_meta.c miro_ego_shm_ring.c
+		miro_ego_sha256.c miro_ego_split.c miro_ego_flac.c miro_ego_fmp4.c miro_ego_shm_ring.c
 
 check: syntax-check $(MOCK_ENCODER) $(TEST_BINS)
 	@for bin in $(TEST_BINS); do \

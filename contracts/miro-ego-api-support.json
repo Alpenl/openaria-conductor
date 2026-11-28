@@ -9,8 +9,8 @@
     {
       "major": 1,
       "path": "contracts/miro-ego-device-v1.openapi.yaml",
-      "sha256": "14122800effbfe1d42eb1bebfa347c5b0f0cbe657b63850182fecde3c7ceefed",
-      "bytes": 163286,
+      "sha256": "0edd3e01d0c27d8685d74047e082067438b26a23aab727e4e41244152cc67734",
+      "bytes": 163390,
       "info_version": "1.0.0",
       "server_base_path": "/api/v1",
       "lifecycle": "current"
@@ -301,6 +301,13 @@
       "bytes": 26844
     },
     {
+      "id": "urn:miro-ego:schema:device-session:v2",
+      "schema": "miro-ego.device-session.v2",
+      "path": "contracts/schemas/miro-ego-device-session-v2.schema.json",
+      "sha256": "f48eaac10e66325447a9141ec3593b6650934cf1ba378cd51bfb883d82e8b626",
+      "bytes": 21486
+    },
+    {
       "id": "urn:miro-ego:schema:operational-event:v1",
       "schema": "miro-ego.operational-event.v1",
       "path": "contracts/schemas/miro-ego-operational-event-v1.schema.json",
@@ -344,6 +351,7 @@
     "miro-ego.clock-status.v1",
     "miro-ego.clock-sync-request.v1",
     "miro-ego.device-session.v1",
+    "miro-ego.device-session.v2",
     "miro-ego.device.v1",
     "miro-ego.firmware-status.v1",
     "miro-ego.log-list.v1",

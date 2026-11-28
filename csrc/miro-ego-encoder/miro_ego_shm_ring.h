@@ -14,10 +14,16 @@
  *   - Slot descriptor table at offset 4096, each 64 bytes:
  *       0..8   : uint64_t frame_seq
  *       8..16  : uint64_t monotonic_ns
- *       16..20 : uint32_t payload_len
- *       20..24 : uint32_t flags
+ *       16..20 : uint32_t payload_len (JPEG bytes at data_offset + 0)
+ *       20..24 : uint32_t flags (bit 0 = MIRO_EGO_SHM_SLOT_FLAG_SYNC_BUNDLE)
  *       24..32 : uint64_t data_offset
- *       32..64 : uint8_t reserved[32]
+ *       32..40 : uint64_t sample_number (48 kHz audio start sample)
+ *       40..44 : uint32_t duration_ticks (exact frame duration N_k)
+ *       44..48 : uint32_t pcm_offset (offset from data_offset)
+ *       48..52 : uint32_t pcm_len
+ *       52..56 : uint32_t meta_offset (offset from data_offset)
+ *       56..60 : uint32_t meta_len
+ *       60..64 : uint32_t reserved
  *   - Data region starts right after slot table, 4096-byte aligned,
  *     spanning slot_count * slot_capacity bytes.
  */
@@ -44,6 +50,7 @@ extern "C" {
 #define MIRO_EGO_SHM_MAX_SLOT_CAPACITY (64u * 1024u * 1024u)
 
 #define MIRO_EGO_SHM_FLAG_EOF (1u << 0)
+#define MIRO_EGO_SHM_SLOT_FLAG_SYNC_BUNDLE (1u << 0)
 
 typedef struct {
     uint8_t magic[8];
@@ -66,7 +73,13 @@ typedef struct {
     uint32_t payload_len;
     uint32_t flags;
     uint64_t data_offset;
-    uint8_t reserved[32];
+    uint64_t sample_number;
+    uint32_t duration_ticks;
+    uint32_t pcm_offset;
+    uint32_t pcm_len;
+    uint32_t meta_offset;
+    uint32_t meta_len;
+    uint32_t reserved;
 } miro_ego_shm_slot_t;
 
 _Static_assert(sizeof(miro_ego_shm_header_t) == 4096u, "MEGO_SHM header must be 4096 bytes");
@@ -85,7 +98,13 @@ _Static_assert(offsetof(miro_ego_shm_slot_t, monotonic_ns) == 8u, "monotonic_ns 
 _Static_assert(offsetof(miro_ego_shm_slot_t, payload_len) == 16u, "payload_len offset");
 _Static_assert(offsetof(miro_ego_shm_slot_t, flags) == 20u, "slot flags offset");
 _Static_assert(offsetof(miro_ego_shm_slot_t, data_offset) == 24u, "data_offset offset");
-_Static_assert(offsetof(miro_ego_shm_slot_t, reserved) == 32u, "reserved offset");
+_Static_assert(offsetof(miro_ego_shm_slot_t, sample_number) == 32u, "sample_number offset");
+_Static_assert(offsetof(miro_ego_shm_slot_t, duration_ticks) == 40u, "duration_ticks offset");
+_Static_assert(offsetof(miro_ego_shm_slot_t, pcm_offset) == 44u, "pcm_offset offset");
+_Static_assert(offsetof(miro_ego_shm_slot_t, pcm_len) == 48u, "pcm_len offset");
+_Static_assert(offsetof(miro_ego_shm_slot_t, meta_offset) == 52u, "meta_offset offset");
+_Static_assert(offsetof(miro_ego_shm_slot_t, meta_len) == 56u, "meta_len offset");
+_Static_assert(offsetof(miro_ego_shm_slot_t, reserved) == 60u, "reserved offset");
 
 typedef enum {
     MIRO_EGO_SHM_OK = 0,
@@ -97,7 +116,7 @@ typedef enum {
     MIRO_EGO_SHM_INVALID_ARG = -3,
 } miro_ego_shm_status_t;
 
-/* Zero-copy borrowed view of the next ready slot payload. */
+/* Zero-copy borrowed view of the next ready slot payload (+ optional sync bundle). */
 typedef struct {
     const uint8_t *data;
     uint32_t payload_len;
@@ -105,6 +124,12 @@ typedef struct {
     uint64_t frame_seq;
     uint64_t monotonic_ns;
     uint64_t slot_index;
+    uint64_t sample_number;
+    uint32_t duration_ticks;
+    const uint8_t *pcm;
+    uint32_t pcm_len;
+    const uint8_t *meta;
+    uint32_t meta_len;
 } miro_ego_shm_frame_t;
 
 typedef struct {
@@ -130,54 +155,25 @@ static inline uint64_t miro_ego_shm_data_offset(uint32_t slot_count)
            ~(uint64_t)(MIRO_EGO_SHM_PAGE_ALIGN - 1u);
 }
 
-/*
- * Computes the minimum required SHM file size in bytes.
- * Returns 0 on invalid parameters or integer overflow.
- */
 uint64_t miro_ego_shm_required_size(uint32_t slot_count, uint32_t slot_capacity);
 
-/*
- * Consumer / shared attach to an already-initialized MEGO_SHM v1 memfd.
- * Strictly validates magic, version, power-of-2 slot_count (1..=256),
- * slot_capacity, fstat length, and initial ring indices.
- * Caller retains ownership of shm_fd, kick_fd, and done_fd.
- * Returns 0 on success, -1 on error (writing a diagnostic to error if provided).
- */
 int miro_ego_shm_ring_attach(miro_ego_shm_ring_t *ring, int shm_fd, int kick_fd,
                              int done_fd, char *error, size_t error_len);
 
-/* Unmaps the SHM mapping; does NOT close caller-owned file descriptors. */
 void miro_ego_shm_ring_detach(miro_ego_shm_ring_t *ring);
 
-/*
- * Consumer receive: waits up to timeout_ms (< 0 means wait indefinitely) for the
- * next frame. On MIRO_EGO_SHM_OK, populates *frame with a zero-copy pointer into
- * the mapped ring; the caller MUST call miro_ego_shm_ring_release() once done
- * reading frame->data before calling receive() again.
- */
 miro_ego_shm_status_t miro_ego_shm_ring_receive(miro_ego_shm_ring_t *ring,
                                                 miro_ego_shm_frame_t *frame,
                                                 int timeout_ms);
 
-/* Advances read_idx with release semantics and signals done_fd. */
 miro_ego_shm_status_t miro_ego_shm_ring_release(miro_ego_shm_ring_t *ring);
 
-/* Returns current dropped_frames counter from the shared header. */
 uint64_t miro_ego_shm_ring_dropped(const miro_ego_shm_ring_t *ring);
 
-/*
- * Producer helpers (used by host tests and C producers):
- * Initializes an empty memfd (ftruncate + header + slot offsets) and attaches.
- */
 int miro_ego_shm_ring_init_fd(miro_ego_shm_ring_t *ring, int shm_fd, int kick_fd,
                               int done_fd, uint32_t slot_count, uint32_t slot_capacity,
                               char *error, size_t error_len);
 
-/*
- * Producer push: waits up to timeout_ms (0 = non-blocking, < 0 = wait forever)
- * for a free slot via done_fd, copies payload into the slot, advances write_idx,
- * and signals kick_fd.
- */
 miro_ego_shm_status_t miro_ego_shm_ring_push(miro_ego_shm_ring_t *ring,
                                              const uint8_t *payload,
                                              uint32_t payload_len,
@@ -186,7 +182,19 @@ miro_ego_shm_status_t miro_ego_shm_ring_push(miro_ego_shm_ring_t *ring,
                                              uint32_t flags,
                                              int timeout_ms);
 
-/* Sets MIRO_EGO_SHM_FLAG_EOF in header->flags and wakes consumer via kick_fd. */
+miro_ego_shm_status_t miro_ego_shm_ring_push_bundle(miro_ego_shm_ring_t *ring,
+                                                    const uint8_t *jpeg,
+                                                    uint32_t jpeg_len,
+                                                    const uint8_t *pcm,
+                                                    uint32_t pcm_len,
+                                                    const uint8_t *meta,
+                                                    uint32_t meta_len,
+                                                    uint64_t frame_seq,
+                                                    uint64_t monotonic_ns,
+                                                    uint64_t sample_number,
+                                                    uint32_t duration_ticks,
+                                                    int timeout_ms);
+
 miro_ego_shm_status_t miro_ego_shm_ring_set_eof(miro_ego_shm_ring_t *ring);
 
 #ifdef __cplusplus

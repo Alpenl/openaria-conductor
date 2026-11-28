@@ -361,8 +361,14 @@ fn device_session_path_artifacts(
     expected_session_id: &str,
 ) -> Result<Vec<ArtifactDescriptor>, SessionIoError> {
     let root = parse_device_session_manifest(payload, expected_session_id)?;
+    let object = manifest_object(&root)?;
+    let schema = string_field(object, "schema")?;
     let mut collector = ArtifactCollector::default();
-    collect_device_session_artifacts(manifest_object(&root)?, &mut collector)?;
+    if schema == "miro-ego.device-session.v2" {
+        collect_device_session_v2_artifacts(object, &mut collector)?;
+    } else {
+        collect_device_session_artifacts(object, &mut collector)?;
+    }
     collector.finish()
 }
 
@@ -378,7 +384,7 @@ fn parse_device_session_manifest(
     })?;
     let object = manifest_object(&root)?;
     let schema = string_field(object, "schema")?;
-    if schema != "miro-ego.device-session.v1" {
+    if schema != "miro-ego.device-session.v1" && schema != "miro-ego.device-session.v2" {
         return Err(SessionIoError::new(
             "manifest_invalid",
             "unsupported device-session manifest schema",
@@ -432,6 +438,29 @@ impl ArtifactCollector {
         self.descriptors.push(descriptor);
         Ok(())
     }
+}
+
+fn collect_device_session_v2_artifacts(
+    object: &Map<String, Value>,
+    collector: &mut ArtifactCollector,
+) -> Result<(), SessionIoError> {
+    let media = object_field(object, "media", "invalid manifest media section")?;
+    if string_field(media, "container")? != "fmp4"
+        || string_field(media, "layout")? != "synced-fmp4"
+    {
+        return Err(SessionIoError::new(
+            "manifest_invalid",
+            "invalid manifest media container or layout",
+        ));
+    }
+    collector.collect(value_field(media, "artifact")?)?;
+
+    if object.contains_key("logs") {
+        for artifact in array_field(object, "logs", "invalid manifest logs array")? {
+            collector.collect(artifact)?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_device_session_artifacts(

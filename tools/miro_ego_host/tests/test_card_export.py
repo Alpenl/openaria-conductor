@@ -493,6 +493,134 @@ class CardExportExfatTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Duplicate artifact path"):
             tool.manifest_artifacts(dup_manifest)
 
+    def test_exports_v2_synced_fmp4_session_with_sha256_verification(self) -> None:
+        import hashlib
+
+        session_mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso6\x00\x00\x00\x08moov"
+        digest = hashlib.sha256(session_mp4).hexdigest()
+        v2_manifest = {
+            "schema": "miro-ego.device-session.v2",
+            "manifest_id": "0198c9a8-7a3c-7000-8000-000000000090",
+            "sealed": True,
+            "sealed_at": "2026-11-28T04:00:00Z",
+            "session_id": "0198c9a8-7a3c-7000-8000-000000000091",
+            "volume_id": "2c9d0e1f-4444-4000-8000-000000000001",
+            "capture_mode": "production",
+            "display_name": "V2 Take",
+            "device": {
+                "device_id": "2c9d0e1f-4444-4000-8000-000000000002",
+                "device_label": "Miro-Ego-12345678",
+                "hardware_fingerprint": f"sha256:{'a' * 64}",
+                "platform": "rdk-x5",
+                "software_version": "0.3.0",
+                "commit": "a" * 40,
+            },
+            "time": {
+                "started_at": "2026-11-28T03:59:55Z",
+                "ended_at": "2026-11-28T04:00:00Z",
+                "timezone": "UTC",
+                "duration_seconds": 1.0,
+                "duration_clock": "audio_hardware_samples",
+            },
+            "take": {
+                "take_id": "0198c9a8-7a3c-7000-8000-000000000091",
+                "sequence": 1,
+                "continuation_of": None,
+            },
+            "camera": {
+                "width": 3840,
+                "height": 1080,
+                "eye_width": 1920,
+                "sensor_fps": 30.0,
+                "frame_decimation": 1,
+                "effective_fps": 30.0,
+                "coordinate_frame": "opencv_optical",
+            },
+            "media": {
+                "container": "fmp4",
+                "layout": "synced-fmp4",
+                "timescale": 48000,
+                "duration_ticks": 48000,
+                "fragment_count": 1,
+                "artifact": {
+                    "artifact_id": digest,
+                    "role": "media.session",
+                    "path": "session.mp4",
+                    "media_type": "video/mp4",
+                    "bytes": len(session_mp4),
+                    "sha256": digest,
+                },
+            },
+            "video": {
+                "layout": "split-eyes",
+                "codec": "hevc",
+                "container": "fmp4",
+                "frame_count": 30,
+                "tracks": {"left_track_id": 1, "right_track_id": 2},
+                "encoding": {"schema": "miro-ego.recording-encoding.v1"},
+            },
+            "imu": {
+                "embedded_in": "media.session",
+                "track_id": 4,
+                "mime_type": "application/x-miro-ego-sync+json",
+                "sample_count": 200,
+                "units": "raw_int16",
+                "coordinate_frame": "raw_device_axes",
+            },
+            "frames": {
+                "embedded_in": "media.session",
+                "track_id": 4,
+                "mime_type": "application/x-miro-ego-sync+json",
+                "count": 30,
+            },
+            "audio": {
+                "state": "recorded",
+                "requested_mode": "enabled",
+                "resolved_mode": "enabled",
+                "codec": "flac",
+                "container": "fmp4",
+                "track_id": 3,
+                "sample_format": "S16_LE",
+                "sample_rate": 48000,
+                "channels": 2,
+                "sample_count": 48000,
+                "sync": {
+                    "time_base": "audio_hardware_samples",
+                    "timescale": 48000,
+                    "boundary_gap_samples": 0,
+                },
+            },
+            "logs": [],
+            "integrity": {
+                "verified_at": "2026-11-28T04:00:00Z",
+                "dropped_frames": 0,
+                "drop_events": [],
+                "fatal_errors": [],
+            },
+        }
+        v2_tree = {
+            "manifest.json": json.dumps(v2_manifest).encode("utf-8"),
+            "session.mp4": session_mp4,
+        }
+        exfat_img = self.root / "v2.exfat"
+        exfat_img.write_bytes(
+            build_exfat_image({"recordings": {"2026-11-28": {"12-00-00": v2_tree}}})
+        )
+        dest = self.root / "v2-out"
+        dest.mkdir()
+        with tool.volumes(exfat_img) as found:
+            records = tool.recordings(found)
+            self.assertEqual(len(records), 1)
+            self.assertTrue(records[0]["sealed"])
+            output = tool.export_selected(records, dest)
+        report = json.loads((output / "export-report.json").read_bytes())
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["verified_artifacts"], 1)
+        self.assertEqual(
+            (output / "exfat/recordings/2026-11-28/12-00-00/session.mp4").read_bytes(),
+            session_mp4,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

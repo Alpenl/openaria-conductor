@@ -14,10 +14,16 @@
 //! - Slot descriptor table at offset `4096`, `slot_count` entries of `64` bytes each (`#[repr(C)]`):
 //!   - `0..8`: `frame_seq: u64`
 //!   - `8..16`: `monotonic_ns: u64`
-//!   - `16..20`: `payload_len: u32`
-//!   - `20..24`: `flags: u32`
+//!   - `16..20`: `payload_len: u32` (MJPEG bytes at slot data offset)
+//!   - `20..24`: `flags: u32` (`bit 0` = `SLOT_FLAG_SYNC_BUNDLE`)
 //!   - `24..32`: `data_offset: u64`
-//!   - `32..64`: `reserved: [u8; 32]`
+//!   - `32..40`: `sample_number: u64` (48 kHz ALSA hardware sample start `S[k]`)
+//!   - `40..44`: `duration_ticks: u32` (`N_k = S[k+1] - S[k]`)
+//!   - `44..48`: `pcm_offset: u32` (relative to `data_offset`, 8B aligned)
+//!   - `48..52`: `pcm_len: u32` (interleaved S16_LE bytes = `N_k * 4`)
+//!   - `52..56`: `meta_offset: u32` (relative to `data_offset`, 8B aligned)
+//!   - `56..60`: `meta_len: u32` (Track 4 UTF-8 JSON bytes)
+//!   - `60..64`: `reserved: u32`
 //! - Data region starts right after the slot table, 4096-byte aligned,
 //!   occupying `slot_count * slot_capacity` bytes.
 
@@ -44,6 +50,8 @@ pub const MAX_DEFAULT_MJPEG_SLOT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Bit 0 of `ShmHeader::flags`: producer has reached EOF / shutdown.
 pub const SHM_FLAG_EOF: u32 = 1 << 0;
+/// Bit 0 of `ShmSlotDescriptor::flags`: slot carries synchronized PCM + metadata bundle.
+pub const SLOT_FLAG_SYNC_BUNDLE: u32 = 1 << 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShmRingConfig {
@@ -169,7 +177,7 @@ pub struct ShmHeader {
     _pad3: [u8; 3896],
 }
 
-/// Shared-memory slot descriptor (exactly 64 bytes).
+/// Shared-memory slot descriptor (exactly 64 bytes, matching `miro_ego_shm_slot_t`).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShmSlotDescriptor {
@@ -178,7 +186,13 @@ pub struct ShmSlotDescriptor {
     pub payload_len: u32,
     pub flags: u32,
     pub data_offset: u64,
-    pub reserved: [u8; 32],
+    pub sample_number: u64,
+    pub duration_ticks: u32,
+    pub pcm_offset: u32,
+    pub pcm_len: u32,
+    pub meta_offset: u32,
+    pub meta_len: u32,
+    pub reserved: u32,
 }
 
 const _: () = {
@@ -198,7 +212,13 @@ const _: () = {
     assert!(std::mem::offset_of!(ShmSlotDescriptor, payload_len) == 16);
     assert!(std::mem::offset_of!(ShmSlotDescriptor, flags) == 20);
     assert!(std::mem::offset_of!(ShmSlotDescriptor, data_offset) == 24);
-    assert!(std::mem::offset_of!(ShmSlotDescriptor, reserved) == 32);
+    assert!(std::mem::offset_of!(ShmSlotDescriptor, sample_number) == 32);
+    assert!(std::mem::offset_of!(ShmSlotDescriptor, duration_ticks) == 40);
+    assert!(std::mem::offset_of!(ShmSlotDescriptor, pcm_offset) == 44);
+    assert!(std::mem::offset_of!(ShmSlotDescriptor, pcm_len) == 48);
+    assert!(std::mem::offset_of!(ShmSlotDescriptor, meta_offset) == 52);
+    assert!(std::mem::offset_of!(ShmSlotDescriptor, meta_len) == 56);
+    assert!(std::mem::offset_of!(ShmSlotDescriptor, reserved) == 60);
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +252,23 @@ pub struct ConsumedFrame {
     pub monotonic_ns: u64,
     pub flags: u32,
     pub payload: Vec<u8>,
+    pub sample_number: u64,
+    pub duration_ticks: u32,
+    pub pcm: Vec<u8>,
+    pub meta: Vec<u8>,
+}
+
+/// Synchronized hardware-timestamped audio/video/metadata payload bundle pushed
+/// atomically into a single MEGO_SHM slot.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncSlotBundle<'a> {
+    pub frame_seq: u64,
+    pub monotonic_ns: u64,
+    pub sample_number: u64,
+    pub duration_ticks: u32,
+    pub jpeg: &'a [u8],
+    pub pcm: &'a [u8],
+    pub meta: &'a [u8],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,7 +433,13 @@ impl ShmRingProducer {
                         payload_len: 0,
                         flags: 0,
                         data_offset: data_offset as u64,
-                        reserved: [0; 32],
+                        sample_number: 0,
+                        duration_ticks: 0,
+                        pcm_offset: 0,
+                        pcm_len: 0,
+                        meta_offset: 0,
+                        meta_len: 0,
+                        reserved: 0,
                     },
                 );
             }
@@ -534,7 +577,13 @@ impl ShmRingProducer {
                     payload_len,
                     flags,
                     data_offset: data_offset as u64,
-                    reserved: [0; 32],
+                    sample_number: 0,
+                    duration_ticks: 0,
+                    pcm_offset: 0,
+                    pcm_len: 0,
+                    meta_offset: 0,
+                    meta_len: 0,
+                    reserved: 0,
                 },
             );
         }
@@ -548,6 +597,177 @@ impl ShmRingProducer {
             write_idx: next_write_idx,
             slot_index,
         })
+    }
+
+    pub fn try_push_sync_bundle(
+        &mut self,
+        bundle: SyncSlotBundle<'_>,
+    ) -> Result<PushStatus, ShmRingError> {
+        if bundle.jpeg.is_empty() {
+            return Err(ShmRingError::new(
+                "invalid_argument",
+                "bundle jpeg payload must not be empty",
+            ));
+        }
+        let payload_len = u32::try_from(bundle.jpeg.len())
+            .map_err(|_| ShmRingError::new("frame_too_large", "jpeg payload exceeds u32 length"))?;
+        let pcm_len = u32::try_from(bundle.pcm.len())
+            .map_err(|_| ShmRingError::new("frame_too_large", "pcm payload exceeds u32 length"))?;
+        let meta_len = u32::try_from(bundle.meta.len())
+            .map_err(|_| ShmRingError::new("frame_too_large", "meta payload exceeds u32 length"))?;
+        let pcm_rel = if pcm_len > 0 {
+            align_up(bundle.jpeg.len(), 8)
+                .ok_or_else(|| ShmRingError::new("frame_too_large", "slot pcm offset overflow"))?
+        } else {
+            0
+        };
+        let after_pcm = if pcm_len > 0 {
+            pcm_rel
+                .checked_add(bundle.pcm.len())
+                .ok_or_else(|| ShmRingError::new("frame_too_large", "slot pcm end overflow"))?
+        } else {
+            bundle.jpeg.len()
+        };
+        let meta_rel = if meta_len > 0 {
+            align_up(after_pcm, 8)
+                .ok_or_else(|| ShmRingError::new("frame_too_large", "slot meta offset overflow"))?
+        } else {
+            0
+        };
+        let total_slot_bytes = if meta_len > 0 {
+            meta_rel
+                .checked_add(bundle.meta.len())
+                .ok_or_else(|| ShmRingError::new("frame_too_large", "slot total bytes overflow"))?
+        } else {
+            after_pcm
+        };
+        if total_slot_bytes > self.layout.slot_capacity as usize {
+            return Err(ShmRingError::new(
+                "frame_too_large",
+                format!(
+                    "sync bundle ({total_slot_bytes} bytes) exceeds slot_capacity ({} bytes)",
+                    self.layout.slot_capacity
+                ),
+            ));
+        }
+
+        if (self.region.flags_atomic().load(Ordering::Acquire) & SHM_FLAG_EOF) != 0 {
+            return Err(ShmRingError::new(
+                "shm_eof",
+                "cannot push bundle after EOF has been signaled",
+            ));
+        }
+        let write_idx = self.region.write_idx_atomic().load(Ordering::Relaxed);
+        let read_idx = self.region.read_idx_atomic().load(Ordering::Acquire);
+        if write_idx < read_idx || (write_idx - read_idx) > u64::from(self.layout.slot_count) {
+            return Err(ShmRingError::new(
+                "shm_corrupt",
+                "SHM ring write_idx/read_idx out of bounds",
+            ));
+        }
+        if (write_idx - read_idx) == u64::from(self.layout.slot_count) {
+            return Ok(PushStatus::Full);
+        }
+
+        let mask = u64::from(self.layout.slot_count - 1);
+        let slot_index = (write_idx & mask) as u32;
+        let data_offset = self
+            .layout
+            .slot_data_offset(slot_index)
+            .ok_or_else(|| ShmRingError::new("shm_corrupt", "invalid slot data offset"))?;
+        let pcm_offset_u32 = u32::try_from(pcm_rel)
+            .map_err(|_| ShmRingError::new("frame_too_large", "pcm_offset exceeds u32"))?;
+        let meta_offset_u32 = u32::try_from(meta_rel)
+            .map_err(|_| ShmRingError::new("frame_too_large", "meta_offset exceeds u32"))?;
+
+        // SAFETY: slot exclusively owned while `in_flight < slot_count`; bounds verified above.
+        unsafe {
+            let base = self.region.data_ptr(data_offset);
+            std::ptr::copy_nonoverlapping(bundle.jpeg.as_ptr(), base, bundle.jpeg.len());
+            if !bundle.pcm.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    bundle.pcm.as_ptr(),
+                    base.add(pcm_rel),
+                    bundle.pcm.len(),
+                );
+            }
+            if !bundle.meta.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    bundle.meta.as_ptr(),
+                    base.add(meta_rel),
+                    bundle.meta.len(),
+                );
+            }
+            std::ptr::write(
+                self.region.slot_ptr(slot_index),
+                ShmSlotDescriptor {
+                    frame_seq: bundle.frame_seq,
+                    monotonic_ns: bundle.monotonic_ns,
+                    payload_len,
+                    flags: SLOT_FLAG_SYNC_BUNDLE,
+                    data_offset: data_offset as u64,
+                    sample_number: bundle.sample_number,
+                    duration_ticks: bundle.duration_ticks,
+                    pcm_offset: pcm_offset_u32,
+                    pcm_len,
+                    meta_offset: meta_offset_u32,
+                    meta_len,
+                    reserved: 0,
+                },
+            );
+        }
+
+        let next_write_idx = write_idx.wrapping_add(1);
+        self.region
+            .write_idx_atomic()
+            .store(next_write_idx, Ordering::Release);
+        signal_eventfd(self.kick_fd.as_raw_fd())?;
+        Ok(PushStatus::Pushed {
+            write_idx: next_write_idx,
+            slot_index,
+        })
+    }
+
+    pub(crate) fn push_bundle_wait_with_backpressure_check<E, F>(
+        &mut self,
+        bundle: SyncSlotBundle<'_>,
+        timeout: Duration,
+        mut check: F,
+    ) -> Result<u64, E>
+    where
+        E: From<ShmRingError>,
+        F: FnMut(bool) -> Result<(), E>,
+    {
+        const POLL_SLICE: Duration = Duration::from_millis(100);
+        let deadline = Instant::now() + timeout;
+        loop {
+            check(false)?;
+            match self.try_push_sync_bundle(bundle)? {
+                PushStatus::Pushed { write_idx, .. } => return Ok(write_idx),
+                PushStatus::Full => {
+                    check(true)?;
+                    drain_eventfd(self.done_fd.as_raw_fd())?;
+                    if let PushStatus::Pushed { write_idx, .. } =
+                        self.try_push_sync_bundle(bundle)?
+                    {
+                        return Ok(write_idx);
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        self.record_dropped_frame();
+                        return Err(ShmRingError::new(
+                            "shm_backpressure_timeout",
+                            "timed out waiting for encoder to free a SHM slot",
+                        )
+                        .into());
+                    }
+                    let _ = wait_and_drain_eventfd(
+                        self.done_fd.as_raw_fd(),
+                        remaining.min(POLL_SLICE),
+                    )?;
+                }
+            }
+        }
     }
 
     /// Push a frame, waiting on `done_fd` up to `timeout` if the ring is full.
@@ -817,6 +1037,56 @@ impl ShmRingConsumer {
             }
         }
 
+        let mut pcm = Vec::new();
+        let mut meta = Vec::new();
+        if (desc.flags & SLOT_FLAG_SYNC_BUNDLE) != 0 {
+            let cap = self.layout.slot_capacity as usize;
+            if desc.pcm_len > 0 {
+                let po = desc.pcm_offset as usize;
+                let pl = desc.pcm_len as usize;
+                let pe = po
+                    .checked_add(pl)
+                    .ok_or_else(|| ShmRingError::new("shm_corrupt", "slot pcm bounds overflow"))?;
+                if po < payload_len || pe > cap {
+                    return Err(ShmRingError::new(
+                        "shm_corrupt",
+                        "slot pcm overlaps payload or exceeds slot_capacity",
+                    ));
+                }
+                pcm.resize(pl, 0);
+                // SAFETY: `data_offset + pe <= expected_offset + cap <= self.region.len`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.region.data_ptr(data_offset + po),
+                        pcm.as_mut_ptr(),
+                        pl,
+                    );
+                }
+            }
+            if desc.meta_len > 0 {
+                let mo = desc.meta_offset as usize;
+                let ml = desc.meta_len as usize;
+                let me = mo
+                    .checked_add(ml)
+                    .ok_or_else(|| ShmRingError::new("shm_corrupt", "slot meta bounds overflow"))?;
+                if mo < payload_len || me > cap {
+                    return Err(ShmRingError::new(
+                        "shm_corrupt",
+                        "slot meta overlaps payload or exceeds slot_capacity",
+                    ));
+                }
+                meta.resize(ml, 0);
+                // SAFETY: `data_offset + me <= expected_offset + cap <= self.region.len`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.region.data_ptr(data_offset + mo),
+                        meta.as_mut_ptr(),
+                        ml,
+                    );
+                }
+            }
+        }
+
         self.region
             .read_idx_atomic()
             .store(read_idx.wrapping_add(1), Ordering::Release);
@@ -827,6 +1097,10 @@ impl ShmRingConsumer {
             monotonic_ns: desc.monotonic_ns,
             flags: desc.flags,
             payload,
+            sample_number: desc.sample_number,
+            duration_ticks: desc.duration_ticks,
+            pcm,
+            meta,
         }))
     }
 

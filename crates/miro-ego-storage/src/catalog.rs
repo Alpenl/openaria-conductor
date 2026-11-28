@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 pub const SESSION_LIST_SCHEMA: &str = "miro-ego.session-list.v1";
 pub const DEVICE_SESSION_SCHEMA: &str = "miro-ego.device-session.v1";
+pub const DEVICE_SESSION_V2_SCHEMA: &str = "miro-ego.device-session.v2";
 pub const DEFAULT_PAGE_LIMIT: usize = 50;
 pub const MAX_PAGE_LIMIT: usize = 200;
 /// Hard cap for `/data/.miro-ego/index/catalog.bin` (16 MiB).
@@ -2438,7 +2439,7 @@ fn classify_and_parse_manifest(
             "manifest missing schema discriminator".to_owned(),
         ));
     };
-    if schema != DEVICE_SESSION_SCHEMA {
+    if schema != DEVICE_SESSION_SCHEMA && schema != DEVICE_SESSION_V2_SCHEMA {
         return Err((
             DiscoveryDiagnosticCode::UnsupportedSchema,
             format!("unsupported manifest schema '{schema}'"),
@@ -2455,7 +2456,7 @@ fn classify_and_parse_manifest(
         .map_err(|err| (DiscoveryDiagnosticCode::ManifestInvalid, err.to_string()))
 }
 
-/// Extract and validate an [`IndexedSession`] from a parsed `miro-ego.device-session.v1` JSON value.
+/// Extract and validate an [`IndexedSession`] from a parsed `miro-ego.device-session.v1` or `.v2` JSON value.
 pub fn parse_indexed_session_from_manifest(
     relative_dir: &str,
     parsed: &Value,
@@ -2471,37 +2472,72 @@ pub fn parse_indexed_session_from_manifest(
         .as_object()
         .ok_or_else(|| StorageError::integrity("manifest_invalid", "manifest must be object"))?;
 
-    ensure_allowed_keys(
-        obj,
-        &[
-            "schema",
-            "manifest_id",
-            "sealed",
-            "sealed_at",
-            "session_id",
-            "volume_id",
-            "capture_mode",
-            "display_name",
-            "device",
-            "time",
-            "take",
-            "camera",
-            "video",
-            "imu",
-            "frames",
-            "audio",
-            "logs",
-            "integrity",
-            "capture_audit",
-        ],
-        "manifest",
-    )?;
-
-    if obj.get("schema").and_then(Value::as_str) != Some(DEVICE_SESSION_SCHEMA) {
+    let schema = obj
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing manifest schema"))?;
+    if schema != DEVICE_SESSION_SCHEMA && schema != DEVICE_SESSION_V2_SCHEMA {
         return Err(StorageError::integrity(
             "manifest_invalid",
-            format!("manifest schema must be {DEVICE_SESSION_SCHEMA}"),
+            format!(
+                "manifest schema must be {DEVICE_SESSION_SCHEMA} or {DEVICE_SESSION_V2_SCHEMA}"
+            ),
         ));
+    }
+
+    if schema == DEVICE_SESSION_V2_SCHEMA {
+        ensure_allowed_keys(
+            obj,
+            &[
+                "schema",
+                "manifest_id",
+                "sealed",
+                "sealed_at",
+                "session_id",
+                "volume_id",
+                "capture_mode",
+                "display_name",
+                "device",
+                "time",
+                "take",
+                "camera",
+                "media",
+                "video",
+                "imu",
+                "frames",
+                "audio",
+                "logs",
+                "integrity",
+                "capture_audit",
+            ],
+            "manifest",
+        )?;
+    } else {
+        ensure_allowed_keys(
+            obj,
+            &[
+                "schema",
+                "manifest_id",
+                "sealed",
+                "sealed_at",
+                "session_id",
+                "volume_id",
+                "capture_mode",
+                "display_name",
+                "device",
+                "time",
+                "take",
+                "camera",
+                "video",
+                "imu",
+                "frames",
+                "audio",
+                "logs",
+                "integrity",
+                "capture_audit",
+            ],
+            "manifest",
+        )?;
     }
     if !obj
         .get("manifest_id")
@@ -2739,15 +2775,19 @@ pub fn parse_indexed_session_from_manifest(
             StorageError::integrity("manifest_invalid", "time.duration_seconds invalid")
         })?;
     if let Some(clock_val) = time_obj.get("duration_clock") {
-        if clock_val.as_str() != Some("host_monotonic") {
+        let valid_clock = matches!(
+            (schema == DEVICE_SESSION_V2_SCHEMA, clock_val.as_str()),
+            (_, Some("host_monotonic")) | (true, Some("audio_hardware_samples"))
+        );
+        if !valid_clock {
             return Err(StorageError::integrity(
                 "manifest_invalid",
-                "time.duration_clock must be 'host_monotonic'",
+                "time.duration_clock is invalid for manifest schema",
             ));
         }
     }
 
-    validate_manifest_camera_and_media(obj)?;
+    validate_manifest_camera_and_media(obj, schema)?;
 
     let total_bytes = unique_downloadable_artifact_bytes(parsed)?;
 
@@ -2997,7 +3037,7 @@ fn validate_closed_artifact(raw: &Value, expected_role: Option<&str>) -> Storage
     Ok(())
 }
 
-fn validate_manifest_camera_and_media(obj: &Map<String, Value>) -> StorageResult<()> {
+fn validate_manifest_camera_and_media(obj: &Map<String, Value>, schema: &str) -> StorageResult<()> {
     // Camera section
     let cam = obj
         .get("camera")
@@ -3060,98 +3100,159 @@ fn validate_manifest_camera_and_media(obj: &Map<String, Value>) -> StorageResult
         ));
     }
 
-    // Video section
-    let video = obj
-        .get("video")
+    if schema == DEVICE_SESSION_V2_SCHEMA {
+        validate_v2_media_imu_frames_audio(obj)?;
+    } else {
+        validate_v1_video_imu_frames_audio(obj)?;
+    }
+
+    // Logs section
+    let logs = obj
+        .get("logs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing logs array"))?;
+    for log_item in logs {
+        validate_closed_artifact(log_item, None)?;
+        let role = log_item
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !role.starts_with("log.") && !role.starts_with("log_") && !role.starts_with("log-") {
+            return Err(StorageError::integrity(
+                "manifest_invalid",
+                "logs[].role must match log[._-]*",
+            ));
+        }
+    }
+
+    // Integrity section
+    let integ = obj
+        .get("integrity")
         .and_then(Value::as_object)
-        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing video object"))?;
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing integrity object"))?;
     ensure_allowed_keys(
-        video,
-        &["layout", "codec", "container", "segments", "encoding"],
-        "video",
+        integ,
+        &[
+            "verified_at",
+            "dropped_frames",
+            "drop_events",
+            "quality_policy",
+            "media_write_throughput_bytes_per_second",
+            "fatal_errors",
+        ],
+        "integrity",
     )?;
-    if video.get("layout").and_then(Value::as_str) != Some("split-eyes")
-        || video.get("container").and_then(Value::as_str) != Some("mp4")
+    if integ
+        .get("verified_at")
+        .and_then(Value::as_str)
+        .is_none_or(|s| parse_rfc3339_utc_nanos(s).is_none())
+        || integ
+            .get("dropped_frames")
+            .and_then(Value::as_u64)
+            .is_none()
+        || !integ
+            .get("fatal_errors")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
     {
         return Err(StorageError::integrity(
             "manifest_invalid",
-            "video must use split-eyes mp4 layout",
+            "integrity fields invalid or fatal_errors non-empty",
         ));
     }
-    let video_codec = video
-        .get("codec")
-        .and_then(Value::as_str)
-        .filter(|&c| c == "h264" || c == "hevc")
-        .ok_or_else(|| StorageError::integrity("manifest_invalid", "invalid video.codec"))?;
-
-    let v_segments = video
-        .get("segments")
+    let drop_events = integ
+        .get("drop_events")
         .and_then(Value::as_array)
-        .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            StorageError::integrity(
-                "manifest_invalid",
-                "video.segments must be a non-empty array",
-            )
+            StorageError::integrity("manifest_invalid", "missing integrity.drop_events")
         })?;
-    for seg in v_segments {
-        let s_obj = seg.as_object().ok_or_else(|| {
-            StorageError::integrity("manifest_invalid", "video segment must be object")
+    for de in drop_events {
+        let de_obj = de.as_object().ok_or_else(|| {
+            StorageError::integrity("manifest_invalid", "drop_event must be object")
         })?;
         ensure_allowed_keys(
-            s_obj,
+            de_obj,
             &[
-                "index",
                 "start_frame",
                 "end_frame",
-                "start_time_seconds",
-                "end_time_seconds",
-                "artifacts",
+                "at_time_seconds",
+                "reason",
+                "dropped",
             ],
-            "video.segments[]",
+            "integrity.drop_events[]",
         )?;
-        if s_obj.get("index").and_then(Value::as_u64).is_none()
-            || s_obj.get("start_frame").and_then(Value::as_u64).is_none()
-            || s_obj.get("end_frame").and_then(Value::as_u64).unwrap_or(0) < 1
-            || !s_obj
-                .get("start_time_seconds")
+        if de_obj.get("start_frame").and_then(Value::as_u64).is_none()
+            || de_obj.get("end_frame").and_then(Value::as_u64).unwrap_or(0) < 1
+            || !de_obj
+                .get("at_time_seconds")
                 .and_then(Value::as_f64)
                 .is_some_and(|v| v.is_finite() && v >= 0.0)
-            || !s_obj
-                .get("end_time_seconds")
-                .and_then(Value::as_f64)
-                .is_some_and(|v| v.is_finite() && v > 0.0)
+            || de_obj.get("reason").and_then(Value::as_str) != Some("write_backpressure")
+            || de_obj.get("dropped").and_then(Value::as_u64).unwrap_or(0) < 1
         {
             return Err(StorageError::integrity(
                 "manifest_invalid",
-                "video segment frame/time bounds invalid",
+                "invalid integrity.drop_events entry",
             ));
         }
-        let arts = s_obj
-            .get("artifacts")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                StorageError::integrity("manifest_invalid", "missing video segment artifacts")
-            })?;
-        ensure_allowed_keys(arts, &["left", "right"], "video.segments[].artifacts")?;
-        let left = arts.get("left").ok_or_else(|| {
-            StorageError::integrity("manifest_invalid", "missing video.left artifact")
+    }
+    if let Some(tput) = integ.get("media_write_throughput_bytes_per_second") {
+        if tput.as_u64().is_none() {
+            return Err(StorageError::integrity(
+                "manifest_invalid",
+                "media_write_throughput_bytes_per_second must be integer >= 0",
+            ));
+        }
+    }
+    if let Some(qp) = integ.get("quality_policy") {
+        let qp_obj = qp.as_object().ok_or_else(|| {
+            StorageError::integrity("manifest_invalid", "quality_policy must be object")
         })?;
-        let right = arts.get("right").ok_or_else(|| {
-            StorageError::integrity("manifest_invalid", "missing video.right artifact")
-        })?;
-        validate_closed_artifact(left, Some("video.left"))?;
-        validate_closed_artifact(right, Some("video.right"))?;
-        if left.get("media_type").and_then(Value::as_str) != Some("video/mp4")
-            || right.get("media_type").and_then(Value::as_str) != Some("video/mp4")
+        ensure_allowed_keys(
+            qp_obj,
+            &[
+                "policy_id",
+                "max_contiguous_dropped_frames",
+                "max_total_dropped_frames",
+                "max_drop_fraction",
+                "window_seconds",
+                "max_dropped_frames_per_window",
+            ],
+            "integrity.quality_policy",
+        )?;
+        if qp_obj.get("policy_id").and_then(Value::as_str) != Some("rdk-x5-lossless-v1")
+            || qp_obj
+                .get("max_contiguous_dropped_frames")
+                .and_then(Value::as_u64)
+                != Some(0)
+            || qp_obj
+                .get("max_total_dropped_frames")
+                .and_then(Value::as_u64)
+                != Some(0)
+            || qp_obj.get("max_drop_fraction").and_then(Value::as_f64) != Some(0.0)
+            || !qp_obj
+                .get("window_seconds")
+                .and_then(Value::as_f64)
+                .is_some_and(|v| v.is_finite() && v > 0.0)
+            || qp_obj
+                .get("max_dropped_frames_per_window")
+                .and_then(Value::as_u64)
+                != Some(0)
         {
             return Err(StorageError::integrity(
                 "manifest_invalid",
-                "video segment media_type must be video/mp4",
+                "integrity.quality_policy violates rdk-x5-lossless-v1 constraints",
             ));
         }
     }
 
+    Ok(())
+}
+
+fn validate_video_encoding_object(
+    video: &Map<String, Value>,
+    video_codec: &str,
+) -> StorageResult<()> {
     let enc = video
         .get("encoding")
         .and_then(Value::as_object)
@@ -3266,6 +3367,383 @@ fn validate_manifest_camera_and_media(obj: &Map<String, Value>) -> StorageResult
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_not_recorded_audio_fields(audio: &Map<String, Value>) -> StorageResult<()> {
+    ensure_allowed_keys(
+        audio,
+        &["state", "requested_mode", "resolved_mode", "reason"],
+        "audio",
+    )?;
+    if !matches!(
+        audio.get("requested_mode").and_then(Value::as_str),
+        Some("device_default" | "disabled" | "enabled")
+    ) || audio.get("resolved_mode").and_then(Value::as_str) != Some("disabled")
+        || !matches!(
+            audio.get("reason").and_then(Value::as_str),
+            Some(
+                "user_disabled"
+                    | "device_default_disabled"
+                    | "recording_interrupted"
+                    | "audio_open_failed"
+            )
+        )
+    {
+        return Err(StorageError::integrity(
+            "manifest_invalid",
+            "not_recorded audio fields invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v2_media_imu_frames_audio(obj: &Map<String, Value>) -> StorageResult<()> {
+    let media = obj
+        .get("media")
+        .and_then(Value::as_object)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing media object"))?;
+    ensure_allowed_keys(
+        media,
+        &[
+            "container",
+            "layout",
+            "timescale",
+            "duration_ticks",
+            "fragment_count",
+            "artifact",
+        ],
+        "media",
+    )?;
+    if media.get("container").and_then(Value::as_str) != Some("fmp4")
+        || media.get("layout").and_then(Value::as_str) != Some("synced-fmp4")
+        || media.get("timescale").and_then(Value::as_u64).unwrap_or(0) < 1
+        || media
+            .get("duration_ticks")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            < 1
+        || media
+            .get("fragment_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            < 1
+    {
+        return Err(StorageError::integrity(
+            "manifest_invalid",
+            "media fields violate schema v2 constraints",
+        ));
+    }
+    let media_art = media
+        .get("artifact")
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing media.artifact"))?;
+    validate_closed_artifact(media_art, Some("media.session"))?;
+    if media_art.get("media_type").and_then(Value::as_str) != Some("video/mp4") {
+        return Err(StorageError::integrity(
+            "manifest_invalid",
+            "media.artifact.media_type must be video/mp4",
+        ));
+    }
+
+    let video = obj
+        .get("video")
+        .and_then(Value::as_object)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing video object"))?;
+    ensure_allowed_keys(
+        video,
+        &[
+            "layout",
+            "codec",
+            "container",
+            "frame_count",
+            "tracks",
+            "encoding",
+        ],
+        "video",
+    )?;
+    if video.get("layout").and_then(Value::as_str) != Some("split-eyes")
+        || video.get("container").and_then(Value::as_str) != Some("fmp4")
+        || video
+            .get("frame_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            < 1
+    {
+        return Err(StorageError::integrity(
+            "manifest_invalid",
+            "v2 video must use split-eyes fmp4 layout with frame_count >= 1",
+        ));
+    }
+    let video_codec = video
+        .get("codec")
+        .and_then(Value::as_str)
+        .filter(|&c| c == "h264" || c == "hevc")
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "invalid video.codec"))?;
+    let tracks = video
+        .get("tracks")
+        .and_then(Value::as_object)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing video.tracks"))?;
+    ensure_allowed_keys(tracks, &["left_track_id", "right_track_id"], "video.tracks")?;
+    if tracks.get("left_track_id").and_then(Value::as_u64) != Some(1)
+        || tracks.get("right_track_id").and_then(Value::as_u64) != Some(2)
+    {
+        return Err(StorageError::integrity(
+            "manifest_invalid",
+            "video.tracks must declare left_track_id=1 and right_track_id=2",
+        ));
+    }
+    validate_video_encoding_object(video, video_codec)?;
+
+    let imu = obj
+        .get("imu")
+        .and_then(Value::as_object)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing imu object"))?;
+    ensure_allowed_keys(
+        imu,
+        &[
+            "embedded_in",
+            "track_id",
+            "mime_type",
+            "sample_count",
+            "units",
+            "coordinate_frame",
+        ],
+        "imu",
+    )?;
+    let imu_track_id = imu.get("track_id").and_then(Value::as_u64).unwrap_or(0);
+    if imu.get("embedded_in").and_then(Value::as_str) != Some("media.session")
+        || !matches!(imu_track_id, 3 | 4)
+        || imu.get("mime_type").and_then(Value::as_str) != Some("application/x-miro-ego-sync+json")
+        || imu.get("sample_count").and_then(Value::as_u64).is_none()
+        || imu.get("units").and_then(Value::as_str) != Some("raw_int16")
+        || imu.get("coordinate_frame").and_then(Value::as_str) != Some("raw_device_axes")
+    {
+        return Err(StorageError::integrity(
+            "manifest_invalid",
+            "v2 imu metadata invalid",
+        ));
+    }
+
+    let frames = obj
+        .get("frames")
+        .and_then(Value::as_object)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing frames object"))?;
+    ensure_allowed_keys(
+        frames,
+        &["embedded_in", "track_id", "mime_type", "count"],
+        "frames",
+    )?;
+    let frames_track_id = frames.get("track_id").and_then(Value::as_u64).unwrap_or(0);
+    if frames.get("embedded_in").and_then(Value::as_str) != Some("media.session")
+        || !matches!(frames_track_id, 3 | 4)
+        || frames_track_id != imu_track_id
+        || frames.get("mime_type").and_then(Value::as_str)
+            != Some("application/x-miro-ego-sync+json")
+        || frames.get("count").and_then(Value::as_u64).unwrap_or(0) < 1
+    {
+        return Err(StorageError::integrity(
+            "manifest_invalid",
+            "v2 frames metadata invalid",
+        ));
+    }
+
+    let audio = obj
+        .get("audio")
+        .and_then(Value::as_object)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing audio object"))?;
+    match audio.get("state").and_then(Value::as_str) {
+        Some("not_recorded") => {
+            validate_not_recorded_audio_fields(audio)?;
+            if frames_track_id != 3 {
+                return Err(StorageError::integrity(
+                    "manifest_invalid",
+                    "v2 not_recorded audio requires metadata track_id=3",
+                ));
+            }
+        }
+        Some("recorded") => {
+            ensure_allowed_keys(
+                audio,
+                &[
+                    "state",
+                    "requested_mode",
+                    "resolved_mode",
+                    "codec",
+                    "container",
+                    "track_id",
+                    "sample_format",
+                    "sample_rate",
+                    "channels",
+                    "sample_count",
+                    "sync",
+                    "capture_clock",
+                ],
+                "audio",
+            )?;
+            if !matches!(
+                audio.get("requested_mode").and_then(Value::as_str),
+                Some("device_default" | "enabled")
+            ) || audio.get("resolved_mode").and_then(Value::as_str) != Some("enabled")
+                || audio.get("codec").and_then(Value::as_str) != Some("flac")
+                || audio.get("container").and_then(Value::as_str) != Some("fmp4")
+                || audio.get("track_id").and_then(Value::as_u64) != Some(3)
+                || frames_track_id != 4
+                || audio.get("sample_format").and_then(Value::as_str) != Some("S16_LE")
+                || !audio
+                    .get("sample_rate")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|v| (8_000..=384_000).contains(&v))
+                || !audio
+                    .get("channels")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|v| (1..=8).contains(&v))
+                || audio
+                    .get("sample_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    < 1
+            {
+                return Err(StorageError::integrity(
+                    "manifest_invalid",
+                    "v2 recorded audio metadata invalid",
+                ));
+            }
+            let sync = audio
+                .get("sync")
+                .and_then(Value::as_object)
+                .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing audio.sync"))?;
+            ensure_allowed_keys(
+                sync,
+                &["time_base", "timescale", "boundary_gap_samples"],
+                "audio.sync",
+            )?;
+            if sync.get("time_base").and_then(Value::as_str) != Some("audio_hardware_samples")
+                || sync.get("timescale").and_then(Value::as_u64).unwrap_or(0) < 1
+                || sync.get("boundary_gap_samples").and_then(Value::as_u64) != Some(0)
+            {
+                return Err(StorageError::integrity(
+                    "manifest_invalid",
+                    "v2 audio.sync invalid",
+                ));
+            }
+            if let Some(cc) = audio.get("capture_clock") {
+                if cc
+                    .as_object()
+                    .and_then(|o| o.get("schema"))
+                    .and_then(Value::as_str)
+                    != Some("miro-ego.audio-clock.v1")
+                {
+                    return Err(StorageError::integrity(
+                        "manifest_invalid",
+                        "invalid audio.capture_clock",
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(StorageError::integrity(
+                "manifest_invalid",
+                "audio.state must be 'recorded' or 'not_recorded'",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v1_video_imu_frames_audio(obj: &Map<String, Value>) -> StorageResult<()> {
+    // Video section
+    let video = obj
+        .get("video")
+        .and_then(Value::as_object)
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing video object"))?;
+    ensure_allowed_keys(
+        video,
+        &["layout", "codec", "container", "segments", "encoding"],
+        "video",
+    )?;
+    if video.get("layout").and_then(Value::as_str) != Some("split-eyes")
+        || video.get("container").and_then(Value::as_str) != Some("mp4")
+    {
+        return Err(StorageError::integrity(
+            "manifest_invalid",
+            "video must use split-eyes mp4 layout",
+        ));
+    }
+    let video_codec = video
+        .get("codec")
+        .and_then(Value::as_str)
+        .filter(|&c| c == "h264" || c == "hevc")
+        .ok_or_else(|| StorageError::integrity("manifest_invalid", "invalid video.codec"))?;
+
+    let v_segments = video
+        .get("segments")
+        .and_then(Value::as_array)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            StorageError::integrity(
+                "manifest_invalid",
+                "video.segments must be a non-empty array",
+            )
+        })?;
+    for seg in v_segments {
+        let s_obj = seg.as_object().ok_or_else(|| {
+            StorageError::integrity("manifest_invalid", "video segment must be object")
+        })?;
+        ensure_allowed_keys(
+            s_obj,
+            &[
+                "index",
+                "start_frame",
+                "end_frame",
+                "start_time_seconds",
+                "end_time_seconds",
+                "artifacts",
+            ],
+            "video.segments[]",
+        )?;
+        if s_obj.get("index").and_then(Value::as_u64).is_none()
+            || s_obj.get("start_frame").and_then(Value::as_u64).is_none()
+            || s_obj.get("end_frame").and_then(Value::as_u64).unwrap_or(0) < 1
+            || !s_obj
+                .get("start_time_seconds")
+                .and_then(Value::as_f64)
+                .is_some_and(|v| v.is_finite() && v >= 0.0)
+            || !s_obj
+                .get("end_time_seconds")
+                .and_then(Value::as_f64)
+                .is_some_and(|v| v.is_finite() && v > 0.0)
+        {
+            return Err(StorageError::integrity(
+                "manifest_invalid",
+                "video segment frame/time bounds invalid",
+            ));
+        }
+        let arts = s_obj
+            .get("artifacts")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                StorageError::integrity("manifest_invalid", "missing video segment artifacts")
+            })?;
+        ensure_allowed_keys(arts, &["left", "right"], "video.segments[].artifacts")?;
+        let left = arts.get("left").ok_or_else(|| {
+            StorageError::integrity("manifest_invalid", "missing video.left artifact")
+        })?;
+        let right = arts.get("right").ok_or_else(|| {
+            StorageError::integrity("manifest_invalid", "missing video.right artifact")
+        })?;
+        validate_closed_artifact(left, Some("video.left"))?;
+        validate_closed_artifact(right, Some("video.right"))?;
+        if left.get("media_type").and_then(Value::as_str) != Some("video/mp4")
+            || right.get("media_type").and_then(Value::as_str) != Some("video/mp4")
+        {
+            return Err(StorageError::integrity(
+                "manifest_invalid",
+                "video segment media_type must be video/mp4",
+            ));
+        }
+    }
+
+    validate_video_encoding_object(video, video_codec)?;
 
     // IMU & Frames sections
     let imu = obj
@@ -3331,32 +3809,7 @@ fn validate_manifest_camera_and_media(obj: &Map<String, Value>) -> StorageResult
         .and_then(Value::as_object)
         .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing audio object"))?;
     match audio.get("state").and_then(Value::as_str) {
-        Some("not_recorded") => {
-            ensure_allowed_keys(
-                audio,
-                &["state", "requested_mode", "resolved_mode", "reason"],
-                "audio",
-            )?;
-            if !matches!(
-                audio.get("requested_mode").and_then(Value::as_str),
-                Some("device_default" | "disabled" | "enabled")
-            ) || audio.get("resolved_mode").and_then(Value::as_str) != Some("disabled")
-                || !matches!(
-                    audio.get("reason").and_then(Value::as_str),
-                    Some(
-                        "user_disabled"
-                            | "device_default_disabled"
-                            | "recording_interrupted"
-                            | "audio_open_failed"
-                    )
-                )
-            {
-                return Err(StorageError::integrity(
-                    "manifest_invalid",
-                    "not_recorded audio fields invalid",
-                ));
-            }
-        }
+        Some("not_recorded") => validate_not_recorded_audio_fields(audio)?,
         Some("recorded") => {
             ensure_allowed_keys(
                 audio,
@@ -3523,146 +3976,5 @@ fn validate_manifest_camera_and_media(obj: &Map<String, Value>) -> StorageResult
             ));
         }
     }
-
-    // Logs section
-    let logs = obj
-        .get("logs")
-        .and_then(Value::as_array)
-        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing logs array"))?;
-    for log_item in logs {
-        validate_closed_artifact(log_item, None)?;
-        let role = log_item
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !role.starts_with("log.") && !role.starts_with("log_") && !role.starts_with("log-") {
-            return Err(StorageError::integrity(
-                "manifest_invalid",
-                "logs[].role must match log[._-]*",
-            ));
-        }
-    }
-
-    // Integrity section
-    let integ = obj
-        .get("integrity")
-        .and_then(Value::as_object)
-        .ok_or_else(|| StorageError::integrity("manifest_invalid", "missing integrity object"))?;
-    ensure_allowed_keys(
-        integ,
-        &[
-            "verified_at",
-            "dropped_frames",
-            "drop_events",
-            "quality_policy",
-            "media_write_throughput_bytes_per_second",
-            "fatal_errors",
-        ],
-        "integrity",
-    )?;
-    if integ
-        .get("verified_at")
-        .and_then(Value::as_str)
-        .is_none_or(|s| parse_rfc3339_utc_nanos(s).is_none())
-        || integ
-            .get("dropped_frames")
-            .and_then(Value::as_u64)
-            .is_none()
-        || !integ
-            .get("fatal_errors")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-    {
-        return Err(StorageError::integrity(
-            "manifest_invalid",
-            "integrity fields invalid or fatal_errors non-empty",
-        ));
-    }
-    let drop_events = integ
-        .get("drop_events")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            StorageError::integrity("manifest_invalid", "missing integrity.drop_events")
-        })?;
-    for de in drop_events {
-        let de_obj = de.as_object().ok_or_else(|| {
-            StorageError::integrity("manifest_invalid", "drop_event must be object")
-        })?;
-        ensure_allowed_keys(
-            de_obj,
-            &[
-                "start_frame",
-                "end_frame",
-                "at_time_seconds",
-                "reason",
-                "dropped",
-            ],
-            "integrity.drop_events[]",
-        )?;
-        if de_obj.get("start_frame").and_then(Value::as_u64).is_none()
-            || de_obj.get("end_frame").and_then(Value::as_u64).unwrap_or(0) < 1
-            || !de_obj
-                .get("at_time_seconds")
-                .and_then(Value::as_f64)
-                .is_some_and(|v| v.is_finite() && v >= 0.0)
-            || de_obj.get("reason").and_then(Value::as_str) != Some("write_backpressure")
-            || de_obj.get("dropped").and_then(Value::as_u64).unwrap_or(0) < 1
-        {
-            return Err(StorageError::integrity(
-                "manifest_invalid",
-                "invalid integrity.drop_events entry",
-            ));
-        }
-    }
-    if let Some(tput) = integ.get("media_write_throughput_bytes_per_second") {
-        if tput.as_u64().is_none() {
-            return Err(StorageError::integrity(
-                "manifest_invalid",
-                "media_write_throughput_bytes_per_second must be integer >= 0",
-            ));
-        }
-    }
-    if let Some(qp) = integ.get("quality_policy") {
-        let qp_obj = qp.as_object().ok_or_else(|| {
-            StorageError::integrity("manifest_invalid", "quality_policy must be object")
-        })?;
-        ensure_allowed_keys(
-            qp_obj,
-            &[
-                "policy_id",
-                "max_contiguous_dropped_frames",
-                "max_total_dropped_frames",
-                "max_drop_fraction",
-                "window_seconds",
-                "max_dropped_frames_per_window",
-            ],
-            "integrity.quality_policy",
-        )?;
-        if qp_obj.get("policy_id").and_then(Value::as_str) != Some("rdk-x5-lossless-v1")
-            || qp_obj
-                .get("max_contiguous_dropped_frames")
-                .and_then(Value::as_u64)
-                != Some(0)
-            || qp_obj
-                .get("max_total_dropped_frames")
-                .and_then(Value::as_u64)
-                != Some(0)
-            || qp_obj.get("max_drop_fraction").and_then(Value::as_f64) != Some(0.0)
-            || !qp_obj
-                .get("window_seconds")
-                .and_then(Value::as_f64)
-                .is_some_and(|v| v.is_finite() && v > 0.0)
-            || qp_obj
-                .get("max_dropped_frames_per_window")
-                .and_then(Value::as_u64)
-                != Some(0)
-        {
-            return Err(StorageError::integrity(
-                "manifest_invalid",
-                "integrity.quality_policy violates rdk-x5-lossless-v1 constraints",
-            ));
-        }
-    }
-
     Ok(())
 }

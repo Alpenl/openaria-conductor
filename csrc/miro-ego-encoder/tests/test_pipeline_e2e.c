@@ -21,38 +21,54 @@ typedef struct {
     int index;
     unsigned long long start_frame;
     unsigned long long end_frame;
-    char left_path[256];
-    unsigned long long left_bytes;
-    char left_sha256[MIRO_EGO_SHA256_HEX_LEN];
-    char right_path[256];
-    unsigned long long right_bytes;
-    char right_sha256[MIRO_EGO_SHA256_HEX_LEN];
-} recorded_seg_t;
+    unsigned long long duration_ticks;
+    unsigned long long frag_offset;
+    unsigned long long frag_bytes;
+} recorded_frag_t;
 
 typedef struct {
-    recorded_seg_t segs[16];
-    int count;
-} seg_collector_t;
+    recorded_frag_t frags[16];
+    int frag_count;
+    int sealed_count;
+    char sealed_path[256];
+    unsigned long long sealed_bytes;
+    char sealed_sha256[MIRO_EGO_SHA256_HEX_LEN];
+    unsigned long long sealed_frames;
+    unsigned long long sealed_ticks;
+    unsigned long long sealed_moof_count;
+    int sealed_has_audio;
+} frag_collector_t;
 
-static void collect_segment(void *user, int index,
-                            unsigned long long start_frame, unsigned long long end_frame,
-                            const char *left_path, unsigned long long left_bytes,
-                            const char *left_sha256,
-                            const char *right_path, unsigned long long right_bytes,
-                            const char *right_sha256)
+static void collect_fragment(void *user, int index,
+                             unsigned long long start_frame, unsigned long long end_frame,
+                             unsigned long long duration_ticks,
+                             unsigned long long frag_offset, unsigned long long frag_bytes)
 {
-    seg_collector_t *col = (seg_collector_t *)user;
-    assert(col->count < 16);
-    recorded_seg_t *s = &col->segs[col->count++];
-    s->index = index;
-    s->start_frame = start_frame;
-    s->end_frame = end_frame;
-    snprintf(s->left_path, sizeof(s->left_path), "%s", left_path);
-    s->left_bytes = left_bytes;
-    snprintf(s->left_sha256, sizeof(s->left_sha256), "%s", left_sha256);
-    snprintf(s->right_path, sizeof(s->right_path), "%s", right_path);
-    s->right_bytes = right_bytes;
-    snprintf(s->right_sha256, sizeof(s->right_sha256), "%s", right_sha256);
+    frag_collector_t *col = (frag_collector_t *)user;
+    assert(col->frag_count < 16);
+    recorded_frag_t *f = &col->frags[col->frag_count++];
+    f->index = index;
+    f->start_frame = start_frame;
+    f->end_frame = end_frame;
+    f->duration_ticks = duration_ticks;
+    f->frag_offset = frag_offset;
+    f->frag_bytes = frag_bytes;
+}
+
+static void collect_sealed(void *user, const char *artifact_path,
+                           unsigned long long bytes, const char *sha256_hex,
+                           unsigned long long total_frames, unsigned long long total_ticks,
+                           unsigned long long moof_count, int has_audio)
+{
+    frag_collector_t *col = (frag_collector_t *)user;
+    col->sealed_count += 1;
+    snprintf(col->sealed_path, sizeof(col->sealed_path), "%s", artifact_path);
+    col->sealed_bytes = bytes;
+    snprintf(col->sealed_sha256, sizeof(col->sealed_sha256), "%s", sha256_hex);
+    col->sealed_frames = total_frames;
+    col->sealed_ticks = total_ticks;
+    col->sealed_moof_count = moof_count;
+    col->sealed_has_audio = has_audio;
 }
 
 static void verify_file_sha256(const char *abs_path, unsigned long long expected_bytes,
@@ -117,7 +133,27 @@ static const miro_ego_split_ops_t CUSTOM_SPLIT_OPS = {
     .destroy = custom_split_destroy,
 };
 
-static void test_pipeline_multi_segment(int hevc, const miro_ego_split_ops_t *ops)
+static void verify_file_boxes(const char *abs_path, int expect_hevc, int expect_audio)
+{
+    int fd = open(abs_path, O_RDONLY);
+    assert(fd >= 0);
+    uint8_t *buf = malloc(1024u * 1024u);
+    assert(buf != NULL);
+    ssize_t n = read(fd, buf, 1024u * 1024u);
+    close(fd);
+    assert(n > 100);
+    size_t len = (size_t)n;
+    assert(memcmp(buf + 4u, "ftyp", 4) == 0);
+    assert(memmem(buf, len, "moov", 4) != NULL);
+    assert(memmem(buf, len, expect_hevc ? "hvc1" : "avc1", 4) != NULL);
+    assert(memmem(buf, len, "mett", 4) != NULL);
+    assert((memmem(buf, len, "fLaC", 4) != NULL) == (expect_audio != 0));
+    assert(memmem(buf, len, "moof", 4) != NULL);
+    assert(memmem(buf, len, "mfra", 4) != NULL);
+    free(buf);
+}
+
+static void test_pipeline_multi_fragment(int hevc, int has_audio, const miro_ego_split_ops_t *ops)
 {
     char dir[] = "/tmp/miro_ego_e2e_XXXXXX";
     assert(mkdtemp(dir) != NULL);
@@ -146,23 +182,51 @@ static void test_pipeline_multi_segment(int hevc, const miro_ego_split_ops_t *op
         .intra_qp = 22,
         .initial_qp = 24,
         .vbv_ms = 2000,
-        .segment_frames = 3,
+        .fragment_frames = 3,
+        .timescale = 48000,
+        .audio_tracks = has_audio,
         .out_dir = dir,
-        .path_prefix = "video/",
+        .output_file = "session.mp4",
         .split_ops = ops,
         .preview = {0},
     };
 
-    seg_collector_t col = {0};
+    frag_collector_t col = {0};
     miro_ego_pipeline_t *pipeline = NULL;
     char err[256] = {0};
-    assert(miro_ego_pipeline_open(&cfg, collect_segment, &col, &pipeline, err, sizeof(err)) == 0);
+    assert(miro_ego_pipeline_open(&cfg, collect_fragment, collect_sealed, &col,
+                                  &pipeline, err, sizeof(err)) == 0);
 
     uint8_t fake_jpeg[64];
     memset(fake_jpeg, 0xd8, sizeof(fake_jpeg));
+    int16_t pcm_buf[1620 * 2];
+    for (int s = 0; s < 1620 * 2; s += 1) {
+        pcm_buf[s] = (int16_t)((s * 13) & 0x0fff);
+    }
+
+    unsigned long long sample_pos = 0ULL;
     for (int i = 0; i < 8; i += 1) {
         fake_jpeg[0] = (uint8_t)i;
-        assert(miro_ego_pipeline_submit(pipeline, fake_jpeg, sizeof(fake_jpeg), 500) == 0);
+        if (has_audio) {
+            uint32_t dur = 1590u + (uint32_t)(i * 3u);
+            char meta[96];
+            snprintf(meta, sizeof(meta), "{\"seq\":%d,\"ticks\":%u}", i, dur);
+            miro_ego_sync_bundle_t b = {
+                .frame_seq = (uint64_t)i,
+                .monotonic_ns = 1000000ULL + (uint64_t)i * 33333000ULL,
+                .sample_number = sample_pos,
+                .duration_ticks = dur,
+                .pcm = (const uint8_t *)pcm_buf,
+                .pcm_len = dur * 4u,
+                .meta_json = (const uint8_t *)meta,
+                .meta_len = (uint32_t)strlen(meta),
+            };
+            assert(miro_ego_pipeline_submit_bundle(pipeline, fake_jpeg, sizeof(fake_jpeg), &b, 500) == 0);
+            sample_pos += dur;
+        } else {
+            assert(miro_ego_pipeline_submit(pipeline, fake_jpeg, sizeof(fake_jpeg), 500) == 0);
+            sample_pos += 1600ULL;
+        }
     }
 
     assert(miro_ego_pipeline_finish(pipeline) == 0);
@@ -171,25 +235,33 @@ static void test_pipeline_multi_segment(int hevc, const miro_ego_split_ops_t *op
     miro_ego_pipeline_stats_t st;
     miro_ego_pipeline_stats(pipeline, &st);
     assert(st.offered == 8 && st.submitted == 8 && st.decoded == 8);
-    assert(st.encoded[0] == 8 && st.encoded[1] == 8);
+    assert(st.encoded[0] == 8 && st.encoded[1] == 8 && st.muxed_frames == 8);
+    assert(st.fragments_written == 3 && st.total_ticks == sample_pos);
 
     miro_ego_pipeline_close(pipeline);
 
-    /* Expect 3 segments: [0..3), [3..6), [6..8) */
-    assert(col.count == 3);
+    assert(col.frag_count == 3);
+    assert(col.sealed_count == 1);
+    assert(strcmp(col.sealed_path, "session.mp4") == 0);
+    assert(col.sealed_frames == 8ULL && col.sealed_ticks == sample_pos);
+    assert(col.sealed_moof_count == 3ULL && col.sealed_has_audio == has_audio);
+
     const unsigned long long expected_starts[3] = {0, 3, 6};
     const unsigned long long expected_ends[3] = {3, 6, 8};
+    unsigned long long sum_frag_dur = 0ULL;
     for (int i = 0; i < 3; i += 1) {
-        assert(col.segs[i].index == i);
-        assert(col.segs[i].start_frame == expected_starts[i]);
-        assert(col.segs[i].end_frame == expected_ends[i]);
-
-        char abs_l[512], abs_r[512];
-        snprintf(abs_l, sizeof(abs_l), "%s/left_%05d.mp4", dir, i);
-        snprintf(abs_r, sizeof(abs_r), "%s/right_%05d.mp4", dir, i);
-        verify_file_sha256(abs_l, col.segs[i].left_bytes, col.segs[i].left_sha256);
-        verify_file_sha256(abs_r, col.segs[i].right_bytes, col.segs[i].right_sha256);
+        assert(col.frags[i].index == i);
+        assert(col.frags[i].start_frame == expected_starts[i]);
+        assert(col.frags[i].end_frame == expected_ends[i]);
+        assert(col.frags[i].frag_bytes > 0ULL);
+        sum_frag_dur += col.frags[i].duration_ticks;
     }
+    assert(sum_frag_dur == sample_pos);
+
+    char abs_mp4[512];
+    snprintf(abs_mp4, sizeof(abs_mp4), "%s/session.mp4", dir);
+    verify_file_sha256(abs_mp4, col.sealed_bytes, col.sealed_sha256);
+    verify_file_boxes(abs_mp4, hevc, has_audio);
 
     cleanup_dir(dir);
 }
@@ -219,7 +291,7 @@ static void test_pipeline_failure_modes(void)
     };
     miro_ego_pipeline_t *pipeline = NULL;
     char err[256] = {0};
-    assert(miro_ego_pipeline_open(&bad_cfg, NULL, NULL, &pipeline, err, sizeof(err)) == -1);
+    assert(miro_ego_pipeline_open(&bad_cfg, NULL, NULL, NULL, &pipeline, err, sizeof(err)) == -1);
     assert(pipeline == NULL && strstr(err, "invalid_configuration") != NULL);
 
     /* Missing IDR fails closed with segment_missing_idr */
@@ -247,18 +319,19 @@ static void test_pipeline_failure_modes(void)
         .intra_qp = 22,
         .initial_qp = 24,
         .vbv_ms = 2000,
-        .segment_frames = 3,
+        .fragment_frames = 3,
         .out_dir = dir,
-        .path_prefix = "video/",
+        .output_file = "session.mp4",
     };
-    seg_collector_t col = {0};
-    assert(miro_ego_pipeline_open(&cfg, collect_segment, &col, &pipeline, err, sizeof(err)) == 0);
+    frag_collector_t col = {0};
+    assert(miro_ego_pipeline_open(&cfg, collect_fragment, collect_sealed, &col,
+                                  &pipeline, err, sizeof(err)) == 0);
     uint8_t fake_jpeg[32] = {1, 2, 3, 4};
     assert(miro_ego_pipeline_submit(pipeline, fake_jpeg, sizeof(fake_jpeg), 500) == 0);
     assert(miro_ego_pipeline_finish(pipeline) == -1);
     assert(miro_ego_pipeline_failed(pipeline));
     assert(strstr(miro_ego_pipeline_error(pipeline), "segment_missing_idr") != NULL);
-    assert(col.count == 0); /* never publish corrupt segment */
+    assert(col.sealed_count == 0);
     miro_ego_pipeline_close(pipeline);
 
     cleanup_dir(dir);
@@ -303,7 +376,7 @@ static void test_cli_shm_end_to_end(void)
     miro_ego_shm_ring_t producer;
     char err[128] = {0};
     assert(miro_ego_shm_ring_init_fd(&producer, shm_fd, kick_fd, done_fd,
-                                     8u, 4096u, err, sizeof(err)) == 0);
+                                     8u, 16384u, err, sizeof(err)) == 0);
 
     int out_pipe[2];
     int err_pipe[2];
@@ -326,13 +399,15 @@ static void test_cli_shm_end_to_end(void)
 
         execl("./tests/build/miro-ego-encoder-mock", "miro-ego-encoder-mock",
               "--out-dir", dir,
-              "--path-prefix", "video/",
+              "--output-file", "session.mp4",
               "--width", "64",
               "--height", "32",
               "--fps", "30",
               "--bitrate-kbps", "4096",
               "--intra-period", "3",
-              "--segment-frames", "3",
+              "--fragment-frames", "3",
+              "--timescale", "48000",
+              "--audio-tracks", "1",
               "--shm-fd", shm_s,
               "--kick-fd", kick_s,
               "--done-fd", done_s,
@@ -351,44 +426,52 @@ static void test_cli_shm_end_to_end(void)
     assert(fgets(line, sizeof(line), out_fp) != NULL);
     assert(strstr(line, "\"event\":\"ready\"") != NULL);
 
-    /* Push 6 frames through MEGO_SHM ring + EOF */
+    /* Push 6 sync bundles through MEGO_SHM ring + EOF */
     uint8_t jpeg[128];
+    uint8_t pcm[1600 * 4];
     memset(jpeg, 0xaa, sizeof(jpeg));
+    memset(pcm, 0x11, sizeof(pcm));
     for (uint64_t seq = 0; seq < 6u; seq += 1) {
         jpeg[0] = (uint8_t)seq;
-        assert(miro_ego_shm_ring_push(&producer, jpeg, sizeof(jpeg),
-                                      seq, seq * 33333ULL, 0u, 5000) == MIRO_EGO_SHM_OK);
+        const char *meta = "{\"seq\":0}";
+        assert(miro_ego_shm_ring_push_bundle(
+                   &producer, jpeg, sizeof(jpeg),
+                   pcm, (uint32_t)sizeof(pcm),
+                   (const uint8_t *)meta, (uint32_t)strlen(meta),
+                   seq, seq * 33333000ULL, seq * 1600ULL, 1600u, 5000) == MIRO_EGO_SHM_OK);
     }
     assert(miro_ego_shm_ring_set_eof(&producer) == MIRO_EGO_SHM_OK);
 
-    int segments_seen = 0;
+    int fragments_seen = 0;
+    int sealed_seen = 0;
     int done_seen = 0;
     while (fgets(line, sizeof(line), out_fp) != NULL) {
         /* Vendor SDK stdout noise must NEVER leak into NDJSON pipe! */
         assert(strstr(line, "mock-hobot-sdk") == NULL);
-        if (strstr(line, "\"event\":\"segment\"") != NULL) {
-            char l_path[256], r_path[256];
-            char l_sha[MIRO_EGO_SHA256_HEX_LEN], r_sha[MIRO_EGO_SHA256_HEX_LEN];
-            extract_json_str(line, "left_path", l_path, sizeof(l_path));
-            extract_json_str(line, "right_path", r_path, sizeof(r_path));
-            extract_json_str(line, "left_sha256", l_sha, sizeof(l_sha));
-            extract_json_str(line, "right_sha256", r_sha, sizeof(r_sha));
-            unsigned long long l_bytes = extract_json_u64(line, "left_bytes");
-            unsigned long long r_bytes = extract_json_u64(line, "right_bytes");
+        if (strstr(line, "\"event\":\"fragment\"") != NULL) {
             unsigned long long idx = extract_json_u64(line, "index");
-            assert(idx == (unsigned long long)segments_seen);
-
-            char abs_l[512], abs_r[512];
-            snprintf(abs_l, sizeof(abs_l), "%s/left_%05llu.mp4", dir, idx);
-            snprintf(abs_r, sizeof(abs_r), "%s/right_%05llu.mp4", dir, idx);
-            verify_file_sha256(abs_l, l_bytes, l_sha);
-            verify_file_sha256(abs_r, r_bytes, r_sha);
-            segments_seen += 1;
+            assert(idx == (unsigned long long)fragments_seen);
+            fragments_seen += 1;
+        } else if (strstr(line, "\"event\":\"sealed\"") != NULL) {
+            char rel[256], sha[MIRO_EGO_SHA256_HEX_LEN];
+            extract_json_str(line, "path", rel, sizeof(rel));
+            extract_json_str(line, "sha256", sha, sizeof(sha));
+            unsigned long long bytes = extract_json_u64(line, "bytes");
+            assert(strcmp(rel, "session.mp4") == 0);
+            assert(extract_json_u64(line, "frames") == 6ULL);
+            assert(extract_json_u64(line, "duration_ticks") == 9600ULL);
+            assert(extract_json_u64(line, "moof_count") == 2ULL);
+            char abs_mp4[512];
+            snprintf(abs_mp4, sizeof(abs_mp4), "%s/session.mp4", dir);
+            verify_file_sha256(abs_mp4, bytes, sha);
+            sealed_seen += 1;
         } else if (strstr(line, "\"event\":\"done\"") != NULL) {
             assert(extract_json_u64(line, "submitted") == 6ULL);
             assert(extract_json_u64(line, "decoded") == 6ULL);
             assert(extract_json_u64(line, "left_frames") == 6ULL);
             assert(extract_json_u64(line, "right_frames") == 6ULL);
+            assert(extract_json_u64(line, "muxed_frames") == 6ULL);
+            assert(extract_json_u64(line, "fragments_written") == 2ULL);
             done_seen += 1;
         }
     }
@@ -404,7 +487,8 @@ static void test_cli_shm_end_to_end(void)
     int status = 0;
     assert(waitpid(pid, &status, 0) == pid);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    assert(segments_seen == 2);
+    assert(fragments_seen == 2);
+    assert(sealed_seen == 1);
     assert(done_seen == 1);
 
     miro_ego_shm_ring_detach(&producer);
@@ -439,12 +523,13 @@ static void test_cli_stdin_fallback(void)
 
         execl("./tests/build/miro-ego-encoder-mock", "miro-ego-encoder-mock",
               "--out-dir", dir,
+              "--output-file", "session.mp4",
               "--stdin",
               "--width", "64",
               "--height", "32",
               "--fps", "30",
               "--intra-period", "3",
-              "--segment-frames", "3",
+              "--fragment-frames", "3",
               (char *)NULL);
         _exit(127);
     }
@@ -466,10 +551,11 @@ static void test_cli_stdin_fallback(void)
     FILE *out_fp = fdopen(out_pipe[0], "r");
     assert(out_fp != NULL);
     char line[2048];
-    int ready_seen = 0, seg_seen = 0, done_seen = 0;
+    int ready_seen = 0, frag_seen = 0, sealed_seen = 0, done_seen = 0;
     while (fgets(line, sizeof(line), out_fp) != NULL) {
         if (strstr(line, "\"event\":\"ready\"") != NULL) ready_seen += 1;
-        else if (strstr(line, "\"event\":\"segment\"") != NULL) seg_seen += 1;
+        else if (strstr(line, "\"event\":\"fragment\"") != NULL) frag_seen += 1;
+        else if (strstr(line, "\"event\":\"sealed\"") != NULL) sealed_seen += 1;
         else if (strstr(line, "\"event\":\"done\"") != NULL) done_seen += 1;
     }
     fclose(out_fp);
@@ -477,15 +563,13 @@ static void test_cli_stdin_fallback(void)
     int status = 0;
     assert(waitpid(pid, &status, 0) == pid);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    assert(ready_seen == 1 && seg_seen == 1 && done_seen == 1);
+    assert(ready_seen == 1 && frag_seen == 1 && sealed_seen == 1 && done_seen == 1);
 
     cleanup_dir(dir);
 }
 
 static void test_pipeline_exact_boundary_and_zero_frame_lazy_open(void)
 {
-    /* 1. Exact multiple of segment_frames (6 frames, segment_frames = 3) with
-     *    fail_empty_mux_stop = 1 must succeed cleanly with 2 segments and no orphan left_00002.mp4. */
     char dir[] = "/tmp/miro_ego_lazy_exact_XXXXXX";
     assert(mkdtemp(dir) != NULL);
 
@@ -514,15 +598,18 @@ static void test_pipeline_exact_boundary_and_zero_frame_lazy_open(void)
         .intra_qp = 22,
         .initial_qp = 24,
         .vbv_ms = 2000,
-        .segment_frames = 3,
+        .fragment_frames = 3,
+        .timescale = 48000,
+        .audio_tracks = 0,
         .out_dir = dir,
-        .path_prefix = "video/",
+        .output_file = "session.mp4",
     };
 
-    seg_collector_t col = {0};
+    frag_collector_t col = {0};
     miro_ego_pipeline_t *pipeline = NULL;
     char err[256] = {0};
-    assert(miro_ego_pipeline_open(&cfg, collect_segment, &col, &pipeline, err, sizeof(err)) == 0);
+    assert(miro_ego_pipeline_open(&cfg, collect_fragment, collect_sealed, &col,
+                                  &pipeline, err, sizeof(err)) == 0);
 
     uint8_t fake_jpeg[64];
     memset(fake_jpeg, 0xd8, sizeof(fake_jpeg));
@@ -534,38 +621,30 @@ static void test_pipeline_exact_boundary_and_zero_frame_lazy_open(void)
     assert(!miro_ego_pipeline_failed(pipeline));
     miro_ego_pipeline_close(pipeline);
 
-    assert(col.count == 2);
-    char orphan_l[512], orphan_r[512];
-    snprintf(orphan_l, sizeof(orphan_l), "%s/left_00002.mp4", dir);
-    snprintf(orphan_r, sizeof(orphan_r), "%s/right_00002.mp4", dir);
-    assert(access(orphan_l, F_OK) != 0);
-    assert(access(orphan_r, F_OK) != 0);
+    assert(col.frag_count == 2 && col.sealed_count == 1);
     cleanup_dir(dir);
 
-    /* 2. Zero-frame session with fail_empty_mux_stop = 1 must finish cleanly
-     *    without creating left_00000.mp4 / right_00000.mp4. */
+    /* Zero-frame session must finish cleanly without creating session.mp4. */
     char zero_dir[] = "/tmp/miro_ego_lazy_zero_XXXXXX";
     assert(mkdtemp(zero_dir) != NULL);
     mock_hobot_reset(&mock);
     cfg.out_dir = zero_dir;
     memset(&col, 0, sizeof(col));
     pipeline = NULL;
-    assert(miro_ego_pipeline_open(&cfg, collect_segment, &col, &pipeline, err, sizeof(err)) == 0);
+    assert(miro_ego_pipeline_open(&cfg, collect_fragment, collect_sealed, &col,
+                                  &pipeline, err, sizeof(err)) == 0);
     assert(miro_ego_pipeline_finish(pipeline) == 0);
     assert(!miro_ego_pipeline_failed(pipeline));
     miro_ego_pipeline_close(pipeline);
-    assert(col.count == 0);
-    snprintf(orphan_l, sizeof(orphan_l), "%s/left_00000.mp4", zero_dir);
-    snprintf(orphan_r, sizeof(orphan_r), "%s/right_00000.mp4", zero_dir);
-    assert(access(orphan_l, F_OK) != 0);
-    assert(access(orphan_r, F_OK) != 0);
+    assert(col.frag_count == 0 && col.sealed_count == 0);
+    char orphan[512];
+    snprintf(orphan, sizeof(orphan), "%s/session.mp4", zero_dir);
+    assert(access(orphan, F_OK) != 0);
     cleanup_dir(zero_dir);
 }
 
 static void test_pipeline_vbr_config_and_transient_backpressure(void)
 {
-    /* 1. Verify H.264 & H.265 VBR rate-control population + transient JPU/VPU
-     *    dequeue_input_buffer timeout recovery + exact segment SHA-256 match. */
     for (int hevc = 0; hevc <= 1; hevc += 1) {
         char dir[] = "/tmp/miro_ego_vbr_bp_XXXXXX";
         assert(mkdtemp(dir) != NULL);
@@ -592,16 +671,16 @@ static void test_pipeline_vbr_config_and_transient_backpressure(void)
             .intra_qp = 21,
             .initial_qp = 24,
             .vbv_ms = 2500,
-            .segment_frames = 3,
+            .fragment_frames = 3,
             .out_dir = dir,
-            .path_prefix = "video/",
+            .output_file = "session.mp4",
         };
 
-        seg_collector_t col = {0};
+        frag_collector_t col = {0};
         miro_ego_pipeline_t *pipeline = NULL;
         char err[256] = {0};
-        assert(miro_ego_pipeline_open(&cfg, collect_segment, &col, &pipeline,
-                                      err, sizeof(err)) == 0);
+        assert(miro_ego_pipeline_open(&cfg, collect_fragment, collect_sealed, &col,
+                                      &pipeline, err, sizeof(err)) == 0);
 
         for (int eye = 0; eye < 2; eye += 1) {
             mc_video_codec_enc_params_t enc_p;
@@ -641,14 +720,10 @@ static void test_pipeline_vbr_config_and_transient_backpressure(void)
         assert(st.drop_decoder_input == 0ULL && st.drop_encoder_input == 0ULL);
         miro_ego_pipeline_close(pipeline);
 
-        assert(col.count == 2);
-        for (int i = 0; i < 2; i += 1) {
-            char abs_l[512], abs_r[512];
-            snprintf(abs_l, sizeof(abs_l), "%s/left_%05d.mp4", dir, i);
-            snprintf(abs_r, sizeof(abs_r), "%s/right_%05d.mp4", dir, i);
-            verify_file_sha256(abs_l, col.segs[i].left_bytes, col.segs[i].left_sha256);
-            verify_file_sha256(abs_r, col.segs[i].right_bytes, col.segs[i].right_sha256);
-        }
+        assert(col.frag_count == 2 && col.sealed_count == 1);
+        char abs_mp4[512];
+        snprintf(abs_mp4, sizeof(abs_mp4), "%s/session.mp4", dir);
+        verify_file_sha256(abs_mp4, col.sealed_bytes, col.sealed_sha256);
         cleanup_dir(dir);
     }
 
@@ -676,14 +751,14 @@ static void test_pipeline_vbr_config_and_transient_backpressure(void)
         .intra_qp = 22,
         .initial_qp = 24,
         .vbv_ms = 2000,
-        .segment_frames = 3,
+        .fragment_frames = 3,
         .out_dir = stall_dir,
-        .path_prefix = "video/",
+        .output_file = "session.mp4",
         .input_stall_timeout_ms = 25,
     };
     miro_ego_pipeline_t *stall_pipe = NULL;
     char err[256] = {0};
-    assert(miro_ego_pipeline_open(&stall_cfg, NULL, NULL, &stall_pipe, err, sizeof(err)) == 0);
+    assert(miro_ego_pipeline_open(&stall_cfg, NULL, NULL, NULL, &stall_pipe, err, sizeof(err)) == 0);
     uint8_t fake_jpeg[32] = {0xff, 0xd8, 0xff, 0xd9};
     assert(miro_ego_pipeline_submit(stall_pipe, fake_jpeg, sizeof(fake_jpeg), 10) == -1);
     assert(miro_ego_pipeline_failed(stall_pipe));
@@ -707,7 +782,7 @@ static void test_pipeline_vbr_config_and_transient_backpressure(void)
         stall_cfg.out_dir = err_dir;
         stall_cfg.input_stall_timeout_ms = 500;
         miro_ego_pipeline_t *err_pipe = NULL;
-        assert(miro_ego_pipeline_open(&stall_cfg, NULL, NULL, &err_pipe, err, sizeof(err)) == 0);
+        assert(miro_ego_pipeline_open(&stall_cfg, NULL, NULL, NULL, &err_pipe, err, sizeof(err)) == 0);
         (void)miro_ego_pipeline_submit(err_pipe, fake_jpeg, sizeof(fake_jpeg), 50);
         assert(miro_ego_pipeline_finish(err_pipe) == -1);
         assert(miro_ego_pipeline_failed(err_pipe));
@@ -721,13 +796,15 @@ static void test_pipeline_vbr_config_and_transient_backpressure(void)
 
 int main(void)
 {
-    test_pipeline_multi_segment(0, NULL);
-    test_pipeline_multi_segment(1, NULL);
+    test_pipeline_multi_fragment(0, 0, NULL);
+    test_pipeline_multi_fragment(0, 1, NULL);
+    test_pipeline_multi_fragment(1, 0, NULL);
+    test_pipeline_multi_fragment(1, 1, NULL);
 
     g_custom_init_calls = 0;
     g_custom_split_calls = 0;
     g_custom_destroy_calls = 0;
-    test_pipeline_multi_segment(0, &CUSTOM_SPLIT_OPS);
+    test_pipeline_multi_fragment(0, 0, &CUSTOM_SPLIT_OPS);
     assert(g_custom_init_calls == 1);
     assert(g_custom_split_calls == 16); /* 8 frames * 2 eyes */
     assert(g_custom_destroy_calls == 1);
@@ -737,6 +814,6 @@ int main(void)
     test_pipeline_failure_modes();
     test_cli_shm_end_to_end();
     test_cli_stdin_fallback();
-    printf("test_pipeline_e2e: PASS (7-thread H.264/HEVC + VSE hook + failure modes + CLI SHM/stdin E2E)\n");
+    printf("test_pipeline_e2e: PASS (fMP4 H.264/HEVC 3/4-track + VSE hook + failure modes + CLI SHM/stdin E2E)\n");
     return 0;
 }

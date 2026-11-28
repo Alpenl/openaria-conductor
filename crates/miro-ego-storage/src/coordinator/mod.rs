@@ -39,5 +39,6 @@ pub use types::{
     RecordingStateStorage, ReserveEnforcementOutcome, RetainedUnsuccessfulSessionResource,
     RuntimeObservation, SAFE_SWAP_RECEIPT_RESOURCE_SCHEMA, SAFE_SWAP_RECEIPT_SCHEMA,
     SESSION_DELETE_REQUEST_SCHEMA, SESSION_DELETE_RESULT_SCHEMA, SafeSwapReceipt,
-    SafeSwapReceiptResource, StopReason, TakeRequest, VerificationCounter, sanitize_diag_code,
+    SafeSwapReceiptResource, StopReason, SyncedFmp4Artifacts, TakeRequest, VerificationCounter,
+    sanitize_diag_code,
 };

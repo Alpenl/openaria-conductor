@@ -1,15 +1,17 @@
-use crate::audio::Recorder;
-use crate::hardware::imu::{Collector, ImuError};
+use crate::audio::{Recorder, SyncedAudioCapture};
+use crate::hardware::imu::{Collector, ImuError, ImuSample};
 use crate::hardware::metrics::Metrics;
 use crate::hardware::native_camera::{Frame, FrameValidator, Stream, StreamError};
 use crate::hardware::preview::{LatestBuffer, PreviewError};
 use crate::hardware::v4l2;
 use crate::session::active_take::{self, ActiveTakeError, ActiveTakeWriter};
 use crate::session::recording::{self, CaptureFanoutState, FrameTimestampAudit, RecordingError};
+use crate::session::shm_ring::SyncSlotBundle;
 use crate::session::stereo_encoder::{self, EncoderProcessError};
 use miro_ego_core::sys::clock::monotonic_ns;
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
@@ -80,6 +82,79 @@ pub struct RuntimeSnapshot {
     pub last_preview_error: Option<RuntimeError>,
 }
 
+const SYNCED_IMU_QUEUE_MAX_SAMPLES: usize = 8192;
+
+#[derive(Default)]
+pub struct SyncedImuQueue {
+    inner: Mutex<VecDeque<ImuSample>>,
+    dropped_overflow: AtomicU64,
+    emitted_samples: AtomicU64,
+}
+
+impl SyncedImuQueue {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::with_capacity(1024)),
+            dropped_overflow: AtomicU64::new(0),
+            emitted_samples: AtomicU64::new(0),
+        }
+    }
+
+    pub fn push_samples(&self, samples: &[ImuSample]) {
+        if let Ok(mut guard) = self.inner.lock() {
+            for sample in samples {
+                if guard.len() >= SYNCED_IMU_QUEUE_MAX_SAMPLES {
+                    let _ = guard.pop_front();
+                    self.dropped_overflow.fetch_add(1, Ordering::Relaxed);
+                }
+                guard.push_back(sample.clone());
+            }
+        }
+    }
+
+    pub fn drain_up_to(&self, max_monotonic_ns: u64) -> Vec<ImuSample> {
+        let mut out = Vec::new();
+        if let Ok(mut guard) = self.inner.lock() {
+            while let Some(front) = guard.front() {
+                if front.host_monotonic_ns > max_monotonic_ns {
+                    break;
+                }
+                if let Some(sample) = guard.pop_front() {
+                    out.push(sample);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn drain_all(&self) -> Vec<ImuSample> {
+        if let Ok(mut guard) = self.inner.lock() {
+            return guard.drain(..).collect();
+        }
+        Vec::new()
+    }
+
+    pub fn dropped_overflow(&self) -> u64 {
+        self.dropped_overflow.load(Ordering::Relaxed)
+    }
+
+    pub fn record_emitted(&self, count: u64) {
+        self.emitted_samples.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn emitted_samples(&self) -> u64 {
+        self.emitted_samples.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone)]
+pub struct SyncedCaptureConfig {
+    pub audio: Option<Arc<SyncedAudioCapture>>,
+    pub imu_queue: Arc<SyncedImuQueue>,
+    pub timescale: u32,
+    pub fps: u32,
+}
+
 pub struct RecordingTarget {
     pub active_take: Arc<Mutex<ActiveTakeWriter>>,
     pub sink: Arc<Mutex<recording::RecordingSink>>,
@@ -92,6 +167,7 @@ pub struct RecordingTarget {
     pub audio: Option<Arc<Recorder>>,
     pub capture_stopped_monotonic_ns: Arc<AtomicU64>,
     pub recover_source_gaps: bool,
+    pub synced: Option<SyncedCaptureConfig>,
 }
 
 struct QueuedRecordFrame {
@@ -225,6 +301,7 @@ struct SplitSinkRecording {
     on_failure: Arc<dyn FailureSink>,
     imu: Option<Arc<Collector>>,
     audio: Option<Arc<Recorder>>,
+    synced: Option<SyncedCaptureConfig>,
     record_queue: Option<Arc<RecordWorkQueue>>,
 }
 
@@ -463,6 +540,7 @@ impl Runtime {
             audio,
             capture_stopped_monotonic_ns,
             recover_source_gaps,
+            synced,
         } = target;
         if recording_start_monotonic_ns == 0 {
             return Err(RuntimeError::new(
@@ -515,6 +593,8 @@ impl Runtime {
         let imu_for_worker = imu.clone();
         let on_failure_for_imu = imu_for_worker.as_ref().map(|_| Arc::clone(&on_failure));
         let sink_for_worker = Arc::clone(&sink);
+        let synced_audio_for_imu = synced.as_ref().and_then(|s| s.audio.clone());
+        let synced_imu_for_imu = synced.as_ref().map(|s| Arc::clone(&s.imu_queue));
         let mut state = self.shared.state.lock().map_err(|_| {
             RuntimeError::new(
                 "capture_runtime_poisoned",
@@ -548,6 +628,7 @@ impl Runtime {
             on_failure: Arc::clone(&on_failure),
             imu,
             audio: audio.clone(),
+            synced,
             record_queue: Some(Arc::clone(&record_queue)),
         });
 
@@ -589,6 +670,8 @@ impl Runtime {
                             sink: sink_for_worker,
                             on_failure,
                             audio,
+                            synced_audio: synced_audio_for_imu,
+                            synced_imu: synced_imu_for_imu,
                             shared,
                             stop,
                             timeout: imu_timeout,
@@ -1290,12 +1373,213 @@ fn recording_accepts_queued_work(shared: &Shared, recording: &SplitSinkRecording
     }
 }
 
+struct PendingSyncedFrame {
+    item: Box<QueuedRecordFrame>,
+    hw_sample_start: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_synced_frame_meta(
+    seq: u64,
+    vseq: u64,
+    mono_ns: u64,
+    raw_ns: u64,
+    hw_s: u64,
+    dur: u32,
+    frame: &Frame,
+    cam_ctr: Option<u32>,
+    imu_samples: &[ImuSample],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(192 + imu_samples.len() * 44);
+    let _ = write!(
+        buf,
+        "{{\"seq\":{seq},\"vseq\":{vseq},\"mono_ns\":{mono_ns},\"raw_ns\":{raw_ns},\
+         \"hw_s\":{hw_s},\"dur\":{dur},\"flags\":{},\"deq_ns\":{}",
+        frame.buffer_flags, frame.dequeue_monotonic_ns
+    );
+    if let Some(ctr) = cam_ctr {
+        let _ = write!(buf, ",\"cam_ctr\":{ctr}");
+    }
+    buf.extend_from_slice(b",\"imu\":[");
+    for (idx, s) in imu_samples.iter().enumerate() {
+        if idx > 0 {
+            buf.push(b',');
+        }
+        let _ = write!(
+            buf,
+            "[{},{},{},{},{},{},{}]",
+            s.host_monotonic_ns,
+            s.accelerometer.x,
+            s.accelerometer.y,
+            s.accelerometer.z,
+            s.gyroscope.x,
+            s.gyroscope.y,
+            s.gyroscope.z
+        );
+    }
+    buf.extend_from_slice(b"]}");
+    buf
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_synced_frame_pair(
+    recording: &SplitSinkRecording,
+    synced: &SyncedCaptureConfig,
+    item: &QueuedRecordFrame,
+    s_start: u64,
+    dur: u32,
+    pcm_timeout: Duration,
+    imu_samples: &[ImuSample],
+    allow_stop_abort: bool,
+) -> Result<WriteFrameOutcome, RuntimeError> {
+    let frame = &item.frame;
+    if frame.raw_side_by_side.is_empty() {
+        return Err(RuntimeError::new(
+            "raw_frame_unavailable",
+            "production split-eye recording is missing raw side-by-side MJPEG frame",
+        ));
+    }
+    let payload = recording::jpeg_payload(&frame.raw_side_by_side)?;
+    let elapsed_seconds = if frame.host_monotonic_ns >= recording.recording_start_monotonic_ns {
+        (frame.host_monotonic_ns - recording.recording_start_monotonic_ns) as f64 / 1_000_000_000.0
+    } else {
+        0.0
+    };
+
+    let pcm_bytes = if let Some(audio) = &synced.audio {
+        let s_end = s_start.saturating_add(u64::from(dur));
+        let pcm = audio
+            .wait_and_read_pcm_slice(s_start, s_end, pcm_timeout)
+            .map_err(|e| RuntimeError::new(e.code, e.message))?;
+        audio.drop_samples_before(s_end);
+        pcm
+    } else {
+        Vec::new()
+    };
+
+    let reserved = {
+        let mut writer = recording.active_take.lock().map_err(|_| {
+            RuntimeError::new(
+                "active_take_writer_poisoned",
+                "active take writer mutex is poisoned",
+            )
+        })?;
+        if item.corrupt_recorded_drops > 0 {
+            writer.record_corrupt_drops(item.corrupt_recorded_drops, elapsed_seconds)?;
+        }
+        if item.recovered_recorded_drops > 0 {
+            writer.record_recovered_drops(item.recovered_recorded_drops, elapsed_seconds)?;
+        }
+        writer.reserve_frame(active_take::ActiveSourceFrame {
+            source_sequence: frame.source_sequence,
+            host_monotonic_ns: frame.host_monotonic_ns,
+            source_gap: item.dropped_before,
+        })?
+    };
+
+    let cam_ctr = item
+        .current_source_frame
+        .camera_counter_raw
+        .or_else(|| recording::avi1_counter(payload));
+    let meta = serialize_synced_frame_meta(
+        reserved.record_sequence,
+        reserved.source_sequence,
+        reserved.host_monotonic_ns,
+        frame.host_monotonic_raw_ns,
+        s_start,
+        dur,
+        frame,
+        cam_ctr,
+        imu_samples,
+    );
+
+    {
+        let mut encoder = recording.encoder.lock().map_err(|_| {
+            RuntimeError::new("encoder_failed", "encoder process mutex is poisoned")
+        })?;
+        let stopped_flag = &recording.capture_stopped_monotonic_ns;
+        let bundle = SyncSlotBundle {
+            frame_seq: reserved.record_sequence,
+            monotonic_ns: reserved.host_monotonic_ns,
+            sample_number: s_start,
+            duration_ticks: dur,
+            jpeg: payload,
+            pcm: &pcm_bytes,
+            meta: &meta,
+        };
+        if let Err(error) = encoder.submit_sync_bundle_with_stop_check(bundle, || {
+            allow_stop_abort && stopped_flag.load(Ordering::Acquire) != 0
+        }) {
+            if error.code == "capture_stopped" {
+                let mut writer = recording.active_take.lock().map_err(|_| {
+                    RuntimeError::new(
+                        "active_take_writer_poisoned",
+                        "active take writer mutex is poisoned",
+                    )
+                })?;
+                writer.cancel_pending_frame(reserved)?;
+                return Ok(WriteFrameOutcome::Stopped);
+            }
+            return Err(encoder_runtime_error(error));
+        }
+    }
+    synced
+        .imu_queue
+        .record_emitted(u64::try_from(imu_samples.len()).unwrap_or(0));
+    let _plan = {
+        let mut planner = recording.segment_planner.lock().map_err(|_| {
+            RuntimeError::new(
+                "native_recording_segment_planner_poisoned",
+                "recording segment planner mutex is poisoned",
+            )
+        })?;
+        planner.next_frame(reserved.record_sequence, elapsed_seconds)?
+    };
+    let total_bytes = u64::try_from(payload.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(pcm_bytes.len()).unwrap_or(u64::MAX))
+        .saturating_add(u64::try_from(meta.len()).unwrap_or(u64::MAX));
+    let mut writer = recording.active_take.lock().map_err(|_| {
+        RuntimeError::new(
+            "active_take_writer_poisoned",
+            "active take writer mutex is poisoned",
+        )
+    })?;
+    writer.finish_frame(reserved, total_bytes)?;
+    Ok(WriteFrameOutcome::Written)
+}
+
+fn compute_synced_interval(
+    synced: &SyncedCaptureConfig,
+    prev_raw_ns: u64,
+    next_raw_ns: u64,
+    s_k: u64,
+) -> (u64, u32) {
+    let default_dur = synced.timescale / synced.fps.max(1);
+    if let Some(audio) = &synced.audio {
+        let mapped = audio
+            .map_raw_ns_to_sample(next_raw_ns)
+            .unwrap_or_else(|| s_k.saturating_add(u64::from(default_dur)));
+        let s_next = mapped.clamp(s_k.saturating_add(16), s_k.saturating_add(65_535));
+        let dur = (s_next - s_k) as u32;
+        (s_next, dur)
+    } else {
+        let dt_ns = next_raw_ns.saturating_sub(prev_raw_ns).max(1);
+        let ticks = ((u128::from(dt_ns) * u128::from(synced.timescale)) / 1_000_000_000)
+            .clamp(1, 65_535) as u32;
+        (s_k.saturating_add(u64::from(ticks)), ticks)
+    }
+}
+
 fn run_record_loop(
     recording: Arc<SplitSinkRecording>,
     queue: Arc<RecordWorkQueue>,
     shared: Arc<Shared>,
     metrics: Option<Arc<Metrics>>,
 ) {
+    let mut synced_pending: Option<PendingSyncedFrame> = None;
+    let mut last_synced_dur: Option<u32> = None;
+
     while let Some(work) = queue.pop() {
         match work {
             RecordWork::RecoveredDrops {
@@ -1325,16 +1609,74 @@ fn run_record_loop(
                     let _ = finish_recording_frame(&shared);
                     continue;
                 }
+                let prev_sf = item.previous_source_frame;
+                let curr_sf = item.current_source_frame;
+                let v_gap = item.validation_source_gap;
+                let v_q = item.validation_queue_rejected;
                 let write_started = start_stage(metrics.as_ref());
-                let write_result = write_split_sink_frame_with_drops(
-                    &recording,
-                    &item.frame,
-                    item.dropped_before,
-                    item.recovered_recorded_drops,
-                    item.corrupt_recorded_drops,
-                    None,
-                    item.current_source_frame.camera_counter_raw,
-                );
+                let mut err_frame: Option<Frame> = None;
+                let write_result = if let Some(synced) = &recording.synced {
+                    if let Some(prev) = synced_pending.take() {
+                        let (s_next, dur) = compute_synced_interval(
+                            synced,
+                            prev.item.frame.host_monotonic_raw_ns,
+                            item.frame.host_monotonic_raw_ns,
+                            prev.hw_sample_start,
+                        );
+                        last_synced_dur = Some(dur);
+                        let imu_samples =
+                            synced.imu_queue.drain_up_to(item.frame.host_monotonic_ns);
+                        let res = submit_synced_frame_pair(
+                            &recording,
+                            synced,
+                            &prev.item,
+                            prev.hw_sample_start,
+                            dur,
+                            Duration::from_millis(250),
+                            &imu_samples,
+                            true,
+                        );
+                        match res {
+                            Ok(WriteFrameOutcome::Written) => {
+                                synced_pending = Some(PendingSyncedFrame {
+                                    item,
+                                    hw_sample_start: s_next,
+                                });
+                                Ok(WriteFrameOutcome::Written)
+                            }
+                            other => {
+                                err_frame = Some(item.frame);
+                                other
+                            }
+                        }
+                    } else {
+                        let s0 = synced
+                            .audio
+                            .as_ref()
+                            .and_then(|a| a.map_raw_ns_to_sample(item.frame.host_monotonic_raw_ns))
+                            .unwrap_or(0);
+                        let _ = synced.imu_queue.drain_up_to(item.frame.host_monotonic_ns);
+                        synced_pending = Some(PendingSyncedFrame {
+                            item,
+                            hw_sample_start: s0,
+                        });
+                        Ok(WriteFrameOutcome::Written)
+                    }
+                } else {
+                    let res = write_split_sink_frame_with_drops(
+                        &recording,
+                        &item.frame,
+                        item.dropped_before,
+                        item.recovered_recorded_drops,
+                        item.corrupt_recorded_drops,
+                        None,
+                        curr_sf.camera_counter_raw,
+                    );
+                    if res.is_err() {
+                        err_frame = Some(item.frame);
+                    }
+                    res
+                };
                 finish_stage(
                     metrics.as_ref(),
                     "native_recording_split_sink",
@@ -1351,15 +1693,11 @@ fn run_record_loop(
                         return;
                     }
                     Err(mut error) => {
-                        decorate_source_gap_error(
-                            &mut error,
-                            &item.frame,
-                            item.previous_source_frame,
-                            item.current_source_frame,
-                            item.validation_source_gap,
-                            item.validation_queue_rejected,
-                            &shared,
-                        );
+                        if let Some(frame) = err_frame.as_ref() {
+                            decorate_source_gap_error(
+                                &mut error, frame, prev_sf, curr_sf, v_gap, v_q, &shared,
+                            );
+                        }
                         let remaining = queue.close_and_drain_remaining_frames();
                         for _ in 0..remaining {
                             let _ = finish_recording_frame(&shared);
@@ -1372,6 +1710,32 @@ fn run_record_loop(
                         return;
                     }
                 }
+            }
+        }
+    }
+
+    // Flush the trailing 1-frame lookahead item on clean stop.
+    if let (Some(synced), Some(prev)) = (&recording.synced, synced_pending.take()) {
+        let clean = !recording.encoder_abort.is_aborted()
+            && shared
+                .state
+                .lock()
+                .is_ok_and(|s| s.terminal_error.is_none() && !s.fanout.snapshot().failure_reported);
+        if clean {
+            let default_dur = (synced.timescale / synced.fps.max(1)).clamp(16, 65_535);
+            let dur = last_synced_dur.unwrap_or(default_dur).clamp(16, 65_535);
+            let imu_samples = synced.imu_queue.drain_all();
+            if let Err(error) = submit_synced_frame_pair(
+                &recording,
+                synced,
+                &prev.item,
+                prev.hw_sample_start,
+                dur,
+                Duration::from_millis(120),
+                &imu_samples,
+                false,
+            ) {
+                report_recording_failure(&shared, error, Some(Arc::clone(&recording.on_failure)));
             }
         }
     }
@@ -1622,6 +1986,8 @@ struct ImuLoopContext {
     sink: Arc<Mutex<recording::RecordingSink>>,
     on_failure: Arc<dyn FailureSink>,
     audio: Option<Arc<Recorder>>,
+    synced_audio: Option<Arc<SyncedAudioCapture>>,
+    synced_imu: Option<Arc<SyncedImuQueue>>,
     shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
     timeout: Duration,
@@ -1635,6 +2001,8 @@ fn run_imu_loop(ctx: ImuLoopContext) {
         sink,
         on_failure,
         audio,
+        synced_audio,
+        synced_imu,
         shared,
         stop,
         timeout,
@@ -1656,6 +2024,16 @@ fn run_imu_loop(ctx: ImuLoopContext) {
                 break;
             }
         }
+        if let Some(audio) = &synced_audio {
+            if let Err(error) = audio.check_health() {
+                report_recording_failure(
+                    &shared,
+                    RuntimeError::new(error.code, error.message),
+                    Some(Arc::clone(&on_failure)),
+                );
+                break;
+            }
+        }
         let call_started = Instant::now();
         let read_started = start_stage(metrics.as_ref());
         let read_result = collector.read(timeout);
@@ -1665,6 +2043,10 @@ fn run_imu_loop(ctx: ImuLoopContext) {
                 stall_deadline = None;
                 if stop.load(Ordering::Acquire) || !recording_present(&shared) {
                     break;
+                }
+                if let Some(imu_queue) = &synced_imu {
+                    imu_queue.push_samples(&observation.samples);
+                    continue;
                 }
                 let write_started = start_stage(metrics.as_ref());
                 let failure = sink
@@ -1890,6 +2272,7 @@ mod tests {
                 dequeue_monotonic_ns: 0,
                 source_sequence: 1,
                 host_monotonic_ns: 1_000_000,
+                host_monotonic_raw_ns: 1_000_000,
                 application_dropped_before: 0,
                 corrupt_dropped_before: 0,
                 producer_max_interval_ns: 0,
@@ -1945,6 +2328,7 @@ mod tests {
             on_failure: sink_cb,
             imu: None,
             audio: None,
+            synced: None,
             record_queue: None,
         }
     }
@@ -1964,6 +2348,7 @@ mod tests {
             dequeue_monotonic_ns: sequence * 20_000_000 + 100_000,
             source_sequence: sequence,
             host_monotonic_ns: sequence * 20_000_000,
+            host_monotonic_raw_ns: sequence * 20_000_000,
             application_dropped_before: 0,
             corrupt_dropped_before: 0,
             producer_max_interval_ns: 0,
@@ -2137,6 +2522,7 @@ mod tests {
                 dequeue_monotonic_ns: 0,
                 source_sequence: 9,
                 host_monotonic_ns: 34_000_000,
+                host_monotonic_raw_ns: 34_000_000,
                 application_dropped_before: 0,
                 corrupt_dropped_before: 0,
                 producer_max_interval_ns: 0,
@@ -2237,6 +2623,7 @@ mod tests {
                 audio: None,
                 capture_stopped_monotonic_ns: Arc::clone(&next.capture_stopped_monotonic_ns),
                 recover_source_gaps: false,
+                synced: None,
             })
             .unwrap();
         assert!(snapshot.recording_active);
@@ -2467,6 +2854,7 @@ mod tests {
                     dequeue_monotonic_ns: 0,
                     source_sequence: 1,
                     host_monotonic_ns: 1_000_000,
+                    host_monotonic_raw_ns: 1_000_000,
                     application_dropped_before: 0,
                     corrupt_dropped_before: 0,
                     producer_max_interval_ns: 0,
@@ -2571,6 +2959,7 @@ mod tests {
                 audio: None,
                 capture_stopped_monotonic_ns: Arc::clone(&rec.capture_stopped_monotonic_ns),
                 recover_source_gaps: false,
+                synced: None,
             })
             .unwrap();
         assert!(rec_snap.recording_active);
@@ -2627,6 +3016,8 @@ mod tests {
             sink,
             on_failure: Arc::clone(&callbacks) as Arc<dyn FailureSink>,
             audio: None,
+            synced_audio: None,
+            synced_imu: None,
             shared: Arc::clone(&runtime.shared),
             stop,
             timeout: Duration::from_millis(5),
@@ -2672,6 +3063,8 @@ mod tests {
             sink: sink2,
             on_failure: Arc::clone(&exhaust_cb) as Arc<dyn FailureSink>,
             audio: None,
+            synced_audio: None,
+            synced_imu: None,
             shared: Arc::clone(&runtime.shared),
             stop: Arc::new(AtomicBool::new(false)),
             timeout: Duration::from_millis(5),
@@ -2711,6 +3104,8 @@ mod tests {
             sink: sink3,
             on_failure: Arc::clone(&fatal_cb) as Arc<dyn FailureSink>,
             audio: None,
+            synced_audio: None,
+            synced_imu: None,
             shared: Arc::clone(&runtime.shared),
             stop: Arc::new(AtomicBool::new(false)),
             timeout: Duration::from_millis(5),
@@ -2794,6 +3189,7 @@ mod tests {
                 audio: None,
                 capture_stopped_monotonic_ns: Arc::clone(&stopped),
                 recover_source_gaps: false,
+                synced: None,
             })
             .unwrap();
 
@@ -2879,6 +3275,7 @@ mod tests {
                 audio: None,
                 capture_stopped_monotonic_ns: Arc::clone(&rec.capture_stopped_monotonic_ns),
                 recover_source_gaps: false,
+                synced: None,
             })
             .unwrap();
 
@@ -2922,6 +3319,7 @@ mod tests {
                 audio: None,
                 capture_stopped_monotonic_ns: Arc::clone(&next.capture_stopped_monotonic_ns),
                 recover_source_gaps: false,
+                synced: None,
             })
             .unwrap();
         assert!(retry_snap.recording_active);
@@ -3287,6 +3685,7 @@ mod tests {
                 audio: None,
                 capture_stopped_monotonic_ns: Arc::clone(&stopped),
                 recover_source_gaps: false,
+                synced: None,
             })
             .unwrap();
 
@@ -3316,5 +3715,82 @@ mod tests {
 
         encoder.lock().unwrap().abort();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn synced_lookahead_pairs_imu_and_flushes_tail_frame() {
+        let imu_q = SyncedImuQueue::new();
+        imu_q.push_samples(&[
+            ImuSample {
+                sequence: 1,
+                packet_sequence: 1,
+                sample_index: 0,
+                device_timestamp_raw: 10,
+                device_ticks: 10,
+                host_read_start_ns: 100,
+                host_read_end_ns: 200,
+                host_monotonic_ns: 25_000_000,
+                accelerometer: crate::hardware::imu::RawVector3 { x: 1, y: 2, z: 3 },
+                gyroscope: crate::hardware::imu::RawVector3 {
+                    x: -1,
+                    y: -2,
+                    z: -3,
+                },
+                sync_offset_ns: None,
+                sync_residual_ns: None,
+                sync_quality: "nominal",
+            },
+            ImuSample {
+                sequence: 2,
+                packet_sequence: 1,
+                sample_index: 1,
+                device_timestamp_raw: 20,
+                device_ticks: 20,
+                host_read_start_ns: 100,
+                host_read_end_ns: 200,
+                host_monotonic_ns: 55_000_000,
+                accelerometer: crate::hardware::imu::RawVector3 { x: 4, y: 5, z: 6 },
+                gyroscope: crate::hardware::imu::RawVector3 {
+                    x: -4,
+                    y: -5,
+                    z: -6,
+                },
+                sync_offset_ns: None,
+                sync_residual_ns: None,
+                sync_quality: "nominal",
+            },
+        ]);
+        let drained = imu_q.drain_up_to(35_000_000);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].sequence, 1);
+
+        let synced = SyncedCaptureConfig {
+            audio: None,
+            imu_queue: Arc::new(imu_q),
+            timescale: 48_000,
+            fps: 30,
+        };
+        let (s_next, dur) = compute_synced_interval(&synced, 20_000_000, 53_333_333, 1_000);
+        assert_eq!(dur, 1_599);
+        assert_eq!(s_next, 2_599);
+
+        let frame = evidence_frame(1, Some(7));
+        let meta = serialize_synced_frame_meta(
+            0,
+            1,
+            20_000_000,
+            20_000_000,
+            1_000,
+            1_599,
+            &frame,
+            Some(7),
+            &drained,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+        assert_eq!(parsed["hw_s"], 1_000);
+        assert_eq!(parsed["dur"], 1_599);
+        assert_eq!(parsed["cam_ctr"], 7);
+        assert_eq!(parsed["imu"].as_array().unwrap().len(), 1);
+        assert_eq!(synced.imu_queue.drain_all().len(), 1);
     }
 }

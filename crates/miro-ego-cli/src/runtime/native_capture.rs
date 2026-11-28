@@ -2,16 +2,18 @@
 //! `network-operation.lock` wrapper (`NetworkLockCaptureBackend`).
 
 use super::error_map::map_camera_focus_error;
-use super::{ENCODER_FINISH_TIMEOUT, rfc3339_now_utc};
+use super::rfc3339_now_utc;
 use bytes::Bytes;
 use miro_ego_api::MjpegPreviewHub;
-use miro_ego_capture::audio::{self, Recorder as AudioRecorder};
+use miro_ego_capture::audio::{self, SyncedAudioCapture};
 use miro_ego_capture::hardware::imu::{Collector as ImuCollector, ImuObservation};
 use miro_ego_capture::hardware::imu_preview::{self, Preview as ImuPreview};
 use miro_ego_capture::hardware::native_camera::{Stream as NativeCameraStream, StreamConfig};
 use miro_ego_capture::hardware::preview::LatestBuffer;
 use miro_ego_capture::session::active_take::ActiveTakeWriter;
-use miro_ego_capture::session::capture_runtime::{FailureSink, RecordingTarget, Runtime};
+use miro_ego_capture::session::capture_runtime::{
+    FailureSink, RecordingTarget, Runtime, SyncedCaptureConfig, SyncedImuQueue,
+};
 use miro_ego_capture::session::recording::{RecordingSegmentPlanner, RecordingSink};
 use miro_ego_capture::session::shm_ring::ShmRingConfig;
 use miro_ego_capture::session::stereo_encoder::{
@@ -23,12 +25,11 @@ use miro_ego_core::locks::{FlockGuard, LockMode, acquire_network_operation_lock}
 use miro_ego_core::sys::clock::monotonic_ns;
 use miro_ego_hw::thermal::read_soc_temperature_c;
 use miro_ego_network::{ControllerStatus, NetworkRpcClient, ObservedDefaultRoute};
-use miro_ego_storage::coordinator::{CAMERA_FOCUS_SCHEMA, DropEventRecord};
+use miro_ego_storage::coordinator::{CAMERA_FOCUS_SCHEMA, DropEventRecord, SyncedFmp4Artifacts};
 use miro_ego_storage::{
     ActiveCaptureHandle, BackendStartRequest, CameraFocusSetRequest, CameraFocusStatus,
     CaptureBackend, CaptureMode, CaptureProgressSnapshot, CapturedArtifact, CapturedAudioOutcome,
-    CapturedAudioSegment, CapturedSessionArtifacts, CapturedVideoSegment, RuntimeObservation,
-    StopReason, StorageError, StorageResult,
+    CapturedSessionArtifacts, RuntimeObservation, StopReason, StorageError, StorageResult,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -62,37 +63,6 @@ impl FailureSink for CaptureFailureLog {
             }
         }
     }
-}
-
-pub(super) fn extract_sink_artifacts(
-    snap: &miro_ego_capture::session::recording::RecordingSinkSnapshot,
-) -> StorageResult<(CapturedArtifact, CapturedArtifact)> {
-    let mut frames: Option<CapturedArtifact> = None;
-    let mut imu: Option<CapturedArtifact> = None;
-    for art in &snap.artifacts {
-        let captured = CapturedArtifact {
-            role: art.role.to_owned(),
-            path: art.relative_path.to_owned(),
-            media_type: "application/x-ndjson".to_owned(),
-            bytes: art.bytes,
-            sha256: Some(art.sha256.clone()),
-        };
-        if art.role == "frames.index" {
-            frames = Some(captured);
-        } else if art.role == "imu.samples" {
-            imu = Some(captured);
-        }
-    }
-    let frames_art = frames.ok_or_else(|| {
-        StorageError::integrity(
-            "missing_frames_artifact",
-            "recording sink omitted frames.ndjson",
-        )
-    })?;
-    let imu_art = imu.ok_or_else(|| {
-        StorageError::integrity("missing_imu_artifact", "recording sink omitted imu.ndjson")
-    })?;
-    Ok((frames_art, imu_art))
 }
 
 fn imu_observation_to_openapi(obs: &ImuObservation, session_id: Option<&str>) -> Value {
@@ -511,16 +481,19 @@ impl Drop for NativeCaptureBackend {
 }
 
 struct NativeActiveHandle {
+    staging_dir: PathBuf,
     runtime: Arc<Runtime>,
     active_take: Arc<Mutex<ActiveTakeWriter>>,
     sink: Arc<Mutex<RecordingSink>>,
     encoder: Arc<Mutex<EncoderProcess>>,
     encoder_abort: EncoderAbortHandle,
-    segment_planner: Arc<Mutex<RecordingSegmentPlanner>>,
     failure_log: Arc<CaptureFailureLog>,
-    audio: Option<Arc<AudioRecorder>>,
+    synced_audio: Option<Arc<SyncedAudioCapture>>,
+    imu_queue: Arc<SyncedImuQueue>,
     audio_requested_mode: String,
     audio_not_recorded_reason: String,
+    audio_sample_rate_hz: u32,
+    audio_channels: u16,
     imu_preview: Arc<ImuPreview>,
     imu_device: Option<PathBuf>,
     imu_xu_unavailable: Arc<AtomicBool>,
@@ -547,10 +520,13 @@ impl NativeActiveHandle {
             return;
         }
         self.completed = true;
+        if let Some(ref audio) = self.synced_audio {
+            audio.request_stop();
+        }
         self.encoder_abort.abort();
         let _ = self.runtime.stop_recording(Duration::from_secs(2));
-        if let Some(ref audio) = self.audio {
-            let _ = audio.stop(Duration::from_secs(2));
+        if let Some(ref audio) = self.synced_audio {
+            let _ = audio.stop();
         }
         if let Ok(mut enc) = self.encoder.lock() {
             enc.abort();
@@ -573,18 +549,18 @@ impl ActiveCaptureHandle for NativeActiveHandle {
         let now_ns = monotonic_ns().unwrap_or(self.started_monotonic_ns);
         let elapsed_seconds =
             now_ns.saturating_sub(self.started_monotonic_ns) as f64 / 1_000_000_000.0;
-        let (frames, bytes) = self
-            .sink
+        let frames = self
+            .active_take
             .lock()
-            .map(|s| {
-                let snap = s.snapshot();
-                (snap.frames_written, snap.bytes_written)
-            })
-            .unwrap_or((0, 0));
+            .map(|t| t.snapshot().frames_written)
+            .unwrap_or(0);
+        let disk_bytes = fs::metadata(self.staging_dir.join("session.mp4"))
+            .map(|m| m.len())
+            .unwrap_or(0);
         CaptureProgressSnapshot {
             elapsed_seconds,
             captured_frames: frames,
-            bytes_written: bytes,
+            bytes_written: disk_bytes,
         }
     }
 
@@ -593,15 +569,11 @@ impl ActiveCaptureHandle for NativeActiveHandle {
     }
 
     fn finish(mut self: Box<Self>, _reason: StopReason) -> StorageResult<CapturedSessionArtifacts> {
-        if let Some(ref audio) = self.audio {
-            audio.request_stop();
-        }
+        // Stop video runtime FIRST so the 1-frame lookahead tail receives its live audio PCM slice
+        // before SyncedAudioCapture shuts down.
         let _ = self.runtime.stop_recording(Duration::from_secs(5));
         let stopped_monotonic_ns = monotonic_ns().unwrap_or(self.started_monotonic_ns);
-        let audio_stop_result = self
-            .audio
-            .take()
-            .map(|recorder| recorder.stop(Duration::from_secs(5)));
+        let audio_stop_result = self.synced_audio.take().map(|audio| audio.stop());
 
         if let Some((code, msg)) = self.failure_log.take() {
             self.encoder_abort.abort();
@@ -619,29 +591,34 @@ impl ActiveCaptureHandle for NativeActiveHandle {
             ));
         }
 
-        let segment_events = {
+        let media_outcome = {
             let mut enc = self.encoder.lock().map_err(|_| {
                 StorageError::service_unavailable("encoder_poisoned", "encoder mutex poisoned")
             })?;
-            enc.finish(ENCODER_FINISH_TIMEOUT).map_err(|err| {
+            enc.finish_media(Duration::from_secs(30)).map_err(|err| {
                 StorageError::service_unavailable(
                     "encoder_finish_failed",
                     format!("{}: {}", err.code, err.message),
                 )
             })?
         };
+        let mut sealed = media_outcome.sealed.ok_or_else(|| {
+            StorageError::integrity(
+                "encoder_sealed_missing",
+                "stereo encoder completed without emitting sealed session.mp4 event",
+            )
+        })?;
+        sealed.timescale = self.audio_sample_rate_hz;
 
-        let sink_snap = {
-            let mut sink = self.sink.lock().map_err(|_| {
-                StorageError::service_unavailable("sink_poisoned", "recording sink mutex poisoned")
-            })?;
-            sink.flush_and_close().map_err(|err| {
-                StorageError::service_unavailable(
-                    "sink_flush_failed",
-                    format!("{}: {}", err.code, err.message),
-                )
-            })?
-        };
+        if let Ok(mut sink) = self.sink.lock() {
+            sink.close();
+        }
+        for empty_legacy in ["frames.ndjson", "imu.ndjson"] {
+            let p = self.staging_dir.join(empty_legacy);
+            if fs::metadata(&p).is_ok_and(|m| m.len() == 0) {
+                let _ = fs::remove_file(&p);
+            }
+        }
 
         let duration_seconds = (stopped_monotonic_ns.saturating_sub(self.started_monotonic_ns)
             as f64
@@ -660,99 +637,49 @@ impl ActiveCaptureHandle for NativeActiveHandle {
             })?
         };
 
-        let segments: Vec<CapturedVideoSegment> = {
-            let mut planner = self.segment_planner.lock().map_err(|_| {
-                StorageError::service_unavailable(
-                    "planner_poisoned",
-                    "segment planner mutex poisoned",
+        let (audio, audio_capture_clock) = match audio_stop_result {
+            Some(Ok(res)) if sealed.audio_samples > 0 => {
+                let clock_json = json!({
+                    "schema": "miro-ego.audio-clock.v1",
+                    "clock": "host_monotonic_raw",
+                    "timestamp_source": "alsa_htimestamp_dma_raw",
+                    "continuity": "verified",
+                    "device": res.device,
+                    "period_frames": res.period_frames,
+                    "buffer_frames": res.buffer_frames,
+                    "thread_started_monotonic_ns": res.started_monotonic_ns,
+                    "thread_stopped_monotonic_ns": res.stopped_monotonic_ns,
+                    "max_residual_ns": res.max_residual_ns,
+                    "effective_rate_hz": res.effective_rate_hz,
+                });
+                (
+                    CapturedAudioOutcome::RecordedWithClock {
+                        requested_mode: self.audio_requested_mode.clone(),
+                        sample_rate: res.sample_rate_hz,
+                        channels: res.channels,
+                        sample_count: sealed.audio_samples,
+                        start_time_seconds: 0.0,
+                        end_time_seconds: duration_seconds,
+                        segments: Vec::new(),
+                        capture_clock: Some(clock_json.clone()),
+                    },
+                    Some(clock_json),
                 )
-            })?;
-            for ev in &segment_events {
-                planner
-                    .register_segment(ev.index, ev.start_frame, ev.end_frame)
-                    .map_err(|err| {
-                        StorageError::integrity(
-                            "segment_plan_invalid",
-                            format!("{}: {}", err.code, err.message),
-                        )
-                    })?;
             }
-            planner
-                .finish(
-                    sink_snap.frames_written,
-                    take_summary.frame_domain,
-                    duration_seconds,
-                )
-                .map_err(|err| {
-                    StorageError::integrity(
-                        "segment_plan_incomplete",
-                        format!("{}: {}", err.code, err.message),
-                    )
-                })?;
-            let mut built = Vec::with_capacity(segment_events.len());
-            for ev in &segment_events {
-                let b0 = planner
-                    .boundary(ev.start_frame, duration_seconds)
-                    .map_err(|err| {
-                        StorageError::integrity("segment_boundary_invalid", err.message)
-                    })?;
-                let b1 = planner
-                    .boundary(ev.end_frame, duration_seconds)
-                    .map_err(|err| {
-                        StorageError::integrity("segment_boundary_invalid", err.message)
-                    })?;
-                built.push(CapturedVideoSegment::from_encoder_segment(
-                    ev,
-                    b0.time_seconds,
-                    b1.time_seconds,
-                ));
-            }
-            built
-        };
-
-        let (frames_artifact, imu_artifact) = extract_sink_artifacts(&sink_snap)?;
-
-        let audio = match audio_stop_result {
-            Some(Ok(res)) => {
-                let clock_json = serde_json::to_value(&res.capture_clock).ok();
-                CapturedAudioOutcome::Recorded {
+            Some(Ok(_)) | Some(Err(_)) => (
+                CapturedAudioOutcome::NotRecorded {
                     requested_mode: self.audio_requested_mode.clone(),
-                    sample_rate: res.sample_rate_hz,
-                    channels: res.channels,
-                    sample_count: res.sample_count,
-                    start_time_seconds: 0.0,
-                    end_time_seconds: duration_seconds,
-                    segments: res
-                        .segments
-                        .into_iter()
-                        .map(|seg| CapturedAudioSegment {
-                            index: seg.index,
-                            start_sample: seg.start_sample,
-                            end_sample: seg.end_sample,
-                            start_time_seconds: seg.start_time_seconds,
-                            end_time_seconds: seg.end_time_seconds,
-                            pcm_payload_bytes: seg.bytes.saturating_sub(audio::WAV_HEADER_BYTES),
-                            wav_header_bytes: audio::WAV_HEADER_BYTES,
-                            artifact: CapturedArtifact {
-                                role: "audio.wav".to_owned(),
-                                path: seg.relative_path,
-                                media_type: "audio/wav".to_owned(),
-                                bytes: seg.bytes,
-                                sha256: seg.sha256,
-                            },
-                        })
-                        .collect(),
-                }
-                .with_capture_clock(clock_json)
-            }
-            Some(Err(_err)) => CapturedAudioOutcome::NotRecorded {
-                requested_mode: self.audio_requested_mode.clone(),
-                reason: "recording_interrupted".to_owned(),
-            },
-            None => CapturedAudioOutcome::NotRecorded {
-                requested_mode: self.audio_requested_mode.clone(),
-                reason: self.audio_not_recorded_reason.clone(),
-            },
+                    reason: "recording_interrupted".to_owned(),
+                },
+                None,
+            ),
+            None => (
+                CapturedAudioOutcome::NotRecorded {
+                    requested_mode: self.audio_requested_mode.clone(),
+                    reason: self.audio_not_recorded_reason.clone(),
+                },
+                None,
+            ),
         };
 
         let dropped_frames = take_summary.dropped_frames;
@@ -768,16 +695,37 @@ impl ActiveCaptureHandle for NativeActiveHandle {
             })
             .collect();
 
+        let frames_count = sealed.frames.max(take_summary.frames_written);
+        let imu_sample_count = self.imu_queue.emitted_samples().max(sealed.imu_samples);
+        sealed.imu_samples = imu_sample_count;
+        let media_bytes = sealed.bytes;
+        let media_sha = sealed.sha256.clone();
+
         self.completed = true;
         self.release_active_imu_and_resume_preview();
 
+        let placeholder_artifact = CapturedArtifact {
+            role: "media.session".to_owned(),
+            path: "session.mp4".to_owned(),
+            media_type: "video/mp4".to_owned(),
+            bytes: media_bytes,
+            sha256: Some(media_sha),
+        };
+
         Ok(CapturedSessionArtifacts {
-            segments,
-            frames_artifact,
-            frames_count: sink_snap.frames_written,
-            imu_artifact,
-            imu_sample_count: sink_snap.imu_samples_written,
+            segments: Vec::new(),
+            frames_artifact: placeholder_artifact.clone(),
+            frames_count,
+            imu_artifact: placeholder_artifact,
+            imu_sample_count,
             audio,
+            synced_fmp4: Some(SyncedFmp4Artifacts {
+                sealed,
+                fragments: media_outcome.fragments,
+                audio_sample_rate: Some(self.audio_sample_rate_hz),
+                audio_channels: Some(self.audio_channels),
+                audio_capture_clock,
+            }),
             logs: Vec::new(),
             dropped_frames,
             drop_events,
@@ -933,13 +881,59 @@ impl CaptureBackend for NativeCaptureBackend {
             / f64::from(self.config.camera.frame_decimation))
         .max(1.0);
         let gop = u64::from(req.encoding.gop_frames.max(1));
-        let raw_seg_frames =
-            ((effective_fps * self.config.segment_seconds).round() as u64).max(gop);
-        let segment_frames = raw_seg_frames.div_ceil(gop) * gop;
-        let video_dir = req.staging_dir.join("video");
-        fs::create_dir_all(&video_dir).map_err(|err| {
-            StorageError::io("staging_create_failed", "create staging video dir", err)
-        })?;
+        let raw_frag_frames = (effective_fps.round() as u64).max(gop);
+        let fragment_frames = raw_frag_frames.div_ceil(gop) * gop;
+
+        let audio_enabled = self.config.audio.enabled && req.mode != CaptureMode::Calibration;
+        let timescale = if audio_enabled {
+            self.config.audio.sample_rate_hz.max(8_000)
+        } else {
+            48_000
+        };
+        let audio_requested_mode = if audio_enabled {
+            "enabled".to_owned()
+        } else {
+            "disabled".to_owned()
+        };
+        let (synced_audio, audio_not_recorded_reason) = if audio_enabled {
+            if !audio::available() {
+                eprintln!(
+                    "miro-ego: audio enabled in config ({}) but ALSA capture is unavailable; recording without audio",
+                    self.config.audio.device
+                );
+                (None, "audio_open_failed".to_owned())
+            } else {
+                match SyncedAudioCapture::new(
+                    &self.config.audio.device,
+                    timescale,
+                    self.config.audio.channels,
+                ) {
+                    Ok(rec) => {
+                        let rec = Arc::new(rec);
+                        match rec.start() {
+                            Ok(()) => (Some(rec), "device_default_disabled".to_owned()),
+                            Err(err) => {
+                                eprintln!(
+                                    "miro-ego: failed starting ALSA audio capture on {}: {}; recording without audio",
+                                    self.config.audio.device, err.message
+                                );
+                                (None, "audio_open_failed".to_owned())
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "miro-ego: failed opening ALSA audio capture on {}: {}; recording without audio",
+                            self.config.audio.device, err.message
+                        );
+                        (None, "audio_open_failed".to_owned())
+                    }
+                }
+            }
+        } else {
+            (None, "device_default_disabled".to_owned())
+        };
+        let audio_tracks = if synced_audio.is_some() { 1_u8 } else { 0_u8 };
 
         let min_slot_cap = min_shm_slot_capacity(
             u64::from(self.config.camera.width),
@@ -960,20 +954,29 @@ impl CaptureBackend for NativeCaptureBackend {
         };
         let mut encoder = EncoderProcess::with_transport(
             EncoderConfig {
-                out_dir: &video_dir,
+                out_dir: &req.staging_dir,
                 executable: &self.encoder_bin,
                 width: u64::from(self.config.camera.width),
                 height: u64::from(self.config.camera.height),
                 fps: effective_fps.round() as u64,
                 bitrate_kbps: u64::from(req.encoding.bitrate_kbps),
-                segment_frames,
-                path_prefix: "video/",
+                segment_frames: fragment_frames,
+                path_prefix: "",
             },
             EncoderTransport::ShmRing(shm_cfg),
         )
         .map_err(|err| StorageError::service_unavailable("encoder_init_failed", err.message))?;
 
         if let Err(err) = encoder.configure(&req.encoding.encoder_arguments()) {
+            encoder.abort();
+            return Err(StorageError::invalid_input(
+                "encoder_config_invalid",
+                err.message,
+            ));
+        }
+        if let Err(err) =
+            encoder.set_fmp4_options("session.mp4", fragment_frames, timescale, audio_tracks)
+        {
             encoder.abort();
             return Err(StorageError::invalid_input(
                 "encoder_config_invalid",
@@ -1009,7 +1012,7 @@ impl CaptureBackend for NativeCaptureBackend {
                 ));
             }
         };
-        let segment_planner = match RecordingSegmentPlanner::new(segment_frames) {
+        let segment_planner = match RecordingSegmentPlanner::new(fragment_frames) {
             Ok(p) => p,
             Err(err) => {
                 encoder.abort();
@@ -1018,60 +1021,19 @@ impl CaptureBackend for NativeCaptureBackend {
             }
         };
 
-        let audio_enabled = self.config.audio.enabled && req.mode != CaptureMode::Calibration;
-        let audio_requested_mode = if audio_enabled {
-            "enabled".to_owned()
-        } else {
-            "disabled".to_owned()
-        };
-        let (audio, audio_not_recorded_reason) = if audio_enabled {
-            if !audio::available() {
-                eprintln!(
-                    "miro-ego: audio enabled in config ({}) but ALSA capture is unavailable; recording without audio",
-                    self.config.audio.device
-                );
-                (None, "audio_open_failed".to_owned())
-            } else {
-                let root_str = req.staging_dir.to_string_lossy().into_owned();
-                match AudioRecorder::new(
-                    &root_str,
-                    &self.config.audio.device,
-                    self.config.audio.sample_rate_hz,
-                    self.config.audio.channels,
-                    self.config.segment_seconds,
-                ) {
-                    Ok(rec) => {
-                        let rec = Arc::new(rec);
-                        match rec.start() {
-                            Ok(()) => (Some(rec), "device_default_disabled".to_owned()),
-                            Err(err) => {
-                                eprintln!(
-                                    "miro-ego: failed starting ALSA audio capture on {}: {}; recording without audio",
-                                    self.config.audio.device, err.message
-                                );
-                                (None, "audio_open_failed".to_owned())
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "miro-ego: failed opening ALSA audio capture on {}: {}; recording without audio",
-                            self.config.audio.device, err.message
-                        );
-                        (None, "audio_open_failed".to_owned())
-                    }
-                }
-            }
-        } else {
-            (None, "device_default_disabled".to_owned())
-        };
-
         let encoder_abort = encoder.abort_handle();
         let active_take = Arc::new(Mutex::new(active_take));
         let sink = Arc::new(Mutex::new(sink));
         let encoder = Arc::new(Mutex::new(encoder));
         let segment_planner = Arc::new(Mutex::new(segment_planner));
         let failure_log = Arc::new(CaptureFailureLog::new());
+        let imu_queue = Arc::new(SyncedImuQueue::new());
+        let synced_cfg = SyncedCaptureConfig {
+            audio: synced_audio.clone(),
+            imu_queue: Arc::clone(&imu_queue),
+            timescale,
+            fps: effective_fps.round() as u32,
+        };
 
         if let Some(ref collector) = imu {
             if let Ok(mut guard) = self.active_imu.lock() {
@@ -1080,16 +1042,19 @@ impl CaptureBackend for NativeCaptureBackend {
         }
 
         let handle = Box::new(NativeActiveHandle {
+            staging_dir: req.staging_dir.clone(),
             runtime: Arc::clone(&runtime),
             active_take: Arc::clone(&active_take),
             sink: Arc::clone(&sink),
             encoder: Arc::clone(&encoder),
             encoder_abort,
-            segment_planner: Arc::clone(&segment_planner),
             failure_log: Arc::clone(&failure_log),
-            audio: audio.clone(),
+            synced_audio,
+            imu_queue,
             audio_requested_mode,
             audio_not_recorded_reason,
+            audio_sample_rate_hz: timescale,
+            audio_channels: self.config.audio.channels,
             imu_preview: Arc::clone(&self.imu_preview),
             imu_device: self.imu_device.clone(),
             imu_xu_unavailable: Arc::clone(&self.imu_xu_unavailable),
@@ -1115,9 +1080,10 @@ impl CaptureBackend for NativeCaptureBackend {
                 on_failure: failure_log as Arc<dyn FailureSink>,
                 imu,
                 imu_timeout: Duration::from_millis(50),
-                audio,
+                audio: None,
                 capture_stopped_monotonic_ns: Arc::new(AtomicU64::new(0)),
                 recover_source_gaps: true,
+                synced: Some(synced_cfg),
             })
             .map_err(|err| {
                 StorageError::service_unavailable("capture_start_failed", err.message)
